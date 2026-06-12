@@ -1,0 +1,83 @@
+<script lang="ts">
+  import type { Status } from "$lib/api";
+
+  let { st, onOpen }: { st: Status | null; onOpen: () => void } = $props();
+</script>
+
+<div class="step">
+  <p class="eyebrow">Step 4 of 4 &middot; Done</p>
+  <h1>That's everything</h1>
+
+  <div class="card summary">
+    <p class="headline">
+      Your box is running <span class="dot-ok" aria-hidden="true">&#9679;</span>
+    </p>
+    {#if st}
+      <dl class="meta">
+        <div><dt class="dim">Box</dt><dd>{st.box_name}</dd></div>
+        {#if st.onion}
+          <div>
+            <dt class="dim">Private address</dt>
+            <dd class="mono">{st.onion}</dd>
+          </div>
+        {/if}
+      </dl>
+    {/if}
+    <p class="dim note">
+      Your recovery kit is safe, and your phone can join whenever you're ready.
+    </p>
+  </div>
+
+  <div class="actions">
+    <button class="btn btn-primary" onclick={onOpen}>Open PurePrivacy</button>
+  </div>
+</div>
+
+<style>
+  .step {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-5);
+  }
+
+  h1 {
+    font-size: var(--fs-xl);
+  }
+
+  .summary {
+    max-width: 34rem;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-4);
+  }
+
+  .headline {
+    font-size: var(--fs-lg);
+    font-weight: 650;
+  }
+
+  .meta {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    font-size: var(--fs-sm);
+  }
+
+  .meta div {
+    display: flex;
+    gap: var(--sp-2);
+  }
+
+  .meta dt {
+    min-width: 8.5rem;
+  }
+
+  .meta dd {
+    margin: 0;
+  }
+
+  .note {
+    font-size: var(--fs-sm);
+  }
+</style>
