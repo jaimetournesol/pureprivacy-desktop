@@ -67,8 +67,12 @@ pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
 
 pub fn render_torrc(app: &AppHandle) -> Result<(), String> {
     let p = paths(app)?;
+    // NoIsolateClientAddr: share circuits across local SOCKS clients.
+    // G1 finding (2026-06-13): tor's default per-client isolation hands the
+    // homeserver cold circuits, and first-contact federation then exceeds
+    // its connect timeout.  See docs/redesign/2026-06-phase0-spike-results.md.
     let torrc = format!(
-        "SocksPort {socks}\n\
+        "SocksPort {socks} NoIsolateClientAddr\n\
          DataDirectory {data}\n\
          HiddenServiceDir {hs}\n\
          HiddenServicePort 8448 127.0.0.1:{hsport}\n\
@@ -94,6 +98,14 @@ pub fn render_tuwunel(app: &AppHandle, server_name: &str) -> Result<(), String> 
          allow_federation = true\n\
          allow_invalid_tls_certificates = true\n\
          trusted_servers = []\n\
+         query_trusted_key_servers_first = false\n\
+         # Cold onion circuits legitimately take tens of seconds on first\n\
+         # contact — G1-proven values (2026-06-13).\n\
+         request_conn_timeout = 90\n\
+         request_total_timeout = 320\n\
+         sender_timeout = 300\n\
+         well_known_conn_timeout = 30\n\
+         well_known_timeout = 60\n\
          \n\
          [global.proxy.global]\n\
          url = \"socks5h://127.0.0.1:{socks}\"\n",
