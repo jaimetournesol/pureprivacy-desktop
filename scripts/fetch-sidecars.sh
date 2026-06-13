@@ -2,8 +2,9 @@
 #
 # fetch-sidecars.sh — fetch the two PurePrivacy sidecar binaries for local dev.
 #
-#   tuwunel  — Matrix homeserver, extracted from the upstream OCI image
-#   tor      — C-tor daemon, copied from the system install (or apt-installed)
+#   tuwunel    — Matrix homeserver, extracted from the upstream OCI image
+#   tor        — C-tor daemon, copied from the system install (or apt-installed)
+#   turnserver — coturn for 1:1 voice (OPTIONAL — box runs fine without it)
 #
 # Binaries land in $PUREPRIVACY_BIN_DIR, defaulting to the app's runtime bin dir:
 #   $HOME/.local/share/ai.tournesol.pureprivacy/bin
@@ -47,7 +48,7 @@ done
 # ------------------------------------------------------------- uninstall ----
 if [[ "$UNINSTALL" == 1 ]]; then
   info "Removing sidecar binaries from $BIN_DIR"
-  for bin in tuwunel tor; do
+  for bin in tuwunel tor turnserver; do
     if [[ -e "$BIN_DIR/$bin" ]]; then
       rm -f "$BIN_DIR/$bin"
       ok "removed $BIN_DIR/$bin"
@@ -151,8 +152,47 @@ fetch_tor() {
   fi
 }
 
+# ------------------------------------------------------------- turnserver ----
+# Optional: 1:1 voice. A missing turnserver leaves the box fully functional
+# (chat + federation), just without calls — so this never fails the script.
+fetch_turn() {
+  local dest="$BIN_DIR/turnserver"
+
+  if [[ "$FORCE" == 0 && -x "$dest" ]] && verify "$dest"; then
+    ok "turnserver already present ($("$dest" --version 2>/dev/null | head -n1)) — skipping"
+    return 0
+  fi
+
+  local sys_turn=""
+  for p in "$(command -v turnserver 2>/dev/null || true)" /usr/bin/turnserver /usr/sbin/turnserver /usr/local/bin/turnserver; do
+    [[ -n "$p" && -x "$p" ]] && { sys_turn="$p"; break; }
+  done
+
+  if [[ -z "$sys_turn" ]] && command -v apt-get >/dev/null 2>&1; then
+    warn "No system coturn found — installing via apt (prompts for sudo)"
+    sudo apt-get install -y coturn || { warn "apt-get install coturn failed — voice will be unavailable"; return 1; }
+    for p in /usr/bin/turnserver /usr/sbin/turnserver; do [[ -x "$p" ]] && { sys_turn="$p"; break; }; done
+  fi
+
+  if [[ -z "$sys_turn" ]]; then
+    warn "No coturn available — the box will run WITHOUT 1:1 voice."
+    warn "Install it later with: sudo apt-get install coturn   (then re-run this script)"
+    return 1
+  fi
+
+  cp "$sys_turn" "$dest" || { warn "failed to copy $sys_turn — voice unavailable"; return 1; }
+  chmod 0755 "$dest"
+  if verify "$dest"; then
+    ok "turnserver installed: $("$dest" --version 2>/dev/null | head -n1)"
+  else
+    warn "turnserver copied but '$dest --version' failed — voice may not work"
+    return 1
+  fi
+}
+
 fetch_tuwunel || FAILURES=$((FAILURES + 1))
 fetch_tor     || FAILURES=$((FAILURES + 1))
+fetch_turn    || warn "voice (coturn) not installed — this is OPTIONAL, box still works"
 
 echo
 if [[ "$FAILURES" -gt 0 ]]; then

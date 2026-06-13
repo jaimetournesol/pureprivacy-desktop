@@ -62,6 +62,9 @@ pub struct Inner {
     pub setup_stage: Option<SetupStage>,
     pub homeserver: ServiceState,
     pub tor: ServiceState,
+    /// coturn (1:1 voice). Optional sidecar: `Stopped` if the binary is absent
+    /// or the box is running without voice — never blocks the box.
+    pub voice: ServiceState,
     pub people_count: u32,
     pub paired_count: u32,
     pub box_name: String,
@@ -71,6 +74,10 @@ pub struct Inner {
     pub phrase: Vec<String>,
     /// Hex pairing token embedded in the connect QR, empty until `begin_setup`.
     pub token: String,
+    /// coturn long-term auth secret; the homeserver signs short-lived TURN
+    /// credentials with it. Generated at `begin_setup`, persisted with the
+    /// other secrets. Empty until then.
+    pub turn_secret: String,
 }
 
 impl Default for Inner {
@@ -82,6 +89,7 @@ impl Default for Inner {
             setup_stage: None,
             homeserver: ServiceState::Stopped,
             tor: ServiceState::Stopped,
+            voice: ServiceState::Stopped,
             people_count: 0,
             paired_count: 0,
             box_name: String::new(),
@@ -89,6 +97,7 @@ impl Default for Inner {
             created: String::new(),
             phrase: Vec::new(),
             token: String::new(),
+            turn_secret: String::new(),
         }
     }
 }
@@ -103,6 +112,7 @@ impl Inner {
             services: vec![
                 Service { name: "homeserver", state: self.homeserver },
                 Service { name: "tor", state: self.tor },
+                Service { name: "voice", state: self.voice },
             ],
             people_count: self.people_count,
             paired_count: self.paired_count,
@@ -159,6 +169,8 @@ struct PersistedBox {
 struct PersistedSecrets {
     phrase: Vec<String>,
     token: String,
+    #[serde(default)]
+    turn_secret: String,
 }
 
 pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -196,7 +208,11 @@ pub fn persist(app: &AppHandle) -> Result<(), String> {
                 created: inner.created.clone(),
                 onion: inner.onion.clone(),
             },
-            PersistedSecrets { phrase: inner.phrase.clone(), token: inner.token.clone() },
+            PersistedSecrets {
+                phrase: inner.phrase.clone(),
+                token: inner.token.clone(),
+                turn_secret: inner.turn_secret.clone(),
+            },
         )
     });
     write_private(
@@ -228,5 +244,6 @@ pub fn load_persisted(app: &AppHandle) {
         inner.onion = boxed.onion;
         inner.phrase = secrets.phrase;
         inner.token = secrets.token;
+        inner.turn_secret = secrets.turn_secret;
     });
 }

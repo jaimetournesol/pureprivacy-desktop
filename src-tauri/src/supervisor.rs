@@ -33,7 +33,7 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 
-use crate::config::{self, HOMESERVER_PORT};
+use crate::config::{self, HOMESERVER_PORT, TURN_PORT};
 use crate::state::{self, Phase, ServiceState, SetupStage};
 
 const DEMO_ONION: &str = "demo7gk2x4adqlmnop.onion";
@@ -106,6 +106,12 @@ fn binaries_present(app: &AppHandle) -> bool {
     }
 }
 
+/// Voice (coturn) is an OPTIONAL sidecar: a box without `turnserver` still
+/// runs, just without 1:1 calls. Probed separately from the required binaries.
+fn turn_present(app: &AppHandle) -> bool {
+    bin_dir(app).map(|d| d.join("turnserver").is_file()).unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle entry points (called from commands + tray)
 // ---------------------------------------------------------------------------
@@ -147,6 +153,7 @@ pub fn stop_lifecycle(app: &AppHandle) {
         inner.setup_stage = None;
         inner.homeserver = ServiceState::Stopped;
         inner.tor = ServiceState::Stopped;
+        inner.voice = ServiceState::Stopped;
     });
 }
 
@@ -186,9 +193,10 @@ async fn run_real(app: AppHandle, gen: u64) -> Result<(), String> {
     let paths = config::ensure_dirs(&app)?;
     config::render_torrc(&app)?;
     // Placeholder so the file always exists; re-rendered with the real onion
-    // below, before tuwunel ever starts.
+    // below, before tuwunel ever starts. No turn block until we have the onion.
     let known_onion = state::read(&app, |inner| inner.onion.clone());
-    config::render_tuwunel(&app, known_onion.as_deref().unwrap_or("placeholder.onion"))?;
+    let turn_secret = state::read(&app, |inner| inner.turn_secret.clone());
+    config::render_tuwunel(&app, known_onion.as_deref().unwrap_or("placeholder.onion"), "")?;
 
     let bins = bin_dir(&app)?;
     spawn_supervised(
@@ -207,8 +215,9 @@ async fn run_real(app: AppHandle, gen: u64) -> Result<(), String> {
     state::update(&app, |inner| inner.onion = Some(onion.clone()));
     let _ = state::persist(&app);
 
-    // Now we know the server_name; render for real and start the homeserver.
-    config::render_tuwunel(&app, &onion)?;
+    // Now we know the server_name; render for real (incl. the turn_uris block
+    // when we have a secret) and start the homeserver.
+    config::render_tuwunel(&app, &onion, &turn_secret)?;
     spawn_supervised(
         app.clone(),
         gen,
@@ -217,6 +226,25 @@ async fn run_real(app: AppHandle, gen: u64) -> Result<(), String> {
         vec!["-c".into(), paths.tuwunel_toml.to_string_lossy().into_owned()],
         Readiness::Http(HOMESERVER_PORT),
     );
+
+    // Optional 1:1-voice sidecar. Render its config (needs the onion + secret)
+    // and supervise it like the others — but only if the binary is present and
+    // a secret exists. A box without voice just leaves this Stopped; it never
+    // blocks startup.
+    if turn_present(&app) && !turn_secret.is_empty() {
+        if let Err(e) = config::render_turnserver(&app, &onion, &turn_secret) {
+            eprintln!("[pureprivacy] voice config skipped: {e}");
+        } else {
+            spawn_supervised(
+                app.clone(),
+                gen,
+                "voice",
+                bins.join("turnserver"),
+                vec!["-c".into(), paths.turnserver_conf.to_string_lossy().into_owned()],
+                Readiness::Tcp(TURN_PORT),
+            );
+        }
+    }
 
     wait_for_http(&app, gen, HOMESERVER_PORT, Duration::from_secs(120)).await?;
     if is_stale(&app, gen) {
@@ -302,6 +330,8 @@ enum Readiness {
     File(PathBuf),
     /// Healthy once GET /_matrix/client/versions answers 200 on this port.
     Http(u16),
+    /// Healthy once a TCP connection to this loopback port succeeds (coturn).
+    Tcp(u16),
 }
 
 impl Readiness {
@@ -309,6 +339,7 @@ impl Readiness {
         match self {
             Readiness::File(path) => std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false),
             Readiness::Http(port) => http_versions_ok(*port).await,
+            Readiness::Tcp(port) => TcpStream::connect(("127.0.0.1", *port)).await.is_ok(),
         }
     }
 }
@@ -317,6 +348,7 @@ fn set_service(app: &AppHandle, name: &'static str, value: ServiceState) {
     state::update(app, |inner| match name {
         "tor" => inner.tor = value,
         "homeserver" => inner.homeserver = value,
+        "voice" => inner.voice = value,
         _ => {}
     });
 }

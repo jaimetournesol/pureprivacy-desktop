@@ -51,6 +51,10 @@ pub fn begin_setup(
         WORDS.choose_multiple(&mut rng, 6).map(|w| w.to_string()).collect();
     let token_bytes: [u8; 16] = rng.gen();
     let token: String = token_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // coturn long-term auth secret (32 random bytes, hex). The homeserver signs
+    // short-lived TURN credentials with it; never leaves the box.
+    let turn_bytes: [u8; 32] = rng.gen();
+    let turn_secret: String = turn_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let created = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
 
     state::update(&app, |inner| {
@@ -59,6 +63,7 @@ pub fn begin_setup(
         inner.created = created;
         inner.phrase = phrase;
         inner.token = token;
+        inner.turn_secret = turn_secret;
     });
     state::persist(&app)?;
 
