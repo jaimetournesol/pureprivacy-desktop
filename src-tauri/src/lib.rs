@@ -4,6 +4,7 @@
 mod account;
 mod commands;
 mod config;
+mod pairing;
 mod state;
 mod supervisor;
 mod tray;
@@ -31,6 +32,10 @@ pub fn run() {
             commands::get_join_info,
             commands::app_info,
             commands::reset_box,
+            commands::pair_create,
+            commands::pair_accept,
+            commands::pair_list,
+            commands::pair_remove,
         ])
         .setup(|app| {
             state::load_persisted(app.handle());

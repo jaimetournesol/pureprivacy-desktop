@@ -259,5 +259,6 @@ pub fn load_persisted(app: &AppHandle) {
         inner.token = secrets.token;
         inner.turn_secret = secrets.turn_secret;
         inner.join_token = secrets.join_token;
+        inner.paired_count = crate::pairing::onions(&dir).len() as u32;
     });
 }

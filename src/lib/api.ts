@@ -138,6 +138,35 @@ export function resetBox(): Promise<null> {
   return invoke<null>("reset_box");
 }
 
+export interface PairCodeOut {
+  code: string;
+  /** QR of the pair code. */
+  svg: string;
+}
+
+export interface Pairing {
+  onion: string;
+  added_at: number;
+}
+
+/** Mint a 15-minute pair code for a friend's box to accept. */
+export function pairCreate(): Promise<PairCodeOut> {
+  return invoke<PairCodeOut>("pair_create");
+}
+
+/** Accept a friend's pair code → add them to the federation allowlist. */
+export function pairAccept(code: string): Promise<string> {
+  return invoke<string>("pair_accept", { code });
+}
+
+export function pairList(): Promise<Pairing[]> {
+  return invoke<Pairing[]>("pair_list");
+}
+
+export function pairRemove(onion: string): Promise<null> {
+  return invoke<null>("pair_remove", { onion });
+}
+
 /* ── status store, polled every 1.5 s ─────────────────────────── */
 
 export const status: Writable<Status | null> = writable(null);

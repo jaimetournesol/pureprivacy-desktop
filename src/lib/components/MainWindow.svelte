@@ -9,6 +9,7 @@
   } from "$lib/api";
   import PeoplePanel from "./PeoplePanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
+  import BoxesPanel from "./BoxesPanel.svelte";
 
   let { st }: { st: Status } = $props();
 
@@ -27,14 +28,14 @@
   const nav: { key: View; label: string; soon?: boolean }[] = [
     { key: "home", label: "Home" },
     { key: "people", label: "People" },
-    { key: "boxes", label: "Boxes", soon: true },
+    { key: "boxes", label: "Boxes" },
     { key: "agent", label: "Agent", soon: true },
     { key: "settings", label: "Settings" },
   ];
 
   const actionCards: { title: string; blurb: string; go?: View }[] = [
     { title: "Add a person", blurb: "Invite someone to message you.", go: "people" },
-    { title: "Pair with a box", blurb: "Link up with a friend's box." },
+    { title: "Pair with a box", blurb: "Link up with a friend's box.", go: "boxes" },
     { title: "Back up now", blurb: "Keep a fresh copy of your keys.", go: "settings" },
   ];
 
@@ -116,6 +117,8 @@
 
   {#if view === "people"}
     <main class="content"><PeoplePanel {st} /></main>
+  {:else if view === "boxes"}
+    <main class="content"><BoxesPanel {st} /></main>
   {:else if view === "settings"}
     <main class="content"><SettingsPanel {st} /></main>
   {:else}

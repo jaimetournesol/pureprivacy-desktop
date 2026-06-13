@@ -33,7 +33,7 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 
-use crate::config::{self, HOMESERVER_PORT, TURN_PORT};
+use crate::config::{self, FEDPROXY_PORT, HOMESERVER_PORT, TURN_PORT};
 use crate::state::{self, Phase, ServiceState, SetupStage};
 
 const DEMO_ONION: &str = "demo7gk2x4adqlmnop.onion";
@@ -112,6 +112,13 @@ fn turn_present(app: &AppHandle) -> bool {
     bin_dir(app).map(|d| d.join("turnserver").is_file()).unwrap_or(false)
 }
 
+/// The Caddy fed-proxy is what enforces the paired-peer federation allowlist
+/// (Option B). Optional like voice: without it, chat works but inbound
+/// federation is off (no TLS terminator / allowlist).
+fn caddy_present(app: &AppHandle) -> bool {
+    bin_dir(app).map(|d| d.join("caddy").is_file()).unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle entry points (called from commands + tray)
 // ---------------------------------------------------------------------------
@@ -158,6 +165,36 @@ pub fn stop_lifecycle(app: &AppHandle) {
         inner.tor = ServiceState::Stopped;
         inner.voice = ServiceState::Stopped;
     });
+}
+
+/// Re-render the fed-proxy allowlist from the current pairings and hot-reload
+/// Caddy — no stack restart (so tor circuits + the homeserver stay up). If the
+/// box isn't running, `caddy reload` simply fails harmlessly and the new
+/// Caddyfile applies on the next start. Called after every pairing change.
+pub fn reload_fedproxy(app: &AppHandle) {
+    let Ok(paths) = config::paths(app) else { return };
+    if let Some(onion) = state::read(app, |i| i.onion.clone()) {
+        let _ = config::ensure_fed_cert(app, &onion);
+    }
+    let peers = crate::pairing::onions(&paths.data_root);
+    if config::render_caddyfile(app, &peers).is_err() || !caddy_present(app) {
+        return;
+    }
+    if let Ok(bins) = bin_dir(app) {
+        // `caddy reload` talks to the running instance's admin API and swaps
+        // config atomically; no-op (errors ignored) if caddy isn't running.
+        let _ = std::process::Command::new(bins.join("caddy"))
+            .args([
+                "reload",
+                "--config",
+                &paths.caddyfile.to_string_lossy(),
+                "--adapter",
+                "caddyfile",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +286,35 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 vec!["-c".into(), paths.turnserver_conf.to_string_lossy().into_owned()],
                 Readiness::Tcp(TURN_PORT),
             );
+        }
+    }
+
+    // Federation fed-proxy (Caddy): TLS-terminate inbound federation and enforce
+    // the paired-peer allowlist rendered from pairings.json (Option B). Optional
+    // like voice — a missing caddy binary just means no inbound federation; chat
+    // still works. The Caddyfile is re-rendered from pairings on every boot, so
+    // a pair change followed by a restart picks up the new allowlist.
+    if caddy_present(&app) {
+        match (|| -> Result<(), String> {
+            config::ensure_fed_cert(&app, &onion)?;
+            let peers = crate::pairing::onions(&paths.data_root);
+            config::render_caddyfile(&app, &peers)
+        })() {
+            Ok(()) => spawn_supervised(
+                app.clone(),
+                gen,
+                "fedproxy",
+                bins.join("caddy"),
+                vec![
+                    "run".into(),
+                    "--config".into(),
+                    paths.caddyfile.to_string_lossy().into_owned(),
+                    "--adapter".into(),
+                    "caddyfile".into(),
+                ],
+                Readiness::Tcp(FEDPROXY_PORT),
+            ),
+            Err(e) => eprintln!("[pureprivacy] federation proxy skipped: {e}"),
         }
     }
 

@@ -7,6 +7,7 @@ use rand::Rng;
 use serde::Serialize;
 use tauri::AppHandle;
 
+use crate::pairing;
 use crate::state::{self, Phase, Status};
 use crate::supervisor;
 use crate::words::WORDS;
@@ -305,6 +306,74 @@ pub fn reset_box(app: AppHandle) -> Result<(), String> {
     }
     state::reset_to_fresh(&app);
     Ok(())
+}
+
+// ── Federation pairing ───────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct PairCodeOut {
+    pub code: String,
+    pub svg: String,
+}
+
+/// Mint a 15-minute pair code carrying this box's address, for a friend's box
+/// to accept. (They paste it into their Boxes → Accept; you paste theirs.)
+#[tauri::command]
+pub fn pair_create(app: AppHandle) -> Result<PairCodeOut, String> {
+    let onion = state::read(&app, |i| i.onion.clone())
+        .ok_or("Your box doesn't have an address yet.")?;
+    let mut rng = rand::thread_rng();
+    let nonce: [u8; 8] = rng.gen();
+    let nonce_hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let code = pairing::mint_code(&onion, &nonce_hex)?;
+    let svg = render_qr_svg(&code)?;
+    Ok(PairCodeOut { code, svg })
+}
+
+/// Accept another box's pair code: add it to the federation allowlist and
+/// hot-reload the fed-proxy. Returns the peer's onion.
+#[tauri::command]
+pub fn pair_accept(app: AppHandle, code: String) -> Result<String, String> {
+    let my_onion = state::read(&app, |i| i.onion.clone());
+    let peer = pairing::parse_code(&code)?;
+    if my_onion.as_deref() == Some(peer.as_str()) {
+        return Err("That's this box's own code — paste your friend's code instead.".into());
+    }
+    let dir = state::app_data_dir(&app)?;
+    pairing::add(&dir, &peer)?;
+    refresh_paired_count(&app, &dir);
+    supervisor::reload_fedproxy(&app);
+    Ok(peer)
+}
+
+#[derive(Serialize)]
+pub struct PairingView {
+    pub onion: String,
+    pub added_at: u64,
+}
+
+#[tauri::command]
+pub fn pair_list(app: AppHandle) -> Result<Vec<PairingView>, String> {
+    let dir = state::app_data_dir(&app)?;
+    Ok(pairing::load(&dir)
+        .peers
+        .into_iter()
+        .map(|p| PairingView { onion: p.onion, added_at: p.added_at })
+        .collect())
+}
+
+#[tauri::command]
+pub fn pair_remove(app: AppHandle, onion: String) -> Result<(), String> {
+    let dir = state::app_data_dir(&app)?;
+    pairing::remove(&dir, &onion)?;
+    refresh_paired_count(&app, &dir);
+    supervisor::reload_fedproxy(&app);
+    Ok(())
+}
+
+fn refresh_paired_count(app: &AppHandle, dir: &std::path::Path) {
+    let count = pairing::onions(dir).len() as u32;
+    state::update(app, |i| i.paired_count = count);
 }
 
 #[tauri::command]

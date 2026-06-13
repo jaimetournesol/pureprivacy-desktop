@@ -31,3 +31,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # mgmt). rustls so we never link the system OpenSSL; the only target is
 # http://127.0.0.1, but the builder needs a TLS backend present.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Federation pairing: base64 pair codes + a self-signed cert (CN = the onion)
+# for the Caddy fed-proxy's TLS termination.
+base64 = "0.22"
+rcgen = "0.13"

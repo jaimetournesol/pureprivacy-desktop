@@ -48,7 +48,7 @@ done
 # ------------------------------------------------------------- uninstall ----
 if [[ "$UNINSTALL" == 1 ]]; then
   info "Removing sidecar binaries from $BIN_DIR"
-  for bin in tuwunel tor turnserver; do
+  for bin in tuwunel tor turnserver caddy; do
     if [[ -e "$BIN_DIR/$bin" ]]; then
       rm -f "$BIN_DIR/$bin"
       ok "removed $BIN_DIR/$bin"
@@ -190,9 +190,41 @@ fetch_turn() {
   fi
 }
 
+# --------------------------------------------------------------- caddy ------
+# The federation fed-proxy: TLS-terminates inbound federation + enforces the
+# paired-peer allowlist. Without it the box runs (chat works) but cannot accept
+# inbound federation — so it's strongly recommended, not strictly required.
+fetch_caddy() {
+  local dest="$BIN_DIR/caddy"
+  if [[ "$FORCE" == 0 && -x "$dest" ]] && verify "$dest"; then
+    ok "caddy already present ($("$dest" version 2>/dev/null | head -n1)) — skipping"
+    return 0
+  fi
+  local sys=""
+  for p in "$(command -v caddy 2>/dev/null || true)" /usr/bin/caddy /usr/local/bin/caddy; do
+    [[ -n "$p" && -x "$p" ]] && { sys="$p"; break; }
+  done
+  if [[ -n "$sys" ]]; then
+    cp "$sys" "$dest" && chmod 0755 "$dest" && { ok "caddy installed: $("$dest" version 2>/dev/null | head -n1)"; return 0; }
+  fi
+  # No system caddy: extract from the official image (same trick as tuwunel).
+  if command -v docker >/dev/null 2>&1; then
+    info "Extracting caddy from caddy:2.8-alpine"
+    docker pull --quiet caddy:2.8-alpine >/dev/null 2>&1 || true
+    local cid
+    cid="$(docker create caddy:2.8-alpine 2>/dev/null)" || { warn "couldn't get caddy — inbound federation will be off"; return 1; }
+    docker cp "$cid:/usr/bin/caddy" "$dest" >/dev/null 2>&1
+    docker rm -f "$cid" >/dev/null 2>&1
+    [[ -x "$dest" ]] && chmod 0755 "$dest" && verify "$dest" && { ok "caddy installed: $("$dest" version 2>/dev/null | head -n1)"; return 0; }
+  fi
+  warn "No caddy available — inbound federation (pairing) will be OFF until installed."
+  return 1
+}
+
 fetch_tuwunel || FAILURES=$((FAILURES + 1))
 fetch_tor     || FAILURES=$((FAILURES + 1))
 fetch_turn    || warn "voice (coturn) not installed — this is OPTIONAL, box still works"
+fetch_caddy   || warn "caddy (fed-proxy) not installed — pairing/federation will be unavailable"
 
 echo
 if [[ "$FAILURES" -gt 0 ]]; then

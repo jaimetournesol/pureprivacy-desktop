@@ -34,12 +34,20 @@ pub const TURN_PORT: u16 = 3479;
 /// construction; if you change them, both files re-render together.
 pub const TURN_RELAY_PORT_MIN: u16 = 61000;
 pub const TURN_RELAY_PORT_MAX: u16 = 61039;
+/// Caddy fed-proxy: TLS-terminates inbound federation and enforces the paired-
+/// peer allowlist (tuwunel has no allowlist of its own). tor maps the onion's
+/// federation port 8448 here; Caddy reverse-proxies to the homeserver.
+pub const FEDPROXY_PORT: u16 = 8449;
 
 pub struct Paths {
     pub config_dir: PathBuf,
     pub torrc: PathBuf,
     pub tuwunel_toml: PathBuf,
     pub turnserver_conf: PathBuf,
+    pub caddyfile: PathBuf,
+    pub fed_cert: PathBuf,
+    pub fed_key: PathBuf,
+    pub data_root: PathBuf,
     pub tor_data: PathBuf,
     pub hs_dir: PathBuf,
     pub hostname_file: PathBuf,
@@ -55,8 +63,12 @@ pub fn paths(app: &AppHandle) -> Result<Paths, String> {
         torrc: config_dir.join("torrc"),
         tuwunel_toml: config_dir.join("tuwunel.toml"),
         turnserver_conf: config_dir.join("turnserver.conf"),
+        caddyfile: config_dir.join("Caddyfile"),
+        fed_cert: config_dir.join("fed-cert.pem"),
+        fed_key: config_dir.join("fed-key.pem"),
         hostname_file: hs_dir.join("hostname"),
         tuwunel_data: base.join("data").join("tuwunel"),
+        data_root: base.clone(),
         config_dir,
         tor_data,
         hs_dir,
@@ -72,6 +84,15 @@ fn set_0700(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn set_0700(_path: &std::path::Path) {}
 
+#[cfg(unix)]
+fn set_0600(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn set_0600(_path: &std::path::Path) {}
+
 /// Create config/data directories. The hidden-service dir must be 0700 or
 /// tor refuses to start.
 pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
@@ -86,7 +107,9 @@ pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
 }
 
 /// Pure builder for torrc — unit-tested; `render_torrc` just adds paths + I/O.
-fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16) -> String {
+/// Federation (8448) goes to the Caddy fed-proxy (TLS + allowlist); the client
+/// API (8008) and TURN go straight to their services.
+fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16) -> String {
     // NoIsolateClientAddr: share circuits across local SOCKS clients.
     // G1 finding (2026-06-13): tor's default per-client isolation hands the
     // homeserver cold circuits, and first-contact federation then exceeds
@@ -95,7 +118,7 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16) -> String {
         "SocksPort {socks} NoIsolateClientAddr\n\
          DataDirectory {data}\n\
          HiddenServiceDir {hs}\n\
-         HiddenServicePort 8448 127.0.0.1:{hsport}\n\
+         HiddenServicePort 8448 127.0.0.1:{fedproxy}\n\
          HiddenServicePort 8008 127.0.0.1:{hsport}\n\
          HiddenServicePort 3478 127.0.0.1:{turn}\n\
          HiddenServicePort 5349 127.0.0.1:{turn}\n",
@@ -117,6 +140,7 @@ pub fn render_torrc(app: &AppHandle) -> Result<(), String> {
         &p.tor_data.display().to_string(),
         &p.hs_dir.display().to_string(),
         HOMESERVER_PORT,
+        FEDPROXY_PORT,
     );
     std::fs::write(&p.torrc, torrc).map_err(|e| format!("couldn't write torrc: {e}"))
 }
@@ -247,6 +271,76 @@ pub fn render_turnserver(app: &AppHandle, onion: &str, turn_secret: &str) -> Res
         .map_err(|e| format!("couldn't write turnserver.conf: {e}"))
 }
 
+/// Pure builder for the fed-proxy Caddyfile — unit-tested. Enforces the
+/// paired-peer allowlist (Option B, verified): key-exchange/discovery is open
+/// (peers need it before they can be allowlisted); the authenticated federation
+/// API is allowed only when the X-Matrix `Authorization` origin is a paired
+/// peer; everything else is 403. With NO peers, the `@paired` block is omitted
+/// entirely, so all authenticated federation is refused.
+fn caddyfile_string(caddy_port: u16, hs_port: u16, cert: &str, key: &str, peers: &[String]) -> String {
+    let mut s = format!(
+        "{{\n\
+         \tauto_https off\n\
+         }}\n\
+         https://:{caddy_port} {{\n\
+         \ttls {cert} {key}\n\
+         \t@open path /_matrix/key/* /_matrix/federation/v1/version /.well-known/*\n\
+         \thandle @open {{\n\
+         \t\treverse_proxy http://127.0.0.1:{hs_port}\n\
+         \t}}\n"
+    );
+    if !peers.is_empty() {
+        // origin="(p1\.onion|p2\.onion)". Onions are [a-z2-7]+.onion, so only
+        // the dot needs escaping. (Do NOT wrap the regex in backticks — that
+        // silently fails to match; gotcha proven 2026-06-13.)
+        let alt = peers
+            .iter()
+            .map(|o| o.replace('.', "\\."))
+            .collect::<Vec<_>>()
+            .join("|");
+        let _ = write!(
+            s,
+            "\t@paired header_regexp Authorization origin=\"({alt})\"\n\
+             \thandle @paired {{\n\
+             \t\treverse_proxy http://127.0.0.1:{hs_port}\n\
+             \t}}\n"
+        );
+    }
+    s.push_str("\thandle {\n\t\trespond \"not a paired peer\" 403\n\t}\n}\n");
+    s
+}
+
+/// Render the fed-proxy Caddyfile from the current pairings.
+pub fn render_caddyfile(app: &AppHandle, peers: &[String]) -> Result<(), String> {
+    let p = paths(app)?;
+    let conf = caddyfile_string(
+        FEDPROXY_PORT,
+        HOMESERVER_PORT,
+        &p.fed_cert.display().to_string(),
+        &p.fed_key.display().to_string(),
+        peers,
+    );
+    std::fs::write(&p.caddyfile, conf).map_err(|e| format!("couldn't write Caddyfile: {e}"))
+}
+
+/// Mint the fed-proxy's self-signed TLS cert (CN = the onion). Peers accept it
+/// because they federate with `allow_invalid_tls_certificates` (onion-only).
+/// Idempotent: only generates if the cert is missing.
+pub fn ensure_fed_cert(app: &AppHandle, onion: &str) -> Result<(), String> {
+    let p = paths(app)?;
+    if p.fed_cert.is_file() && p.fed_key.is_file() {
+        return Ok(());
+    }
+    let certified = rcgen::generate_simple_self_signed(vec![onion.to_string()])
+        .map_err(|e| format!("couldn't mint federation cert: {e}"))?;
+    std::fs::write(&p.fed_cert, certified.cert.pem())
+        .map_err(|e| format!("couldn't write fed cert: {e}"))?;
+    std::fs::write(&p.fed_key, certified.key_pair.serialize_pem())
+        .map_err(|e| format!("couldn't write fed key: {e}"))?;
+    set_0600(&p.fed_key);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,15 +351,34 @@ mod tests {
 
     #[test]
     fn torrc_publishes_every_relay_port_plus_the_fixed_ones() {
-        let torrc = torrc_string(9150, "/d", "/d/hs", 8118);
+        let torrc = torrc_string(9150, "/d", "/d/hs", 8118, 8449);
         let lines = torrc.matches("HiddenServicePort").count();
         // 8448 + 8008 + 3478 + 5349 fixed, plus one per relay port.
         assert_eq!(lines, 4 + relay_count());
         assert!(torrc.contains("SocksPort 9150 NoIsolateClientAddr"));
+        // Federation (8448) goes to the fed-proxy; client API (8008) to tuwunel.
+        assert!(torrc.contains("HiddenServicePort 8448 127.0.0.1:8449"));
+        assert!(torrc.contains("HiddenServicePort 8008 127.0.0.1:8118"));
         // The coturn relay range and torrc MUST agree port-for-port.
         for p in [TURN_RELAY_PORT_MIN, TURN_RELAY_PORT_MAX] {
             assert!(torrc.contains(&format!("HiddenServicePort {p} 127.0.0.1:{p}")));
         }
+    }
+
+    #[test]
+    fn caddyfile_allowlists_paired_peers_only() {
+        let peers = vec!["aaa.onion".to_string(), "bbb.onion".to_string()];
+        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &peers);
+        // open endpoints + allowlist + catch-all 403
+        assert!(cf.contains("@open path /_matrix/key/*"));
+        assert!(cf.contains(r#"@paired header_regexp Authorization origin="(aaa\.onion|bbb\.onion)""#));
+        assert!(cf.contains("respond \"not a paired peer\" 403"));
+        assert!(cf.contains("reverse_proxy http://127.0.0.1:8118"));
+
+        // No peers → NO @paired block → all authed federation refused.
+        let none = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[]);
+        assert!(!none.contains("@paired"));
+        assert!(none.contains("respond \"not a paired peer\" 403"));
     }
 
     #[test]
