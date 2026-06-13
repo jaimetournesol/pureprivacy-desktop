@@ -7,8 +7,13 @@
     type ConnectQr,
     type Status,
   } from "$lib/api";
+  import PeoplePanel from "./PeoplePanel.svelte";
+  import SettingsPanel from "./SettingsPanel.svelte";
 
   let { st }: { st: Status } = $props();
+
+  type View = "home" | "people" | "boxes" | "agent" | "settings";
+  let view = $state<View>("home");
 
   let qr = $state<ConnectQr | null>(null);
   let showQr = $state(false);
@@ -18,12 +23,19 @@
   let toast = $state("");
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const navStubs = ["People", "Boxes", "Agent", "Settings"];
+  // Boxes (pairing) + Agent (MCP) land in later builds.
+  const nav: { key: View; label: string; soon?: boolean }[] = [
+    { key: "home", label: "Home" },
+    { key: "people", label: "People" },
+    { key: "boxes", label: "Boxes", soon: true },
+    { key: "agent", label: "Agent", soon: true },
+    { key: "settings", label: "Settings" },
+  ];
 
-  const actionCards = [
-    { title: "Add a person", blurb: "Invite someone to message you." },
+  const actionCards: { title: string; blurb: string; go?: View }[] = [
+    { title: "Add a person", blurb: "Invite someone to message you.", go: "people" },
     { title: "Pair with a box", blurb: "Link up with a friend's box." },
-    { title: "Back up now", blurb: "Keep a fresh copy of your keys." },
+    { title: "Back up now", blurb: "Keep a fresh copy of your keys.", go: "settings" },
   ];
 
   function showToast(msg: string) {
@@ -34,6 +46,11 @@
 
   function comingSoon() {
     showToast("Coming in the next build");
+  }
+
+  function onAction(go?: View) {
+    if (go) view = go;
+    else comingSoon();
   }
 
   async function copyAddress() {
@@ -78,15 +95,30 @@
 <div class="shell">
   <nav class="rail" aria-label="Main">
     <div class="rail-brand" aria-hidden="true">&#10059;</div>
-    <button class="rail-item active" aria-current="page">Home</button>
-    {#each navStubs as label}
-      <button class="rail-item" disabled title="Soon">
-        {label}
-        <span class="soon">soon</span>
-      </button>
+    {#each nav as item}
+      {#if item.soon}
+        <button class="rail-item" disabled title="Soon">
+          {item.label}
+          <span class="soon">soon</span>
+        </button>
+      {:else}
+        <button
+          class="rail-item"
+          class:active={view === item.key}
+          aria-current={view === item.key ? "page" : undefined}
+          onclick={() => (view = item.key)}
+        >
+          {item.label}
+        </button>
+      {/if}
     {/each}
   </nav>
 
+  {#if view === "people"}
+    <main class="content"><PeoplePanel {st} /></main>
+  {:else if view === "settings"}
+    <main class="content"><SettingsPanel {st} /></main>
+  {:else}
   <main class="content">
     <header class="topline">
       <h1>{st.box_name || "Your box"}</h1>
@@ -212,7 +244,7 @@
 
     <section class="actions-grid" aria-label="Actions">
       {#each actionCards as a}
-        <button class="card action-card" onclick={comingSoon}>
+        <button class="card action-card" onclick={() => onAction(a.go)}>
           <span class="action-title">{a.title}</span>
           <span class="dim action-blurb">{a.blurb}</span>
         </button>
@@ -223,6 +255,7 @@
       Your box runs while this computer is on — keep it awake and plugged in.
     </footer>
   </main>
+  {/if}
 
   {#if toast}
     <div class="toast" role="status">{toast}</div>

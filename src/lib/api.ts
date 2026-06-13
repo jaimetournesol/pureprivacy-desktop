@@ -111,6 +111,33 @@ export function detectLegacyInstall(): Promise<LegacyInstall> {
   return invoke<LegacyInstall>("detect_legacy_install");
 }
 
+export interface JoinInfo {
+  onion: string;
+  join_token: string;
+  /** QR encoding pureprivacy://join?hs=…&token=… */
+  svg: string;
+}
+
+/** What a new person needs to join this box (People → Add a person). */
+export function getJoinInfo(): Promise<JoinInfo> {
+  return invoke<JoinInfo>("get_join_info");
+}
+
+export interface AppInfo {
+  version: string;
+  data_dir: string;
+  demo_mode: boolean;
+}
+
+export function appInfo(): Promise<AppInfo> {
+  return invoke<AppInfo>("app_info");
+}
+
+/** Wipe the box and return to fresh setup. Destructive — confirm first. */
+export function resetBox(): Promise<null> {
+  return invoke<null>("reset_box");
+}
+
 /* ── status store, polled every 1.5 s ─────────────────────────── */
 
 export const status: Writable<Status | null> = writable(null);

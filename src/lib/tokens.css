@@ -156,6 +156,16 @@ p {
   border-color: var(--hairline-strong);
 }
 
+.btn-danger {
+  background: transparent;
+  color: var(--err);
+  border-color: var(--err);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--err) 14%, transparent);
+}
+
 .btn-subtle:hover:not(:disabled) {
   background: var(--surface-raised);
 }

@@ -234,6 +234,11 @@ pub fn persist(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Reset all in-memory state back to a fresh, unconfigured box (after a wipe).
+pub fn reset_to_fresh(app: &AppHandle) {
+    update(app, |inner| *inner = Inner::default());
+}
+
 /// Load persisted state at launch. If box.json exists the box was set up
 /// before, so we come up in `stopped` (the user explicitly starts it).
 pub fn load_persisted(app: &AppHandle) {

@@ -205,6 +205,24 @@ pub struct ConnectQr {
     pub svg: String,
 }
 
+/// Render `payload` to a complete `<svg>` QR (dark-on-white, scannable).
+pub fn render_qr_svg(payload: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(payload.as_bytes())
+        .map_err(|e| format!("Couldn't build the QR code: {e}"))?;
+    let rendered = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(240, 240)
+        .quiet_zone(true)
+        .dark_color(qrcode::render::svg::Color("#1A1A1A"))
+        .light_color(qrcode::render::svg::Color("#FFFFFF"))
+        .build();
+    // The renderer prefixes an XML declaration; we want a bare <svg> element.
+    Ok(match rendered.find("<svg") {
+        Some(idx) => rendered[idx..].to_string(),
+        None => rendered,
+    })
+}
+
 #[tauri::command]
 pub fn get_connect_qr(app: AppHandle) -> Result<ConnectQr, String> {
     let (onion, username, token) = state::read(&app, |inner| {
@@ -215,23 +233,78 @@ pub fn get_connect_qr(app: AppHandle) -> Result<ConnectQr, String> {
         return Err("Set up your box first.".into());
     }
     let payload = format!("pureprivacy://connect?hs={onion}&user={username}&token={token}");
-
-    let code = qrcode::QrCode::new(payload.as_bytes())
-        .map_err(|e| format!("Couldn't build the QR code: {e}"))?;
-    let rendered = code
-        .render::<qrcode::render::svg::Color>()
-        .min_dimensions(240, 240)
-        .quiet_zone(true)
-        .dark_color(qrcode::render::svg::Color("#1A1A1A"))
-        .light_color(qrcode::render::svg::Color("#FFFFFF"))
-        .build();
-    // The renderer prefixes an XML declaration; the contract wants a complete
-    // <svg> element, so trim anything before it.
-    let svg = match rendered.find("<svg") {
-        Some(idx) => rendered[idx..].to_string(),
-        None => rendered,
-    };
+    let svg = render_qr_svg(&payload)?;
     Ok(ConnectQr { payload, svg })
+}
+
+#[derive(Serialize)]
+pub struct JoinInfo {
+    /// The box's onion (the new person's homeserver address).
+    pub onion: String,
+    /// The registration token they enter to create their account.
+    pub join_token: String,
+    /// A QR encoding both, for the "show this to your friend" hand-off.
+    pub svg: String,
+}
+
+/// Everything a new person needs to join this box: the homeserver address + the
+/// registration token. The owner shows this (the People → Add a person flow);
+/// the person installs a client, points at the onion, and registers with the
+/// token. (tuwunel registration is token-gated — verified.)
+#[tauri::command]
+pub fn get_join_info(app: AppHandle) -> Result<JoinInfo, String> {
+    let (onion, join_token) =
+        state::read(&app, |inner| (inner.onion.clone(), inner.join_token.clone()));
+    let onion = onion.ok_or("Your box doesn't have an address yet.")?;
+    if join_token.is_empty() {
+        return Err("Set up your box first.".into());
+    }
+    let payload = format!("pureprivacy://join?hs={onion}&token={join_token}");
+    let svg = render_qr_svg(&payload)?;
+    Ok(JoinInfo { onion, join_token, svg })
+}
+
+#[derive(Serialize)]
+pub struct AppInfo {
+    pub version: String,
+    pub data_dir: String,
+    pub demo_mode: bool,
+}
+
+/// App + box facts for the Settings page.
+#[tauri::command]
+pub fn app_info(app: AppHandle) -> Result<AppInfo, String> {
+    let data_dir = state::app_data_dir(&app)?.to_string_lossy().into_owned();
+    let demo_mode = state::read(&app, |inner| inner.demo_mode);
+    Ok(AppInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        data_dir,
+        demo_mode,
+    })
+}
+
+/// Wipe the box: stop everything, delete the data dir (RocksDB, tor keys/onion,
+/// configs, secrets), and return to the fresh-setup state. Destructive and
+/// irreversible — the onion identity is gone. (Plan task T-UNINST; the GUI heir
+/// of `pureprivacy reset`.) The frontend confirms before calling this.
+#[tauri::command]
+pub fn reset_box(app: AppHandle) -> Result<(), String> {
+    supervisor::stop_lifecycle(&app);
+    let dir = state::app_data_dir(&app)?;
+    // Remove the mutable subdirs + secrets, but leave the (possibly bundled)
+    // bin/ dir alone so the next setup still finds the sidecars.
+    for sub in ["data", "config"] {
+        let p = dir.join(sub);
+        if p.exists() {
+            std::fs::remove_dir_all(&p).map_err(|e| format!("couldn't remove {}: {e}", p.display()))?;
+        }
+    }
+    for f in ["box.json", "secrets.json"] {
+        let p = dir.join(f);
+        let _ = std::fs::remove_file(&p);
+    }
+    state::reset_to_fresh(&app);
+    Ok(())
 }
 
 #[tauri::command]

@@ -28,6 +28,9 @@ pub fn run() {
             commands::stop_box,
             commands::start_box,
             commands::detect_legacy_install,
+            commands::get_join_info,
+            commands::app_info,
+            commands::reset_box,
         ])
         .setup(|app| {
             state::load_persisted(app.handle());
