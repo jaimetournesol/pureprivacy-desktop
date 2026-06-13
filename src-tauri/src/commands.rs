@@ -243,3 +243,54 @@ pub fn start_box(app: AppHandle) -> Result<(), String> {
     supervisor::start_lifecycle(&app);
     Ok(())
 }
+
+#[derive(serde::Serialize)]
+pub struct LegacyInstall {
+    /// True if a v0.1 Docker appliance is running on this machine.
+    pub present: bool,
+    /// The `pureprivacy-*` container names found (e.g. for the UI to list).
+    pub containers: Vec<String>,
+}
+
+/// Detect an existing v0.1 (Docker appliance) PurePrivacy install so the native
+/// app never silently orphans someone's running box. (Plan task T-MIG.) The
+/// native app uses a different engine (tuwunel, fresh server identity — no DB
+/// migration from Synapse), so the UI must offer an explicit choice rather than
+/// stomping the running stack. Best-effort: missing/!running docker => none.
+#[tauri::command]
+pub fn detect_legacy_install() -> Result<LegacyInstall, String> {
+    let out = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "name=pureprivacy-",
+            "--format",
+            "{{.Names}}",
+        ])
+        .output();
+    let containers: Vec<String> = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            // Don't mistake a second native install's helpers for the appliance:
+            // the v0.1 stack uses these exact service suffixes.
+            .filter(|l| {
+                l.starts_with("pureprivacy-")
+                    && (l.contains("synapse")
+                        || l.contains("tor")
+                        || l.contains("wizard")
+                        || l.contains("postgres")
+                        || l.contains("coturn")
+                        || l.contains("mcp"))
+            })
+            .map(String::from)
+            .collect(),
+        // docker absent, daemon down, or no perms => treat as "no legacy box".
+        _ => Vec::new(),
+    };
+    Ok(LegacyInstall {
+        present: !containers.is_empty(),
+        containers,
+    })
+}

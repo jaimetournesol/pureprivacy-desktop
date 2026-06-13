@@ -101,6 +101,16 @@ export function startBox(): Promise<null> {
   return invoke<null>("start_box");
 }
 
+export interface LegacyInstall {
+  present: boolean;
+  containers: string[];
+}
+
+/** Detect a running v0.1 Docker appliance so we never silently orphan it. */
+export function detectLegacyInstall(): Promise<LegacyInstall> {
+  return invoke<LegacyInstall>("detect_legacy_install");
+}
+
 /* ── status store, polled every 1.5 s ─────────────────────────── */
 
 export const status: Writable<Status | null> = writable(null);

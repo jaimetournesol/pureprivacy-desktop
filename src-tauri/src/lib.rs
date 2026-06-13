@@ -26,6 +26,7 @@ pub fn run() {
             commands::get_connect_qr,
             commands::stop_box,
             commands::start_box,
+            commands::detect_legacy_install,
         ])
         .setup(|app| {
             state::load_persisted(app.handle());
