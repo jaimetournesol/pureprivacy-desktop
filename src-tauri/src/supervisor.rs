@@ -404,17 +404,16 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 // ws://). Caddy terminates TLS on the onion's 7443 and proxies
                 // the WS upgrade to LiveKit.
                 ("LIVEKIT_URL".into(), format!("wss://{onion}:{LIVEKIT_WSS_ONION_PORT}")),
-                // ALL_PROXY is set but is NOT sufficient on lk-jwt 0.2.0: it
-                // dials peers with a `matrix://` URL, and Go's
-                // ProxyFromEnvironment only proxies http/https — so matrix://
-                // bypasses SOCKS and does a direct .onion DNS lookup that fails.
-                // (Live connect test, 2026-06-13: "lookup <onion>: no such
-                // host".) SAME-BOX group calls work; CROSS-INSTALL needs lk-jwt's
-                // outbound onion reach to go through Tor transparently — TODO:
-                // run lk-jwt behind a Tor gateway (AutomapHostsOnResolve +
-                // TransPort) or torsocks-wrap it. See the vault doc + the
-                // cross-install-voice findings.
-                ("ALL_PROXY".into(), format!("socks5h://127.0.0.1:{SOCKS_PORT}")),
+                // Route lk-jwt's remote-user validation over Tor. lk-jwt dials
+                // the peer as matrix://<onion>, but fclient rewrites that to
+                // https:// before the request — so Go's http.ProxyFromEnvironment
+                // honors HTTPS_PROXY (it does NOT read ALL_PROXY, and would skip
+                // a still-matrix:// scheme). socks5h:// makes Tor resolve the
+                // .onion. PROVEN over Tor by the live two-box connect test
+                // (2026-06-13: "Got user info for @bob:<onion>" → JWT minted).
+                // HTTP_PROXY too for the pre-flight well-known GET.
+                ("HTTPS_PROXY".into(), format!("socks5h://127.0.0.1:{SOCKS_PORT}")),
+                ("HTTP_PROXY".into(), format!("socks5h://127.0.0.1:{SOCKS_PORT}")),
                 // Accept the self-signed onion certs the federation path uses.
                 (
                     "LIVEKIT_INSECURE_SKIP_VERIFY_TLS".into(),
