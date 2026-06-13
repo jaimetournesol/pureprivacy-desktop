@@ -82,6 +82,13 @@ pub struct Inner {
     /// open-reg); used to create the admin on first run and shared by the owner
     /// to add more people. Generated at `begin_setup`.
     pub join_token: String,
+    /// LiveKit SFU API key (16 random bytes, hex). Shared by livekit-server and
+    /// lk-jwt so the JWTs lk-jwt mints are accepted by the SFU. Generated at
+    /// `begin_setup`, persisted with the other secrets. Empty until then.
+    pub livekit_api_key: String,
+    /// LiveKit SFU API secret (32 random bytes, hex). The signing secret paired
+    /// with `livekit_api_key`. Generated at `begin_setup`. Empty until then.
+    pub livekit_api_secret: String,
 }
 
 impl Default for Inner {
@@ -103,6 +110,8 @@ impl Default for Inner {
             token: String::new(),
             turn_secret: String::new(),
             join_token: String::new(),
+            livekit_api_key: String::new(),
+            livekit_api_secret: String::new(),
         }
     }
 }
@@ -178,6 +187,10 @@ struct PersistedSecrets {
     turn_secret: String,
     #[serde(default)]
     join_token: String,
+    #[serde(default)]
+    livekit_api_key: String,
+    #[serde(default)]
+    livekit_api_secret: String,
 }
 
 pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -220,6 +233,8 @@ pub fn persist(app: &AppHandle) -> Result<(), String> {
                 token: inner.token.clone(),
                 turn_secret: inner.turn_secret.clone(),
                 join_token: inner.join_token.clone(),
+                livekit_api_key: inner.livekit_api_key.clone(),
+                livekit_api_secret: inner.livekit_api_secret.clone(),
             },
         )
     });
@@ -259,6 +274,8 @@ pub fn load_persisted(app: &AppHandle) {
         inner.token = secrets.token;
         inner.turn_secret = secrets.turn_secret;
         inner.join_token = secrets.join_token;
+        inner.livekit_api_key = secrets.livekit_api_key;
+        inner.livekit_api_secret = secrets.livekit_api_secret;
         inner.paired_count = crate::pairing::onions(&dir).len() as u32;
     });
 }

@@ -33,7 +33,10 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 
-use crate::config::{self, FEDPROXY_PORT, HOMESERVER_PORT, TURN_PORT};
+use crate::config::{
+    self, FEDPROXY_PORT, HOMESERVER_PORT, LIVEKIT_WS_PORT, LIVEKIT_WSS_ONION_PORT, LKJWT_PORT,
+    SOCKS_PORT, TURN_PORT,
+};
 use crate::state::{self, Phase, ServiceState, SetupStage};
 
 const DEMO_ONION: &str = "demo7gk2x4adqlmnop.onion";
@@ -119,6 +122,26 @@ fn caddy_present(app: &AppHandle) -> bool {
     bin_dir(app).map(|d| d.join("caddy").is_file()).unwrap_or(false)
 }
 
+/// The LiveKit SFU (group calls / Element Call). Optional sidecar.
+fn livekit_present(app: &AppHandle) -> bool {
+    bin_dir(app).map(|d| d.join("livekit-server").is_file()).unwrap_or(false)
+}
+
+/// lk-jwt-service: validates a Matrix OpenID token and mints a LiveKit JWT.
+/// Optional sidecar — paired with livekit-server.
+fn lkjwt_present(app: &AppHandle) -> bool {
+    bin_dir(app).map(|d| d.join("lk-jwt-service").is_file()).unwrap_or(false)
+}
+
+/// Group-voice (Element Call) is enabled only when BOTH the SFU and the token
+/// service are present. This is the `voice` flag threaded into torrc / Caddyfile
+/// / tuwunel.toml: it gates the wss SFU site, the group-call onion port map, and
+/// the well_known livekit_url advertisement so a box without the binaries never
+/// promises a service it can't run.
+fn group_voice_present(app: &AppHandle) -> bool {
+    livekit_present(app) && lkjwt_present(app)
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle entry points (called from commands + tray)
 // ---------------------------------------------------------------------------
@@ -177,7 +200,10 @@ pub fn reload_fedproxy(app: &AppHandle) {
         let _ = config::ensure_fed_cert(app, &onion);
     }
     let peers = crate::pairing::onions(&paths.data_root);
-    if config::render_caddyfile(app, &peers).is_err() || !caddy_present(app) {
+    // Pass the current group_voice_present so the :7444 wss SFU site survives a
+    // pair-change reload (the Caddyfile is re-rendered wholesale here).
+    let voice = group_voice_present(app);
+    if config::render_caddyfile(app, &peers, voice).is_err() || !caddy_present(app) {
         return;
     }
     if let Ok(bins) = bin_dir(app) {
@@ -231,14 +257,26 @@ async fn run_demo(app: AppHandle, gen: u64) {
 
 async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> Result<(), String> {
     let paths = config::ensure_dirs(&app)?;
-    config::render_torrc(&app)?;
+    // Group calls (Element Call / LiveKit) are enabled only when both the SFU
+    // and the lk-jwt binaries are present. This flag gates the wss SFU site, the
+    // group-call onion port map, and the well_known livekit_url advertisement.
+    let voice = group_voice_present(&app);
+    config::render_torrc(&app, voice)?;
     // Placeholder so the file always exists; re-rendered with the real onion
     // below, before tuwunel ever starts. No turn / registration block until we
     // have the onion + secrets.
     let known_onion = state::read(&app, |inner| inner.onion.clone());
-    let (turn_secret, join_token, username) =
-        state::read(&app, |inner| (inner.turn_secret.clone(), inner.join_token.clone(), inner.username.clone()));
-    config::render_tuwunel(&app, known_onion.as_deref().unwrap_or("placeholder.onion"), "", "")?;
+    let (turn_secret, join_token, username, livekit_api_key, livekit_api_secret) =
+        state::read(&app, |inner| {
+            (
+                inner.turn_secret.clone(),
+                inner.join_token.clone(),
+                inner.username.clone(),
+                inner.livekit_api_key.clone(),
+                inner.livekit_api_secret.clone(),
+            )
+        });
+    config::render_tuwunel(&app, known_onion.as_deref().unwrap_or("placeholder.onion"), "", "", voice)?;
 
     let bins = bin_dir(&app)?;
     spawn_supervised(
@@ -247,6 +285,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
         "tor",
         bins.join("tor"),
         vec!["-f".into(), paths.torrc.to_string_lossy().into_owned()],
+        vec![],
         Readiness::File(paths.hostname_file.clone()),
     );
 
@@ -258,15 +297,16 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     let _ = state::persist(&app);
 
     // Now we know the server_name; render for real (incl. the turn_uris block
-    // when we have a secret, and token-gated registration) and start the
-    // homeserver.
-    config::render_tuwunel(&app, &onion, &turn_secret, &join_token)?;
+    // when we have a secret, the well_known livekit_url when voice is enabled,
+    // and token-gated registration) and start the homeserver.
+    config::render_tuwunel(&app, &onion, &turn_secret, &join_token, voice)?;
     spawn_supervised(
         app.clone(),
         gen,
         "homeserver",
         bins.join("tuwunel"),
         vec!["-c".into(), paths.tuwunel_toml.to_string_lossy().into_owned()],
+        vec![],
         Readiness::Http(HOMESERVER_PORT),
     );
 
@@ -284,6 +324,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 "voice",
                 bins.join("turnserver"),
                 vec!["-c".into(), paths.turnserver_conf.to_string_lossy().into_owned()],
+                vec![],
                 Readiness::Tcp(TURN_PORT),
             );
         }
@@ -298,7 +339,9 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
         match (|| -> Result<(), String> {
             config::ensure_fed_cert(&app, &onion)?;
             let peers = crate::pairing::onions(&paths.data_root);
-            config::render_caddyfile(&app, &peers)
+            // voice=group_voice_present so the :7444 wss SFU site is rendered
+            // from the start (not only after a pair-change reload).
+            config::render_caddyfile(&app, &peers, voice)
         })() {
             Ok(()) => spawn_supervised(
                 app.clone(),
@@ -312,9 +355,81 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                     "--adapter".into(),
                     "caddyfile".into(),
                 ],
+                vec![],
                 Readiness::Tcp(FEDPROXY_PORT),
             ),
             Err(e) => eprintln!("[pureprivacy] federation proxy skipped: {e}"),
+        }
+    }
+
+    // Optional group-call sidecars (Element Call / LiveKit). Both must be present
+    // (group_voice_present) and we need the shared api_key/secret. A box without
+    // them just runs without group calls — it never blocks startup. Spawned after
+    // the onion is known + tuwunel rendered + the caddy fed-proxy (which includes
+    // the wss SFU site) is launched, so lk-jwt's handed-out wss://<onion>:7443
+    // points at a site that exists.
+    if voice {
+        if livekit_api_key.is_empty() || livekit_api_secret.is_empty() {
+            eprintln!("[pureprivacy] group voice skipped: missing livekit api key/secret");
+        } else if let Err(e) =
+            config::render_livekit_yaml(&app, &livekit_api_key, &livekit_api_secret)
+        {
+            eprintln!("[pureprivacy] group voice skipped: {e}");
+        } else {
+            // LiveKit SFU: TCP-only signaling + media on loopback.
+            spawn_supervised(
+                app.clone(),
+                gen,
+                "livekit",
+                bins.join("livekit-server"),
+                vec!["--config".into(), paths.livekit_yaml.to_string_lossy().into_owned()],
+                vec![],
+                Readiness::Tcp(LIVEKIT_WS_PORT),
+            );
+            // lk-jwt-service: configured entirely by env (no args). It validates
+            // a caller's Matrix OpenID token and mints a LiveKit JWT.
+            //
+            // v0.1 used an /etc/hosts onion->fed-proxy override + CA trust;
+            // modernized to ALL_PROXY=socks5h. Revert path:
+            // docs/redesign/2026-06-voice-workarounds-vault.md
+            let lkjwt_envs: Vec<(String, String)> = vec![
+                ("LIVEKIT_KEY".into(), livekit_api_key.clone()),
+                ("LIVEKIT_SECRET".into(), livekit_api_secret.clone()),
+                // The env var is LIVEKIT_JWT_PORT (NOT LK_JWT_PORT) — lk-jwt
+                // 0.2.0 ignores the latter and falls back to 8080, which then
+                // mismatches the torrc onion map. (Caught by the live connect
+                // test, 2026-06-13.)
+                ("LIVEKIT_JWT_PORT".into(), LKJWT_PORT.to_string()),
+                // The wss SFU URL handed to clients (KEEP — Element Call refuses
+                // ws://). Caddy terminates TLS on the onion's 7443 and proxies
+                // the WS upgrade to LiveKit.
+                ("LIVEKIT_URL".into(), format!("wss://{onion}:{LIVEKIT_WSS_ONION_PORT}")),
+                // ALL_PROXY is set but is NOT sufficient on lk-jwt 0.2.0: it
+                // dials peers with a `matrix://` URL, and Go's
+                // ProxyFromEnvironment only proxies http/https — so matrix://
+                // bypasses SOCKS and does a direct .onion DNS lookup that fails.
+                // (Live connect test, 2026-06-13: "lookup <onion>: no such
+                // host".) SAME-BOX group calls work; CROSS-INSTALL needs lk-jwt's
+                // outbound onion reach to go through Tor transparently — TODO:
+                // run lk-jwt behind a Tor gateway (AutomapHostsOnResolve +
+                // TransPort) or torsocks-wrap it. See the vault doc + the
+                // cross-install-voice findings.
+                ("ALL_PROXY".into(), format!("socks5h://127.0.0.1:{SOCKS_PORT}")),
+                // Accept the self-signed onion certs the federation path uses.
+                (
+                    "LIVEKIT_INSECURE_SKIP_VERIFY_TLS".into(),
+                    "YES_I_KNOW_WHAT_I_AM_DOING".into(),
+                ),
+            ];
+            spawn_supervised(
+                app.clone(),
+                gen,
+                "lkjwt",
+                bins.join("lk-jwt-service"),
+                vec![],
+                lkjwt_envs,
+                Readiness::Tcp(LKJWT_PORT),
+            );
         }
     }
 
@@ -454,6 +569,7 @@ fn spawn_supervised(
     name: &'static str,
     program: PathBuf,
     args: Vec<String>,
+    envs: Vec<(String, String)>,
     readiness: Readiness,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -466,6 +582,7 @@ fn spawn_supervised(
 
             let mut cmd = Command::new(&program);
             cmd.args(&args)
+                .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

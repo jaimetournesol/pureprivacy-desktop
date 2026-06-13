@@ -60,6 +60,14 @@ pub fn begin_setup(
     // shared by the owner to add more people.
     let join_bytes: [u8; 16] = rng.gen();
     let join_token: String = join_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // LiveKit SFU credentials (Element Call group calls). The api_key (16 bytes)
+    // + api_secret (32 bytes), hex, are shared by livekit-server and lk-jwt so
+    // the JWTs lk-jwt mints are accepted by the SFU; never leave the box.
+    let livekit_key_bytes: [u8; 16] = rng.gen();
+    let livekit_api_key: String = livekit_key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let livekit_secret_bytes: [u8; 32] = rng.gen();
+    let livekit_api_secret: String =
+        livekit_secret_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let created = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
 
     state::update(&app, |inner| {
@@ -70,6 +78,8 @@ pub fn begin_setup(
         inner.token = token;
         inner.turn_secret = turn_secret;
         inner.join_token = join_token;
+        inner.livekit_api_key = livekit_api_key;
+        inner.livekit_api_secret = livekit_api_secret;
     });
     state::persist(&app)?;
 

@@ -18,6 +18,8 @@ set -euo pipefail
 
 BIN_DIR="${PUREPRIVACY_BIN_DIR:-$HOME/.local/share/ai.tournesol.pureprivacy/bin}"
 TUWUNEL_IMAGE="ghcr.io/matrix-construct/tuwunel:latest"
+LIVEKIT_IMAGE="livekit/livekit-server:v1.7.2"
+LKJWT_IMAGE="ghcr.io/element-hq/lk-jwt-service:0.2.0"
 
 # ---------------------------------------------------------------- colors ----
 if [[ -t 1 ]]; then
@@ -48,7 +50,7 @@ done
 # ------------------------------------------------------------- uninstall ----
 if [[ "$UNINSTALL" == 1 ]]; then
   info "Removing sidecar binaries from $BIN_DIR"
-  for bin in tuwunel tor turnserver caddy; do
+  for bin in tuwunel tor turnserver caddy livekit-server lk-jwt-service; do
     if [[ -e "$BIN_DIR/$bin" ]]; then
       rm -f "$BIN_DIR/$bin"
       ok "removed $BIN_DIR/$bin"
@@ -221,10 +223,64 @@ fetch_caddy() {
   return 1
 }
 
+# --------------------------------------------------------------- livekit ----
+# Optional: group calls (Element Call / LiveKit SFU). A missing livekit-server
+# leaves the box fully functional (chat + federation + 1:1 voice), just without
+# group calls — so this never fails the script. Extracted from the upstream
+# image with the same docker create/cp trick as tuwunel/caddy.
+fetch_livekit() {
+  local dest="$BIN_DIR/livekit-server"
+  if [[ "$FORCE" == 0 && -x "$dest" ]] && verify "$dest"; then
+    ok "livekit-server already present ($("$dest" --version 2>/dev/null | head -n1)) — skipping"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "docker required to extract livekit-server from $LIVEKIT_IMAGE — group calls unavailable"
+    return 1
+  fi
+  info "Extracting /livekit-server from $LIVEKIT_IMAGE"
+  docker pull --quiet "$LIVEKIT_IMAGE" >/dev/null 2>&1 || { warn "docker pull $LIVEKIT_IMAGE failed — group calls unavailable"; return 1; }
+  local cid
+  cid="$(docker create "$LIVEKIT_IMAGE" 2>/dev/null)" || { warn "docker create $LIVEKIT_IMAGE failed — group calls unavailable"; return 1; }
+  docker cp "$cid:/livekit-server" "$dest" >/dev/null 2>&1
+  docker rm -f "$cid" >/dev/null 2>&1
+  [[ -x "$dest" ]] && chmod 0755 "$dest" && verify "$dest" && { ok "livekit-server installed: $("$dest" --version 2>/dev/null | head -n1)"; return 0; }
+  warn "couldn't extract livekit-server — group calls will be OFF until installed"
+  return 1
+}
+
+# ---------------------------------------------------------------- lk-jwt ----
+# Optional: the token service paired with livekit-server. Validates a caller's
+# Matrix OpenID token and mints a LiveKit JWT. Like livekit, never fails the
+# script. The image has no shell/version flag, so we don't `verify` it — a
+# present, executable file is enough.
+fetch_lkjwt() {
+  local dest="$BIN_DIR/lk-jwt-service"
+  if [[ "$FORCE" == 0 && -x "$dest" ]]; then
+    ok "lk-jwt-service already present — skipping"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "docker required to extract lk-jwt-service from $LKJWT_IMAGE — group calls unavailable"
+    return 1
+  fi
+  info "Extracting /lk-jwt-service from $LKJWT_IMAGE"
+  docker pull --quiet "$LKJWT_IMAGE" >/dev/null 2>&1 || { warn "docker pull $LKJWT_IMAGE failed — group calls unavailable"; return 1; }
+  local cid
+  cid="$(docker create "$LKJWT_IMAGE" 2>/dev/null)" || { warn "docker create $LKJWT_IMAGE failed — group calls unavailable"; return 1; }
+  docker cp "$cid:/lk-jwt-service" "$dest" >/dev/null 2>&1
+  docker rm -f "$cid" >/dev/null 2>&1
+  [[ -x "$dest" ]] && chmod 0755 "$dest" && { ok "lk-jwt-service installed"; return 0; }
+  warn "couldn't extract lk-jwt-service — group calls will be OFF until installed"
+  return 1
+}
+
 fetch_tuwunel || FAILURES=$((FAILURES + 1))
 fetch_tor     || FAILURES=$((FAILURES + 1))
 fetch_turn    || warn "voice (coturn) not installed — this is OPTIONAL, box still works"
 fetch_caddy   || warn "caddy (fed-proxy) not installed — pairing/federation will be unavailable"
+fetch_livekit || warn "livekit-server not installed — group calls (Element Call) OPTIONAL, box still works"
+fetch_lkjwt   || warn "lk-jwt-service not installed — group calls (Element Call) OPTIONAL, box still works"
 
 echo
 if [[ "$FAILURES" -gt 0 ]]; then

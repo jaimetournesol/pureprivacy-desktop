@@ -39,12 +39,28 @@ pub const TURN_RELAY_PORT_MAX: u16 = 61039;
 /// federation port 8448 here; Caddy reverse-proxies to the homeserver.
 pub const FEDPROXY_PORT: u16 = 8449;
 
+/// LiveKit SFU group-call sidecars (Element Call). All loopback; Tor maps the
+/// well-known onion ports here. These mirror the v0.1 appliance exactly:
+/// LiveKit is TCP-only (Tor carries no UDP) and the SFU URL handed to clients
+/// is wss:// (Element Call refuses ws://), terminated by a second Caddy site.
+/// LiveKit signaling WebSocket (loopback; Caddy wss site reverse-proxies here).
+pub const LIVEKIT_WS_PORT: u16 = 7880;
+/// LiveKit TCP media relay (Tor carries no UDP, so media rides TCP).
+pub const LIVEKIT_TCP_PORT: u16 = 7881;
+/// lk-jwt-service: validates a Matrix OpenID token and mints a LiveKit JWT.
+pub const LKJWT_PORT: u16 = 8082;
+/// Onion port for the wss-terminated SFU signaling path (handed to clients).
+pub const LIVEKIT_WSS_ONION_PORT: u16 = 7443;
+/// Caddy's loopback listener for the wss SFU site; tor maps 7443 here.
+pub const CADDY_WSS_PORT: u16 = 7444;
+
 pub struct Paths {
     pub config_dir: PathBuf,
     pub torrc: PathBuf,
     pub tuwunel_toml: PathBuf,
     pub turnserver_conf: PathBuf,
     pub caddyfile: PathBuf,
+    pub livekit_yaml: PathBuf,
     pub fed_cert: PathBuf,
     pub fed_key: PathBuf,
     pub data_root: PathBuf,
@@ -64,6 +80,7 @@ pub fn paths(app: &AppHandle) -> Result<Paths, String> {
         tuwunel_toml: config_dir.join("tuwunel.toml"),
         turnserver_conf: config_dir.join("turnserver.conf"),
         caddyfile: config_dir.join("Caddyfile"),
+        livekit_yaml: config_dir.join("livekit.yaml"),
         fed_cert: config_dir.join("fed-cert.pem"),
         fed_key: config_dir.join("fed-key.pem"),
         hostname_file: hs_dir.join("hostname"),
@@ -109,7 +126,7 @@ pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
 /// Pure builder for torrc — unit-tested; `render_torrc` just adds paths + I/O.
 /// Federation (8448) goes to the Caddy fed-proxy (TLS + allowlist); the client
 /// API (8008) and TURN go straight to their services.
-fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16) -> String {
+fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, voice: bool) -> String {
     // NoIsolateClientAddr: share circuits across local SOCKS clients.
     // G1 finding (2026-06-13): tor's default per-client isolation hands the
     // homeserver cold circuits, and first-contact federation then exceeds
@@ -130,10 +147,26 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16) ->
     for port in TURN_RELAY_PORT_MIN..=TURN_RELAY_PORT_MAX {
         let _ = writeln!(torrc, "HiddenServicePort {port} 127.0.0.1:{port}");
     }
+    // Group-call (Element Call / LiveKit) onion port map. Only published when the
+    // LiveKit + lk-jwt sidecars are present; harmless to omit otherwise. Mirrors
+    // the v0.1 appliance torrc: wss-terminated SFU signaling (Caddy wss site),
+    // the TCP media relay, and the lk-jwt token service.
+    if voice {
+        let _ = writeln!(
+            torrc,
+            "HiddenServicePort {wss} 127.0.0.1:{caddy_wss}\n\
+             HiddenServicePort {media} 127.0.0.1:{media}\n\
+             HiddenServicePort {jwt} 127.0.0.1:{jwt}",
+            wss = LIVEKIT_WSS_ONION_PORT,
+            caddy_wss = CADDY_WSS_PORT,
+            media = LIVEKIT_TCP_PORT,
+            jwt = LKJWT_PORT,
+        );
+    }
     torrc
 }
 
-pub fn render_torrc(app: &AppHandle) -> Result<(), String> {
+pub fn render_torrc(app: &AppHandle, voice: bool) -> Result<(), String> {
     let p = paths(app)?;
     let torrc = torrc_string(
         SOCKS_PORT,
@@ -141,6 +174,7 @@ pub fn render_torrc(app: &AppHandle) -> Result<(), String> {
         &p.hs_dir.display().to_string(),
         HOMESERVER_PORT,
         FEDPROXY_PORT,
+        voice,
     );
     std::fs::write(&p.torrc, torrc).map_err(|e| format!("couldn't write torrc: {e}"))
 }
@@ -158,6 +192,7 @@ fn tuwunel_toml_string(
     socks: u16,
     turn_secret: &str,
     join_token: &str,
+    voice: bool,
 ) -> String {
     let mut toml = format!(
         "[global]\n\
@@ -199,6 +234,21 @@ fn tuwunel_toml_string(
              turn_ttl = 86400\n"
         );
     }
+    if voice && !server_name.ends_with("placeholder.onion") {
+        // Group calls (Element Call / LiveKit). Advertising livekit_url makes
+        // tuwunel publish org.matrix.msc4143.rtc_foci, which clients read to
+        // discover the SFU + the lk-jwt token endpoint. client must be set
+        // alongside it (tuwunel only emits the rtc_foci block when both are
+        // present). lk-jwt is fetched over http://<onion>:8082 — Tor maps that
+        // onion port to the loopback lk-jwt service.
+        let _ = write!(
+            toml,
+            "\n[global.well_known]\n\
+             client = \"http://{server_name}\"\n\
+             livekit_url = \"http://{server_name}:{jwt}\"\n",
+            jwt = LKJWT_PORT,
+        );
+    }
     let _ = write!(
         toml,
         "\n[global.proxy.global]\n\
@@ -217,6 +267,7 @@ pub fn render_tuwunel(
     server_name: &str,
     turn_secret: &str,
     join_token: &str,
+    voice: bool,
 ) -> Result<(), String> {
     let p = paths(app)?;
     let toml = tuwunel_toml_string(
@@ -226,6 +277,7 @@ pub fn render_tuwunel(
         SOCKS_PORT,
         turn_secret,
         join_token,
+        voice,
     );
     std::fs::write(&p.tuwunel_toml, toml).map_err(|e| format!("couldn't write tuwunel.toml: {e}"))
 }
@@ -277,14 +329,21 @@ pub fn render_turnserver(app: &AppHandle, onion: &str, turn_secret: &str) -> Res
 /// API is allowed only when the X-Matrix `Authorization` origin is a paired
 /// peer; everything else is 403. With NO peers, the `@paired` block is omitted
 /// entirely, so all authenticated federation is refused.
-fn caddyfile_string(caddy_port: u16, hs_port: u16, cert: &str, key: &str, peers: &[String]) -> String {
+fn caddyfile_string(
+    caddy_port: u16,
+    hs_port: u16,
+    cert: &str,
+    key: &str,
+    peers: &[String],
+    voice: bool,
+) -> String {
     let mut s = format!(
         "{{\n\
          \tauto_https off\n\
          }}\n\
          https://:{caddy_port} {{\n\
          \ttls {cert} {key}\n\
-         \t@open path /_matrix/key/* /_matrix/federation/v1/version /.well-known/*\n\
+         \t@open path /_matrix/key/* /_matrix/federation/v1/version /_matrix/federation/v1/openid/* /.well-known/*\n\
          \thandle @open {{\n\
          \t\treverse_proxy http://127.0.0.1:{hs_port}\n\
          \t}}\n"
@@ -310,11 +369,30 @@ fn caddyfile_string(caddy_port: u16, hs_port: u16, cert: &str, key: &str, peers:
         );
     }
     s.push_str("\thandle {\n\t\trespond \"not a paired peer\" 403\n\t}\n}\n");
+    if voice {
+        // Second site: TLS-terminate the wss SFU signaling path and reverse-proxy
+        // the WS upgrade to LiveKit. NOT allowlist-gated — call participants are
+        // authed by the LiveKit JWT (minted by lk-jwt after validating their
+        // Matrix OpenID token), not by federation origin. Caddy's reverse_proxy
+        // handles the WebSocket upgrade automatically. Reuses the same onion
+        // self-signed cert as the federation site. tor maps onion 7443 here.
+        let _ = write!(
+            s,
+            "https://:{wss_port} {{\n\
+             \ttls {cert} {key}\n\
+             \treverse_proxy http://127.0.0.1:{livekit}\n\
+             }}\n",
+            wss_port = CADDY_WSS_PORT,
+            cert = cert,
+            key = key,
+            livekit = LIVEKIT_WS_PORT,
+        );
+    }
     s
 }
 
 /// Render the fed-proxy Caddyfile from the current pairings.
-pub fn render_caddyfile(app: &AppHandle, peers: &[String]) -> Result<(), String> {
+pub fn render_caddyfile(app: &AppHandle, peers: &[String], voice: bool) -> Result<(), String> {
     let p = paths(app)?;
     let conf = caddyfile_string(
         FEDPROXY_PORT,
@@ -322,8 +400,49 @@ pub fn render_caddyfile(app: &AppHandle, peers: &[String]) -> Result<(), String>
         &p.fed_cert.display().to_string(),
         &p.fed_key.display().to_string(),
         peers,
+        voice,
     );
     std::fs::write(&p.caddyfile, conf).map_err(|e| format!("couldn't write Caddyfile: {e}"))
+}
+
+/// Pure builder for livekit.yaml — unit-tested. Mirrors the v0.1 appliance's
+/// `docker/livekit/livekit.yaml.tmpl` EXACTLY: LiveKit is TCP-only because Tor
+/// carries no UDP; loopback ICE candidates leak + always fail; the built-in
+/// TURN is off (we relay over Tor, not LiveKit's own TURN). The api_key/secret
+/// pair is shared with lk-jwt so the JWTs it mints are accepted by the SFU.
+fn livekit_yaml_string(ws_port: u16, tcp_port: u16, api_key: &str, api_secret: &str) -> String {
+    format!(
+        "# PurePrivacy LiveKit SFU config (generated, do not edit).\n\
+         # Tor-only mode: TCP fallback only, since UDP cannot traverse a hidden service.\n\
+         port: {ws_port}\n\
+         bind_addresses:\n\
+         \x20 - 127.0.0.1\n\
+         \n\
+         rtc:\n\
+         \x20 tcp_port: {tcp_port}\n\
+         \x20 # Force TCP relay so the WebRTC media path can ride Tor's hidden-service\n\
+         \x20 # tunnel.  use_external_ip + loopback candidates are useless over Tor.\n\
+         \x20 use_external_ip: false\n\
+         \x20 enable_loopback_candidate: false\n\
+         \n\
+         keys:\n\
+         \x20 {api_key}: {api_secret}\n\
+         \n\
+         logging:\n\
+         \x20 level: info\n\
+         \x20 json: false\n\
+         \n\
+         turn:\n\
+         \x20 enabled: false\n"
+    )
+}
+
+/// Render livekit.yaml for the group-call SFU sidecar. Needs the shared
+/// api_key/secret (generated at setup, persisted with the other secrets).
+pub fn render_livekit_yaml(app: &AppHandle, api_key: &str, api_secret: &str) -> Result<(), String> {
+    let p = paths(app)?;
+    let conf = livekit_yaml_string(LIVEKIT_WS_PORT, LIVEKIT_TCP_PORT, api_key, api_secret);
+    std::fs::write(&p.livekit_yaml, conf).map_err(|e| format!("couldn't write livekit.yaml: {e}"))
 }
 
 /// Mint the fed-proxy's self-signed TLS cert (CN = the onion). Peers accept it
@@ -354,7 +473,7 @@ mod tests {
 
     #[test]
     fn torrc_publishes_every_relay_port_plus_the_fixed_ones() {
-        let torrc = torrc_string(9150, "/d", "/d/hs", 8118, 8449);
+        let torrc = torrc_string(9150, "/d", "/d/hs", 8118, 8449, false);
         let lines = torrc.matches("HiddenServicePort").count();
         // 8448 + 8008 + 3478 + 5349 fixed, plus one per relay port.
         assert_eq!(lines, 4 + relay_count());
@@ -369,47 +488,121 @@ mod tests {
     }
 
     #[test]
+    fn torrc_maps_group_call_ports_only_when_voice_enabled() {
+        // voice=true publishes the wss (7443→caddy 7444), media (7881), and
+        // lk-jwt (8082) onion ports on top of the base map.
+        let with = torrc_string(9150, "/d", "/d/hs", 8118, 8449, true);
+        assert!(with.contains(&format!(
+            "HiddenServicePort {LIVEKIT_WSS_ONION_PORT} 127.0.0.1:{CADDY_WSS_PORT}"
+        )));
+        assert!(with.contains(&format!(
+            "HiddenServicePort {LIVEKIT_TCP_PORT} 127.0.0.1:{LIVEKIT_TCP_PORT}"
+        )));
+        assert!(with.contains(&format!("HiddenServicePort {LKJWT_PORT} 127.0.0.1:{LKJWT_PORT}")));
+
+        // voice=false omits all three.
+        let without = torrc_string(9150, "/d", "/d/hs", 8118, 8449, false);
+        assert!(!without.contains(&format!("127.0.0.1:{CADDY_WSS_PORT}")));
+        assert!(!without.contains(&format!("HiddenServicePort {LIVEKIT_TCP_PORT}")));
+        assert!(!without.contains(&format!("HiddenServicePort {LKJWT_PORT}")));
+    }
+
+    #[test]
     fn caddyfile_allowlists_paired_peers_only() {
         let peers = vec!["aaa.onion".to_string(), "bbb.onion".to_string()];
-        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &peers);
+        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &peers, false);
         // open endpoints + allowlist + catch-all 403
         assert!(cf.contains("@open path /_matrix/key/*"));
+        // openid/userinfo MUST be open — lk-jwt's cross-box call validation hits
+        // it with no X-Matrix origin header, so @paired can't match it.
+        assert!(cf.contains("/_matrix/federation/v1/openid/*"));
         assert!(cf.contains(r#"@paired header_regexp Authorization origin="?(aaa\.onion|bbb\.onion)"?"#));
         assert!(cf.contains("respond \"not a paired peer\" 403"));
         assert!(cf.contains("reverse_proxy http://127.0.0.1:8118"));
 
         // No peers → NO @paired block → all authed federation refused.
-        let none = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[]);
+        let none = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false);
         assert!(!none.contains("@paired"));
         assert!(none.contains("respond \"not a paired peer\" 403"));
     }
 
     #[test]
+    fn caddyfile_adds_wss_sfu_site_only_when_voice_enabled() {
+        // voice=true appends a SECOND site on :7444 reverse-proxying LiveKit's
+        // signaling WS (:7880). It is NOT allowlist-gated (JWT-authed).
+        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], true);
+        assert!(cf.contains(&format!("https://:{CADDY_WSS_PORT} {{")));
+        assert!(cf.contains(&format!("reverse_proxy http://127.0.0.1:{LIVEKIT_WS_PORT}")));
+        // The wss site still keeps the federation site intact below it.
+        assert!(cf.contains(&format!("https://:{FEDPROXY_PORT} {{")));
+
+        // voice=false → no wss site at all.
+        let without = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false);
+        assert!(!without.contains(&format!("https://:{CADDY_WSS_PORT}")));
+        assert!(!without.contains(&format!("reverse_proxy http://127.0.0.1:{LIVEKIT_WS_PORT}")));
+    }
+
+    #[test]
+    fn livekit_yaml_is_tcp_only_with_the_shared_keys() {
+        let yaml = livekit_yaml_string(7880, 7881, "lkkey", "lksecret");
+        // TCP media port + no external IP (Tor carries no UDP) — KEEP from v0.1.
+        assert!(yaml.contains("tcp_port: 7881"));
+        assert!(yaml.contains("use_external_ip: false"));
+        assert!(yaml.contains("enable_loopback_candidate: false"));
+        // The shared api_key: api_secret pair lk-jwt also signs with.
+        assert!(yaml.contains("lkkey: lksecret"));
+        // Built-in TURN stays off — we relay over Tor, not LiveKit's TURN.
+        assert!(yaml.contains("enabled: false"));
+        assert!(yaml.contains("port: 7880"));
+    }
+
+    #[test]
     fn tuwunel_advertises_turn_only_with_secret_and_real_onion() {
         let onion = "abc123.onion";
-        let with = tuwunel_toml_string(onion, "/db", 8118, 9150, "deadbeef", "jointok");
+        let with = tuwunel_toml_string(onion, "/db", 8118, 9150, "deadbeef", "jointok", false);
         assert!(with.contains("turn_uris = [\"turn:abc123.onion:3478?transport=tcp\"]"));
         assert!(with.contains("turn_secret = \"deadbeef\""));
         assert!(with.contains("socks5h://127.0.0.1:9150"));
 
         // No secret yet → no turn block.
-        let without = tuwunel_toml_string(onion, "/db", 8118, 9150, "", "jointok");
+        let without = tuwunel_toml_string(onion, "/db", 8118, 9150, "", "jointok", false);
         assert!(!without.contains("turn_uris"));
 
         // Placeholder server_name (pre-mint) → never advertise turn.
-        let placeholder = tuwunel_toml_string("placeholder.onion", "/db", 8118, 9150, "deadbeef", "jointok");
+        let placeholder = tuwunel_toml_string("placeholder.onion", "/db", 8118, 9150, "deadbeef", "jointok", false);
         assert!(!placeholder.contains("turn_uris"));
     }
 
     #[test]
+    fn tuwunel_advertises_well_known_livekit_only_with_voice_and_real_onion() {
+        let onion = "abc123.onion";
+        // voice=true + real onion → well_known with client + livekit_url.
+        let with = tuwunel_toml_string(onion, "/db", 8118, 9150, "deadbeef", "jointok", true);
+        assert!(with.contains("[global.well_known]"));
+        assert!(with.contains("client = \"http://abc123.onion\""));
+        assert!(with.contains(&format!("livekit_url = \"http://abc123.onion:{LKJWT_PORT}\"")));
+
+        // voice=false → no well_known block.
+        let no_voice = tuwunel_toml_string(onion, "/db", 8118, 9150, "deadbeef", "jointok", false);
+        assert!(!no_voice.contains("[global.well_known]"));
+        assert!(!no_voice.contains("livekit_url"));
+
+        // Placeholder onion (pre-mint) → never advertise even with voice=true.
+        let placeholder =
+            tuwunel_toml_string("placeholder.onion", "/db", 8118, 9150, "deadbeef", "jointok", true);
+        assert!(!placeholder.contains("[global.well_known]"));
+        assert!(!placeholder.contains("livekit_url"));
+    }
+
+    #[test]
     fn tuwunel_gates_registration_on_a_token_never_open() {
-        let with = tuwunel_toml_string("abc.onion", "/db", 8118, 9150, "", "jointok123");
+        let with = tuwunel_toml_string("abc.onion", "/db", 8118, 9150, "", "jointok123", false);
         assert!(with.contains("allow_registration = true"));
         assert!(with.contains("registration_token = \"jointok123\""));
 
         // No token (e.g. pre-setup placeholder) → registration stays absent
         // (tuwunel defaults registration OFF), never an open-reg server.
-        let without = tuwunel_toml_string("placeholder.onion", "/db", 8118, 9150, "", "");
+        let without = tuwunel_toml_string("placeholder.onion", "/db", 8118, 9150, "", "", false);
         assert!(!without.contains("allow_registration"));
         assert!(!without.contains("registration_token"));
     }
