@@ -303,6 +303,12 @@ fn turnserver_conf_string(onion: &str, secret: &str) -> String {
          # Tor carries no UDP, so refuse UDP on the client leg. Same-box calls\n\
          # forward relay->relay on loopback and never ask Tor to carry UDP.\n\
          no-udp\n\
+         # The co-located LiveKit SFU is a loopback peer (127.0.0.1): the relayed\n\
+         # group-call media is forwarded to it locally. coturn forbids loopback\n\
+         # peers by default (verified: 403 Forbidden IP), so allow them — safe on a\n\
+         # single-user appliance where the only loopback peer is our own SFU and\n\
+         # the relay still requires a valid auth-secret credential.\n\
+         allow-loopback-peers\n\
          no-multicast-peers\n\
          no-cli\n\
          no-stdout-log\n\
@@ -405,13 +411,50 @@ pub fn render_caddyfile(app: &AppHandle, peers: &[String], voice: bool) -> Resul
     std::fs::write(&p.caddyfile, conf).map_err(|e| format!("couldn't write Caddyfile: {e}"))
 }
 
-/// Pure builder for livekit.yaml — unit-tested. Mirrors the v0.1 appliance's
-/// `docker/livekit/livekit.yaml.tmpl` EXACTLY: LiveKit is TCP-only because Tor
-/// carries no UDP; loopback ICE candidates leak + always fail; the built-in
-/// TURN is off (we relay over Tor, not LiveKit's own TURN). The api_key/secret
-/// pair is shared with lk-jwt so the JWTs it mints are accepted by the SFU.
-fn livekit_yaml_string(ws_port: u16, tcp_port: u16, api_key: &str, api_secret: &str) -> String {
-    format!(
+/// Mint a long-lived coturn REST credential (the `use-auth-secret` scheme):
+/// `username = <unix-expiry>`, `credential = base64(HMAC-SHA1(secret, username))`.
+/// coturn validates this without any stored user, so the LiveKit SFU can
+/// authenticate to coturn with a *static* username/credential pair (LiveKit's
+/// `turn_servers` config can't compute time-limited REST creds itself).
+///
+/// The expiry MUST fit in 32 bits: coturn parses the REST timestamp into a 32-bit
+/// time and a value past 2^31 overflows → it silently treats the request as a
+/// long-term-cred lookup, fails to find the user, and 401s. (Verified live: a
+/// year-3000 expiry "Cannot complete Allocation"; 2147483647 authenticates.) So
+/// we use the 32-bit max, 2147483647 = 2038-01-19 — ~12 years, far longer than
+/// any appliance lifecycle, and never needs rotation in practice.
+fn turn_rest_credential(secret: &str) -> (String, String) {
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    // 32-bit-max unix time (2038-01-19). A larger value overflows coturn's REST
+    // parser and the credential is rejected — see the doc comment above.
+    let username = "2147483647".to_string();
+    let mut mac =
+        Hmac::<Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(username.as_bytes());
+    let credential = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    (username, credential)
+}
+
+/// Pure builder for livekit.yaml — unit-tested. Tor-only: TCP-only because Tor
+/// carries no UDP; loopback/host ICE candidates leak + are unreachable over the
+/// onion. The SFU's own embedded TURN stays off — instead we **force-relay all
+/// media through the coturn-at-onion** by advertising it in `rtc.turn_servers`.
+/// That's the proven media-over-Tor path: clients reach coturn over Tor (the
+/// only Tor leg), and the SFU↔coturn leg is local. See
+/// `docs/redesign/2026-06-media-over-tor.md` (TURN-relay-over-onion, 0% loss).
+/// The api_key/secret pair is shared with lk-jwt so its JWTs are accepted; the
+/// turn_secret is the same one coturn enforces (use-auth-secret).
+fn livekit_yaml_string(
+    ws_port: u16,
+    tcp_port: u16,
+    api_key: &str,
+    api_secret: &str,
+    onion: &str,
+    turn_secret: &str,
+) -> String {
+    let mut s = format!(
         "# PurePrivacy LiveKit SFU config (generated, do not edit).\n\
          # Tor-only mode: TCP fallback only, since UDP cannot traverse a hidden service.\n\
          port: {ws_port}\n\
@@ -423,8 +466,27 @@ fn livekit_yaml_string(ws_port: u16, tcp_port: u16, api_key: &str, api_secret: &
          \x20 # Force TCP relay so the WebRTC media path can ride Tor's hidden-service\n\
          \x20 # tunnel.  use_external_ip + loopback candidates are useless over Tor.\n\
          \x20 use_external_ip: false\n\
-         \x20 enable_loopback_candidate: false\n\
-         \n\
+         \x20 enable_loopback_candidate: false\n"
+    );
+    // Advertise the coturn-at-onion to clients so they gather a *relay* candidate
+    // (the only ICE candidate type that survives Tor). Plaintext `turn:` over TCP
+    // is fine — the onion is the encryption layer. Only rendered with a real
+    // onion + secret; a placeholder onion would hand clients a dead TURN URI.
+    if !onion.ends_with("placeholder.onion") && !turn_secret.is_empty() {
+        let (user, cred) = turn_rest_credential(turn_secret);
+        let _ = write!(
+            s,
+            "\x20 turn_servers:\n\
+             \x20   - host: {onion}\n\
+             \x20     port: 3478\n\
+             \x20     protocol: tcp\n\
+             \x20     username: \"{user}\"\n\
+             \x20     credential: \"{cred}\"\n"
+        );
+    }
+    let _ = write!(
+        s,
+        "\n\
          keys:\n\
          \x20 {api_key}: {api_secret}\n\
          \n\
@@ -434,14 +496,29 @@ fn livekit_yaml_string(ws_port: u16, tcp_port: u16, api_key: &str, api_secret: &
          \n\
          turn:\n\
          \x20 enabled: false\n"
-    )
+    );
+    s
 }
 
 /// Render livekit.yaml for the group-call SFU sidecar. Needs the shared
-/// api_key/secret (generated at setup, persisted with the other secrets).
-pub fn render_livekit_yaml(app: &AppHandle, api_key: &str, api_secret: &str) -> Result<(), String> {
+/// api_key/secret (generated at setup, persisted with the other secrets), plus
+/// the onion + turn_secret so the SFU force-relays media through coturn-at-onion.
+pub fn render_livekit_yaml(
+    app: &AppHandle,
+    api_key: &str,
+    api_secret: &str,
+    onion: &str,
+    turn_secret: &str,
+) -> Result<(), String> {
     let p = paths(app)?;
-    let conf = livekit_yaml_string(LIVEKIT_WS_PORT, LIVEKIT_TCP_PORT, api_key, api_secret);
+    let conf = livekit_yaml_string(
+        LIVEKIT_WS_PORT,
+        LIVEKIT_TCP_PORT,
+        api_key,
+        api_secret,
+        onion,
+        turn_secret,
+    );
     std::fs::write(&p.livekit_yaml, conf).map_err(|e| format!("couldn't write livekit.yaml: {e}"))
 }
 
@@ -544,7 +621,7 @@ mod tests {
 
     #[test]
     fn livekit_yaml_is_tcp_only_with_the_shared_keys() {
-        let yaml = livekit_yaml_string(7880, 7881, "lkkey", "lksecret");
+        let yaml = livekit_yaml_string(7880, 7881, "lkkey", "lksecret", "abc123.onion", "deadbeef");
         // TCP media port + no external IP (Tor carries no UDP) — KEEP from v0.1.
         assert!(yaml.contains("tcp_port: 7881"));
         assert!(yaml.contains("use_external_ip: false"));
@@ -554,6 +631,36 @@ mod tests {
         // Built-in TURN stays off — we relay over Tor, not LiveKit's TURN.
         assert!(yaml.contains("enabled: false"));
         assert!(yaml.contains("port: 7880"));
+        // Force-relay: the onion coturn is advertised so clients gather a relay
+        // candidate (the only ICE type that survives Tor).
+        assert!(yaml.contains("turn_servers:"));
+        assert!(yaml.contains("host: abc123.onion"));
+        assert!(yaml.contains("protocol: tcp"));
+    }
+
+    #[test]
+    fn livekit_turn_servers_omitted_without_real_onion_or_secret() {
+        // Placeholder onion (pre-mint) → no dead TURN URI handed to clients.
+        let pre = livekit_yaml_string(7880, 7881, "k", "s", "placeholder.onion", "deadbeef");
+        assert!(!pre.contains("turn_servers:"));
+        // No secret yet → no TURN block.
+        let nosec = livekit_yaml_string(7880, 7881, "k", "s", "abc123.onion", "");
+        assert!(!nosec.contains("turn_servers:"));
+    }
+
+    #[test]
+    fn turn_rest_credential_is_deterministic_hmac() {
+        // Same secret → same long-lived credential (so reboots don't churn it),
+        // and the username is the far-future expiry coturn validates against.
+        let (u1, c1) = turn_rest_credential("deadbeef");
+        let (u2, c2) = turn_rest_credential("deadbeef");
+        // 32-bit-max expiry — a larger value overflows coturn's REST parser.
+        assert_eq!(u1, "2147483647");
+        assert_eq!((u1, c1.clone()), (u2, c2));
+        // Different secret → different credential.
+        let (_, c3) = turn_rest_credential("other");
+        assert_ne!(c1, c3);
+        assert!(!c1.is_empty());
     }
 
     #[test]
@@ -614,6 +721,8 @@ mod tests {
         assert!(conf.contains("external-ip=abc123.onion"));
         assert!(conf.contains("static-auth-secret=s3cr3t"));
         assert!(conf.contains("no-udp"));
+        // Co-located SFU is a loopback peer — must be permitted.
+        assert!(conf.contains("allow-loopback-peers"));
         assert!(conf.contains(&format!("min-port={TURN_RELAY_PORT_MIN}")));
         assert!(conf.contains(&format!("max-port={TURN_RELAY_PORT_MAX}")));
     }

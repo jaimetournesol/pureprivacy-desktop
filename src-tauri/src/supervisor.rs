@@ -371,9 +371,13 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     if voice {
         if livekit_api_key.is_empty() || livekit_api_secret.is_empty() {
             eprintln!("[pureprivacy] group voice skipped: missing livekit api key/secret");
-        } else if let Err(e) =
-            config::render_livekit_yaml(&app, &livekit_api_key, &livekit_api_secret)
-        {
+        } else if let Err(e) = config::render_livekit_yaml(
+            &app,
+            &livekit_api_key,
+            &livekit_api_secret,
+            &onion,
+            &turn_secret,
+        ) {
             eprintln!("[pureprivacy] group voice skipped: {e}");
         } else {
             // LiveKit SFU: TCP-only signaling + media on loopback.
