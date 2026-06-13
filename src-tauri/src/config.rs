@@ -290,9 +290,12 @@ fn caddyfile_string(caddy_port: u16, hs_port: u16, cert: &str, key: &str, peers:
          \t}}\n"
     );
     if !peers.is_empty() {
-        // origin="(p1\.onion|p2\.onion)". Onions are [a-z2-7]+.onion, so only
-        // the dot needs escaping. (Do NOT wrap the regex in backticks — that
-        // silently fails to match; gotcha proven 2026-06-13.)
+        // origin="?(p1\.onion|p2\.onion)"?. The X-Matrix auth header's params
+        // may be quoted OR unquoted per the Matrix spec (tuwunel sends them
+        // unquoted) — so the surrounding quotes are OPTIONAL, or paired real
+        // federation gets 403'd. (Live two-box test caught this, 2026-06-13.)
+        // Onions are [a-z2-7]+.onion, so only the dot needs escaping. Do NOT
+        // wrap the regex in backticks — that silently fails to match.
         let alt = peers
             .iter()
             .map(|o| o.replace('.', "\\."))
@@ -300,7 +303,7 @@ fn caddyfile_string(caddy_port: u16, hs_port: u16, cert: &str, key: &str, peers:
             .join("|");
         let _ = write!(
             s,
-            "\t@paired header_regexp Authorization origin=\"({alt})\"\n\
+            "\t@paired header_regexp Authorization origin=\"?({alt})\"?\n\
              \thandle @paired {{\n\
              \t\treverse_proxy http://127.0.0.1:{hs_port}\n\
              \t}}\n"
@@ -371,7 +374,7 @@ mod tests {
         let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &peers);
         // open endpoints + allowlist + catch-all 403
         assert!(cf.contains("@open path /_matrix/key/*"));
-        assert!(cf.contains(r#"@paired header_regexp Authorization origin="(aaa\.onion|bbb\.onion)""#));
+        assert!(cf.contains(r#"@paired header_regexp Authorization origin="?(aaa\.onion|bbb\.onion)"?"#));
         assert!(cf.contains("respond \"not a paired peer\" 403"));
         assert!(cf.contains("reverse_proxy http://127.0.0.1:8118"));
 
