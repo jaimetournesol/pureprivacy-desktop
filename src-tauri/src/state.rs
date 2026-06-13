@@ -78,6 +78,10 @@ pub struct Inner {
     /// credentials with it. Generated at `begin_setup`, persisted with the
     /// other secrets. Empty until then.
     pub turn_secret: String,
+    /// Homeserver registration token. Gates registration (so the box is never
+    /// open-reg); used to create the admin on first run and shared by the owner
+    /// to add more people. Generated at `begin_setup`.
+    pub join_token: String,
 }
 
 impl Default for Inner {
@@ -98,6 +102,7 @@ impl Default for Inner {
             phrase: Vec::new(),
             token: String::new(),
             turn_secret: String::new(),
+            join_token: String::new(),
         }
     }
 }
@@ -171,6 +176,8 @@ struct PersistedSecrets {
     token: String,
     #[serde(default)]
     turn_secret: String,
+    #[serde(default)]
+    join_token: String,
 }
 
 pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -212,6 +219,7 @@ pub fn persist(app: &AppHandle) -> Result<(), String> {
                 phrase: inner.phrase.clone(),
                 token: inner.token.clone(),
                 turn_secret: inner.turn_secret.clone(),
+                join_token: inner.join_token.clone(),
             },
         )
     });
@@ -245,5 +253,6 @@ pub fn load_persisted(app: &AppHandle) {
         inner.phrase = secrets.phrase;
         inner.token = secrets.token;
         inner.turn_secret = secrets.turn_secret;
+        inner.join_token = secrets.join_token;
     });
 }

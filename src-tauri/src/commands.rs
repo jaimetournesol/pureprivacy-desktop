@@ -55,6 +55,10 @@ pub fn begin_setup(
     // short-lived TURN credentials with it; never leaves the box.
     let turn_bytes: [u8; 32] = rng.gen();
     let turn_secret: String = turn_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // Homeserver registration token: gates registration (no open-reg) and is
+    // shared by the owner to add more people.
+    let join_bytes: [u8; 16] = rng.gen();
+    let join_token: String = join_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let created = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
 
     state::update(&app, |inner| {
@@ -64,12 +68,14 @@ pub fn begin_setup(
         inner.phrase = phrase;
         inner.token = token;
         inner.turn_secret = turn_secret;
+        inner.join_token = join_token;
     });
     state::persist(&app)?;
 
-    // Real sidecars if the binaries are there, demo simulation otherwise.
-    // Progress is observable via get_status().setup_stage.
-    supervisor::start_lifecycle(&app);
+    // Real sidecars if the binaries are there, demo simulation otherwise. The
+    // password creates the admin account once, then is dropped (never
+    // persisted). Progress is observable via get_status().setup_stage.
+    supervisor::start_lifecycle(&app, Some(password));
     Ok(())
 }
 
@@ -240,7 +246,8 @@ pub fn start_box(app: AppHandle) -> Result<(), String> {
     if !configured {
         return Err("Set up your box first.".into());
     }
-    supervisor::start_lifecycle(&app);
+    // Restart of an already-set-up box: the admin account already exists.
+    supervisor::start_lifecycle(&app, None);
     Ok(())
 }
 

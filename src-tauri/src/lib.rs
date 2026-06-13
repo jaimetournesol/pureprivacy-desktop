@@ -1,6 +1,7 @@
 //! PurePrivacy desktop backend. The frontend polls get_status() every 1.5s;
 //! nothing is pushed via events.
 
+mod account;
 mod commands;
 mod config;
 mod state;

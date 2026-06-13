@@ -117,7 +117,10 @@ fn turn_present(app: &AppHandle) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Start (or restart) the box. Picks real or demo mode by binary presence.
-pub fn start_lifecycle(app: &AppHandle) {
+/// `admin_password` is `Some` only on first-run setup (it's used once to create
+/// the admin account, then dropped — never persisted); plain start/restart
+/// passes `None`.
+pub fn start_lifecycle(app: &AppHandle, admin_password: Option<String>) {
     let gen = app.state::<Supervisor>().bump();
     let demo = !binaries_present(app);
     state::update(app, |inner| {
@@ -132,7 +135,7 @@ pub fn start_lifecycle(app: &AppHandle) {
         tauri::async_runtime::spawn(async move { run_demo(handle, gen).await });
     } else {
         tauri::async_runtime::spawn(async move {
-            if let Err(err) = run_real(handle.clone(), gen).await {
+            if let Err(err) = run_real(handle.clone(), gen, admin_password).await {
                 if !is_stale(&handle, gen) {
                     eprintln!("[pureprivacy] setup failed: {err}");
                     state::update(&handle, |inner| {
@@ -189,14 +192,16 @@ async fn run_demo(app: AppHandle, gen: u64) {
 // Real mode — tor first, mint onion, then tuwunel
 // ---------------------------------------------------------------------------
 
-async fn run_real(app: AppHandle, gen: u64) -> Result<(), String> {
+async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> Result<(), String> {
     let paths = config::ensure_dirs(&app)?;
     config::render_torrc(&app)?;
     // Placeholder so the file always exists; re-rendered with the real onion
-    // below, before tuwunel ever starts. No turn block until we have the onion.
+    // below, before tuwunel ever starts. No turn / registration block until we
+    // have the onion + secrets.
     let known_onion = state::read(&app, |inner| inner.onion.clone());
-    let turn_secret = state::read(&app, |inner| inner.turn_secret.clone());
-    config::render_tuwunel(&app, known_onion.as_deref().unwrap_or("placeholder.onion"), "")?;
+    let (turn_secret, join_token, username) =
+        state::read(&app, |inner| (inner.turn_secret.clone(), inner.join_token.clone(), inner.username.clone()));
+    config::render_tuwunel(&app, known_onion.as_deref().unwrap_or("placeholder.onion"), "", "")?;
 
     let bins = bin_dir(&app)?;
     spawn_supervised(
@@ -216,8 +221,9 @@ async fn run_real(app: AppHandle, gen: u64) -> Result<(), String> {
     let _ = state::persist(&app);
 
     // Now we know the server_name; render for real (incl. the turn_uris block
-    // when we have a secret) and start the homeserver.
-    config::render_tuwunel(&app, &onion, &turn_secret)?;
+    // when we have a secret, and token-gated registration) and start the
+    // homeserver.
+    config::render_tuwunel(&app, &onion, &turn_secret, &join_token)?;
     spawn_supervised(
         app.clone(),
         gen,
@@ -247,6 +253,27 @@ async fn run_real(app: AppHandle, gen: u64) -> Result<(), String> {
     }
 
     wait_for_http(&app, gen, HOMESERVER_PORT, Duration::from_secs(120)).await?;
+    if is_stale(&app, gen) {
+        return Ok(());
+    }
+
+    // First run: create the admin account now that the homeserver answers.
+    // tuwunel makes the first registered user an admin; the registration token
+    // keeps the box from being open-reg. Without this the box would come up
+    // "running" with no account to log into.
+    if let Some(password) = admin_password {
+        if !username.is_empty() && !join_token.is_empty() {
+            match crate::account::create_admin(&username, &password, &join_token).await {
+                Ok(()) => eprintln!("[pureprivacy] admin account @{username} ready"),
+                Err(e) => {
+                    if !is_stale(&app, gen) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     if is_stale(&app, gen) {
         return Ok(());
     }

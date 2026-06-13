@@ -127,7 +127,14 @@ pub fn render_torrc(app: &AppHandle) -> Result<(), String> {
 /// tuwunel signs short-lived credentials with the shared secret and hands them
 /// to clients via /_matrix/client/v3/voip/turnServer (spike-verified wired).
 /// Pure builder for tuwunel.toml — unit-tested.
-fn tuwunel_toml_string(server_name: &str, db: &str, port: u16, socks: u16, turn_secret: &str) -> String {
+fn tuwunel_toml_string(
+    server_name: &str,
+    db: &str,
+    port: u16,
+    socks: u16,
+    turn_secret: &str,
+    join_token: &str,
+) -> String {
     let mut toml = format!(
         "[global]\n\
          server_name = \"{server_name}\"\n\
@@ -146,6 +153,16 @@ fn tuwunel_toml_string(server_name: &str, db: &str, port: u16, socks: u16, turn_
          well_known_conn_timeout = 30\n\
          well_known_timeout = 60\n"
     );
+    if !join_token.is_empty() {
+        // Registration is token-gated, never open. The app creates the admin
+        // (first user => auto-admin) with this token, and the owner shares it
+        // to add more people.
+        let _ = write!(
+            toml,
+            "allow_registration = true\n\
+             registration_token = \"{join_token}\"\n"
+        );
+    }
     if !turn_secret.is_empty() && !server_name.ends_with("placeholder.onion") {
         // turn:<onion>:3478 — tor maps that onion port to the loopback coturn.
         // TCP transport only: Tor carries no UDP. (onion-purist: 1:1 voice
@@ -171,7 +188,12 @@ fn tuwunel_toml_string(server_name: &str, db: &str, port: u16, socks: u16, turn_
 /// the server_name is the real onion, advertise the 1:1 voice TURN server —
 /// tuwunel signs short-lived credentials with the shared secret and hands them
 /// to clients via /_matrix/client/v3/voip/turnServer (spike-verified wired).
-pub fn render_tuwunel(app: &AppHandle, server_name: &str, turn_secret: &str) -> Result<(), String> {
+pub fn render_tuwunel(
+    app: &AppHandle,
+    server_name: &str,
+    turn_secret: &str,
+    join_token: &str,
+) -> Result<(), String> {
     let p = paths(app)?;
     let toml = tuwunel_toml_string(
         server_name,
@@ -179,6 +201,7 @@ pub fn render_tuwunel(app: &AppHandle, server_name: &str, turn_secret: &str) -> 
         HOMESERVER_PORT,
         SOCKS_PORT,
         turn_secret,
+        join_token,
     );
     std::fs::write(&p.tuwunel_toml, toml).map_err(|e| format!("couldn't write tuwunel.toml: {e}"))
 }
@@ -248,18 +271,31 @@ mod tests {
     #[test]
     fn tuwunel_advertises_turn_only_with_secret_and_real_onion() {
         let onion = "abc123.onion";
-        let with = tuwunel_toml_string(onion, "/db", 8118, 9150, "deadbeef");
+        let with = tuwunel_toml_string(onion, "/db", 8118, 9150, "deadbeef", "jointok");
         assert!(with.contains("turn_uris = [\"turn:abc123.onion:3478?transport=tcp\"]"));
         assert!(with.contains("turn_secret = \"deadbeef\""));
         assert!(with.contains("socks5h://127.0.0.1:9150"));
 
         // No secret yet → no turn block.
-        let without = tuwunel_toml_string(onion, "/db", 8118, 9150, "");
+        let without = tuwunel_toml_string(onion, "/db", 8118, 9150, "", "jointok");
         assert!(!without.contains("turn_uris"));
 
         // Placeholder server_name (pre-mint) → never advertise turn.
-        let placeholder = tuwunel_toml_string("placeholder.onion", "/db", 8118, 9150, "deadbeef");
+        let placeholder = tuwunel_toml_string("placeholder.onion", "/db", 8118, 9150, "deadbeef", "jointok");
         assert!(!placeholder.contains("turn_uris"));
+    }
+
+    #[test]
+    fn tuwunel_gates_registration_on_a_token_never_open() {
+        let with = tuwunel_toml_string("abc.onion", "/db", 8118, 9150, "", "jointok123");
+        assert!(with.contains("allow_registration = true"));
+        assert!(with.contains("registration_token = \"jointok123\""));
+
+        // No token (e.g. pre-setup placeholder) → registration stays absent
+        // (tuwunel defaults registration OFF), never an open-reg server.
+        let without = tuwunel_toml_string("placeholder.onion", "/db", 8118, 9150, "", "");
+        assert!(!without.contains("allow_registration"));
+        assert!(!without.contains("registration_token"));
     }
 
     #[test]
