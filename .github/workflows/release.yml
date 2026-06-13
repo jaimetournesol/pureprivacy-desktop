@@ -1,0 +1,146 @@
+# Release — tag-triggered (v*) cross-platform build via tauri-action.
+# Produces a DRAFT GitHub release with installers for all four targets.
+#
+# Signing/notarization is scaffolded but COMMENTED OUT below — see the
+# TODO(G4/G5) markers and scripts/release/README.md for what is blocked
+# on the owner (Apple Developer + Azure Trusted Signing accounts).
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-24.04
+            args: ''
+            rust_targets: ''
+          - name: win-x64
+            runner: windows-latest
+            args: ''
+            rust_targets: ''
+          - name: mac-arm64
+            runner: macos-14
+            args: '--target aarch64-apple-darwin'
+            rust_targets: 'aarch64-apple-darwin'
+          - name: mac-x64
+            runner: macos-13
+            args: '--target x86_64-apple-darwin'
+            rust_targets: 'x86_64-apple-darwin'
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tauri Linux dependencies
+        if: matrix.name == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install pnpm via corepack
+        run: |
+          npm install -g corepack@latest
+          corepack enable
+          corepack prepare pnpm@latest-10 --activate
+          pnpm --version
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.name }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ------------------------------------------------------------------
+      # TODO(G4/G5): Windows code signing via Azure Trusted Signing — needs
+      # the Azure Trusted Signing account (G5). Uncomment this step AND the
+      # AZURE_* env slots + signCommand config override on the tauri-action
+      # step below once the account + secrets exist.
+      # ------------------------------------------------------------------
+      # - name: Install trusted-signing-cli (Windows signing)
+      #   if: matrix.name == 'win-x64'
+      #   run: cargo install trusted-signing-cli --locked
+
+      - name: Build and publish draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ----------------------------------------------------------------
+          # TODO(G4/G5): Tauri updater artifact signing (minisign). Generate
+          # the keypair per scripts/release/README.md, store both secrets in
+          # GitHub, then uncomment. Without this, no .sig files and no
+          # latest.json are produced, so the in-app updater stays inert.
+          # ----------------------------------------------------------------
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          #
+          # ----------------------------------------------------------------
+          # TODO(G4/G5): macOS signing + notarization — needs Apple Developer
+          # account (G4). Uncomment once the certificate + notarytool secrets
+          # exist. Until then macOS artifacts are unsigned (Gatekeeper will
+          # quarantine them).
+          # ----------------------------------------------------------------
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}                    # base64-encoded Developer ID Application .p12
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}  # .p12 password
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}          # e.g. "Developer ID Application: Tournesol (TEAMID)"
+          # APPLE_ID: ${{ secrets.APPLE_ID }}                                      # Apple ID used by notarytool
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}                          # app-specific password for notarytool
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}                            # Apple Developer Team ID
+          #
+          # ----------------------------------------------------------------
+          # TODO(G4/G5): Azure Trusted Signing service-principal credentials
+          # (Windows) — needs the Azure account (G5). Used by
+          # trusted-signing-cli via the signCommand override (see `args` note
+          # below). Until then Windows artifacts are unsigned (SmartScreen
+          # will warn).
+          # ----------------------------------------------------------------
+          # AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          # AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          # AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'PurePrivacy ${{ github.ref_name }}'
+          releaseBody: 'Draft release — see the assets to download and install this version.'
+          releaseDraft: true
+          prerelease: false
+          # Generates + uploads latest.json for the Tauri updater once the
+          # updater plugin is configured and TAURI_SIGNING_PRIVATE_KEY is set.
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+          # ----------------------------------------------------------------
+          # TODO(G4/G5): Azure Trusted Signing signCommand slot — when G5
+          # lands, append the following to `args` for the win-x64 matrix leg
+          # (injected at build time; tauri.conf.json itself stays untouched):
+          #
+          #   --config '{"bundle":{"windows":{"signCommand":"trusted-signing-cli -e https://weu.codesigning.azure.net -a <ACCOUNT_NAME> -c <CERT_PROFILE_NAME> %1"}}}'
+          # ----------------------------------------------------------------
