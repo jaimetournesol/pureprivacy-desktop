@@ -89,6 +89,11 @@ pub struct Inner {
     /// LiveKit SFU API secret (32 random bytes, hex). The signing secret paired
     /// with `livekit_api_key`. Generated at `begin_setup`. Empty until then.
     pub livekit_api_secret: String,
+    /// The admin account's password. PurePrivacy uses password login between the
+    /// phone and the box, so — unlike a multi-device server — the box persists its
+    /// own admin password (single-user appliance) so the owner's phone can sign in.
+    /// Empty until `begin_setup`.
+    pub admin_password: String,
 }
 
 impl Default for Inner {
@@ -112,6 +117,7 @@ impl Default for Inner {
             join_token: String::new(),
             livekit_api_key: String::new(),
             livekit_api_secret: String::new(),
+            admin_password: String::new(),
         }
     }
 }
@@ -191,6 +197,8 @@ struct PersistedSecrets {
     livekit_api_key: String,
     #[serde(default)]
     livekit_api_secret: String,
+    #[serde(default)]
+    admin_password: String,
 }
 
 pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -241,6 +249,7 @@ pub fn persist(app: &AppHandle) -> Result<(), String> {
                 join_token: inner.join_token.clone(),
                 livekit_api_key: inner.livekit_api_key.clone(),
                 livekit_api_secret: inner.livekit_api_secret.clone(),
+                admin_password: inner.admin_password.clone(),
             },
         )
     });
@@ -282,6 +291,7 @@ pub fn load_persisted(app: &AppHandle) {
         inner.join_token = secrets.join_token;
         inner.livekit_api_key = secrets.livekit_api_key;
         inner.livekit_api_secret = secrets.livekit_api_secret;
+        inner.admin_password = secrets.admin_password;
         inner.paired_count = crate::pairing::onions(&dir).len() as u32;
     });
 }

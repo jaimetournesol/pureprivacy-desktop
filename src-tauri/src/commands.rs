@@ -80,6 +80,10 @@ pub fn begin_setup(
         inner.join_token = join_token;
         inner.livekit_api_key = livekit_api_key;
         inner.livekit_api_secret = livekit_api_secret;
+        // Persist the admin password: PurePrivacy uses password login between the
+        // phone and the box, so the box keeps its own credential (single-user
+        // appliance) instead of dropping it after admin creation.
+        inner.admin_password = password.clone();
     });
     state::persist(&app)?;
 
