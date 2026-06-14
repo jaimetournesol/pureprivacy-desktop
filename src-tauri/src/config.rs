@@ -295,8 +295,13 @@ fn turnserver_conf_string(onion: &str, secret: &str) -> String {
          listening-port={turn}\n\
          min-port={min}\n\
          max-port={max}\n\
-         # No public IP: advertise the .onion so client SDP carries the right host.\n\
-         external-ip={onion}\n\
+         # The relay address must be reachable by the CO-LOCATED SFU (loopback), NOT\n\
+         # the .onion — the client reaches coturn via the Tor control channel\n\
+         # (turn:<onion>:3478, advertised by LiveKit), and coturn forwards the relayed\n\
+         # media to the SFU locally. Advertising the onion here makes the SFU unable to\n\
+         # reach the relay (udp send: Invalid argument) once media is forced to relay.\n\
+         external-ip=127.0.0.1\n\
+         relay-ip=127.0.0.1\n\
          realm={onion}\n\
          use-auth-secret\n\
          static-auth-secret={secret}\n\
@@ -454,6 +459,8 @@ fn livekit_yaml_string(
     onion: &str,
     turn_secret: &str,
 ) -> String {
+    // UDP port for the local coturn-relay -> SFU hop (never exposed over Tor).
+    let udp_port = tcp_port + 1;
     let mut s = format!(
         "# PurePrivacy LiveKit SFU config (generated, do not edit).\n\
          # Tor-only mode: TCP fallback only, since UDP cannot traverse a hidden service.\n\
@@ -463,10 +470,12 @@ fn livekit_yaml_string(
          \n\
          rtc:\n\
          \x20 tcp_port: {tcp_port}\n\
-         \x20 # Force TCP relay so the WebRTC media path can ride Tor's hidden-service\n\
-         \x20 # tunnel.  use_external_ip + loopback candidates are useless over Tor.\n\
+         \x20 # A UDP port + loopback candidate so the coturn relay's UDP leg has a\n\
+         \x20 # local SFU port to deliver the relayed media to. The client leg still\n\
+         \x20 # rides Tor (TCP) to coturn; this is only the local relay->SFU hop.\n\
+         \x20 udp_port: {udp_port}\n\
          \x20 use_external_ip: false\n\
-         \x20 enable_loopback_candidate: false\n"
+         \x20 enable_loopback_candidate: true\n"
     );
     // Advertise the coturn-at-onion to clients so they gather a *relay* candidate
     // (the only ICE candidate type that survives Tor). Plaintext `turn:` over TCP
@@ -622,10 +631,12 @@ mod tests {
     #[test]
     fn livekit_yaml_is_tcp_only_with_the_shared_keys() {
         let yaml = livekit_yaml_string(7880, 7881, "lkkey", "lksecret", "abc123.onion", "deadbeef");
-        // TCP media port + no external IP (Tor carries no UDP) — KEEP from v0.1.
+        // TCP client leg (Tor carries no UDP) + a local UDP port & loopback candidate
+        // so the coturn relay's UDP hop can reach the co-located SFU.
         assert!(yaml.contains("tcp_port: 7881"));
+        assert!(yaml.contains("udp_port: 7882"));
         assert!(yaml.contains("use_external_ip: false"));
-        assert!(yaml.contains("enable_loopback_candidate: false"));
+        assert!(yaml.contains("enable_loopback_candidate: true"));
         // The shared api_key: api_secret pair lk-jwt also signs with.
         assert!(yaml.contains("lkkey: lksecret"));
         // Built-in TURN stays off — we relay over Tor, not LiveKit's TURN.
@@ -718,7 +729,9 @@ mod tests {
     fn turnserver_conf_scopes_to_the_onion_and_refuses_udp() {
         let conf = turnserver_conf_string("abc123.onion", "s3cr3t");
         assert!(conf.contains("realm=abc123.onion"));
-        assert!(conf.contains("external-ip=abc123.onion"));
+        // relay address is loopback (reachable by the co-located SFU), not the onion.
+        assert!(conf.contains("external-ip=127.0.0.1"));
+        assert!(conf.contains("relay-ip=127.0.0.1"));
         assert!(conf.contains("static-auth-secret=s3cr3t"));
         assert!(conf.contains("no-udp"));
         // Co-located SFU is a loopback peer — must be permitted.
