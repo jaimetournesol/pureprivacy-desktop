@@ -194,10 +194,16 @@ struct PersistedSecrets {
 }
 
 pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("couldn't resolve app data dir: {e}"))?;
+    // Per-instance override (env `PUREPRIVACY_DATA_DIR`) so two boxes can run on
+    // one host with separate state (tor onion keys, tuwunel db, secrets). Unset in
+    // production, where Tauri's identifier-derived app-data dir is used.
+    let dir = match std::env::var("PUREPRIVACY_DATA_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("couldn't resolve app data dir: {e}"))?,
+    };
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create app data dir: {e}"))?;
     Ok(dir)
 }

@@ -10,10 +10,10 @@
 //!   1. POST /register {username,password}              -> 401 {session, flows}
 //!   2. POST /register {..., auth: registration_token}  -> 200 {user_id}
 
-use crate::config::HOMESERVER_PORT;
+use crate::config::{off, HOMESERVER_PORT};
 
 fn register_url() -> String {
-    format!("http://127.0.0.1:{HOMESERVER_PORT}/_matrix/client/v3/register")
+    format!("http://127.0.0.1:{}/_matrix/client/v3/register", HOMESERVER_PORT + off())
 }
 
 fn errcode(v: &serde_json::Value) -> Option<&str> {

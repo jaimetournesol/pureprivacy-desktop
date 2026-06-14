@@ -34,7 +34,7 @@ use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 
 use crate::config::{
-    self, FEDPROXY_PORT, HOMESERVER_PORT, LIVEKIT_WS_PORT, LIVEKIT_WSS_ONION_PORT, LKJWT_PORT,
+    self, off, FEDPROXY_PORT, HOMESERVER_PORT, LIVEKIT_WS_PORT, LIVEKIT_WSS_ONION_PORT, LKJWT_PORT,
     SOCKS_PORT, TURN_PORT,
 };
 use crate::state::{self, Phase, ServiceState, SetupStage};
@@ -307,7 +307,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
         bins.join("tuwunel"),
         vec!["-c".into(), paths.tuwunel_toml.to_string_lossy().into_owned()],
         vec![],
-        Readiness::Http(HOMESERVER_PORT),
+        Readiness::Http(HOMESERVER_PORT + off()),
     );
 
     // Optional 1:1-voice sidecar. Render its config (needs the onion + secret)
@@ -325,7 +325,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 bins.join("turnserver"),
                 vec!["-c".into(), paths.turnserver_conf.to_string_lossy().into_owned()],
                 vec![],
-                Readiness::Tcp(TURN_PORT),
+                Readiness::Tcp(TURN_PORT + off()),
             );
         }
     }
@@ -356,7 +356,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                     "caddyfile".into(),
                 ],
                 vec![],
-                Readiness::Tcp(FEDPROXY_PORT),
+                Readiness::Tcp(FEDPROXY_PORT + off()),
             ),
             Err(e) => eprintln!("[pureprivacy] federation proxy skipped: {e}"),
         }
@@ -388,7 +388,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 bins.join("livekit-server"),
                 vec!["--config".into(), paths.livekit_yaml.to_string_lossy().into_owned()],
                 vec![],
-                Readiness::Tcp(LIVEKIT_WS_PORT),
+                Readiness::Tcp(LIVEKIT_WS_PORT + off()),
             );
             // lk-jwt-service: configured entirely by env (no args). It validates
             // a caller's Matrix OpenID token and mints a LiveKit JWT.
@@ -403,7 +403,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 // 0.2.0 ignores the latter and falls back to 8080, which then
                 // mismatches the torrc onion map. (Caught by the live connect
                 // test, 2026-06-13.)
-                ("LIVEKIT_JWT_PORT".into(), LKJWT_PORT.to_string()),
+                ("LIVEKIT_JWT_PORT".into(), (LKJWT_PORT + off()).to_string()),
                 // The wss SFU URL handed to clients (KEEP — Element Call refuses
                 // ws://). Caddy terminates TLS on the onion's 7443 and proxies
                 // the WS upgrade to LiveKit.
@@ -416,8 +416,8 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 // .onion. PROVEN over Tor by the live two-box connect test
                 // (2026-06-13: "Got user info for @bob:<onion>" → JWT minted).
                 // HTTP_PROXY too for the pre-flight well-known GET.
-                ("HTTPS_PROXY".into(), format!("socks5h://127.0.0.1:{SOCKS_PORT}")),
-                ("HTTP_PROXY".into(), format!("socks5h://127.0.0.1:{SOCKS_PORT}")),
+                ("HTTPS_PROXY".into(), format!("socks5h://127.0.0.1:{}", SOCKS_PORT + off())),
+                ("HTTP_PROXY".into(), format!("socks5h://127.0.0.1:{}", SOCKS_PORT + off())),
                 // Accept the self-signed onion certs the federation path uses.
                 (
                     "LIVEKIT_INSECURE_SKIP_VERIFY_TLS".into(),
@@ -431,12 +431,12 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 bins.join("lk-jwt-service"),
                 vec![],
                 lkjwt_envs,
-                Readiness::Tcp(LKJWT_PORT),
+                Readiness::Tcp(LKJWT_PORT + off()),
             );
         }
     }
 
-    wait_for_http(&app, gen, HOMESERVER_PORT, Duration::from_secs(120)).await?;
+    wait_for_http(&app, gen, HOMESERVER_PORT + off(), Duration::from_secs(120)).await?;
     if is_stale(&app, gen) {
         return Ok(());
     }

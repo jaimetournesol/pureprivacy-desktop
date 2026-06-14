@@ -54,6 +54,18 @@ pub const LIVEKIT_WSS_ONION_PORT: u16 = 7443;
 /// Caddy's loopback listener for the wss SFU site; tor maps 7443 here.
 pub const CADDY_WSS_PORT: u16 = 7444;
 
+/// Per-instance LOOPBACK port offset (env `PUREPRIVACY_PORT_OFFSET`, default 0).
+/// Lets two boxes run on one host: every loopback bind/map target shifts by this,
+/// while the .onion-facing ports stay standard (each box has its own onion, so
+/// 8008/8448/3478/7443/8082 never collide and clients see the same ports on both).
+/// Unset (= 0) in production and tests, so behaviour is unchanged by default.
+pub fn off() -> u16 {
+    std::env::var("PUREPRIVACY_PORT_OFFSET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 pub struct Paths {
     pub config_dir: PathBuf,
     pub torrc: PathBuf,
@@ -127,6 +139,10 @@ pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
 /// Federation (8448) goes to the Caddy fed-proxy (TLS + allowlist); the client
 /// API (8008) and TURN go straight to their services.
 fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, voice: bool) -> String {
+    // Loopback bind/map targets shift by off() per instance; the onion-facing
+    // ports (8448/8008/3478/5349/7443/8082) stay standard so clients see the same
+    // ports on every box. off() == 0 in production + tests (env unset).
+    let o = off();
     // NoIsolateClientAddr: share circuits across local SOCKS clients.
     // G1 finding (2026-06-13): tor's default per-client isolation hands the
     // homeserver cold circuits, and first-contact federation then exceeds
@@ -139,28 +155,33 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, vo
          HiddenServicePort 8008 127.0.0.1:{hsport}\n\
          HiddenServicePort 3478 127.0.0.1:{turn}\n\
          HiddenServicePort 5349 127.0.0.1:{turn}\n",
-        turn = TURN_PORT,
+        socks = socks + o,
+        fedproxy = fedproxy + o,
+        hsport = hsport + o,
+        turn = TURN_PORT + o,
     );
     // Tor cannot wildcard-map a port RANGE, so the coturn TCP relay range
     // needs one explicit HiddenServicePort line per port. Same constants the
     // turnserver.conf min/max-port derive from, so the two files always agree.
-    for port in TURN_RELAY_PORT_MIN..=TURN_RELAY_PORT_MAX {
+    for port in (TURN_RELAY_PORT_MIN + o)..=(TURN_RELAY_PORT_MAX + o) {
         let _ = writeln!(torrc, "HiddenServicePort {port} 127.0.0.1:{port}");
     }
     // Group-call (Element Call / LiveKit) onion port map. Only published when the
     // LiveKit + lk-jwt sidecars are present; harmless to omit otherwise. Mirrors
     // the v0.1 appliance torrc: wss-terminated SFU signaling (Caddy wss site),
-    // the TCP media relay, and the lk-jwt token service.
+    // the TCP media relay, and the lk-jwt token service. Onion ports stay standard;
+    // only the loopback targets shift by the offset.
     if voice {
         let _ = writeln!(
             torrc,
             "HiddenServicePort {wss} 127.0.0.1:{caddy_wss}\n\
              HiddenServicePort {media} 127.0.0.1:{media}\n\
-             HiddenServicePort {jwt} 127.0.0.1:{jwt}",
+             HiddenServicePort {jwt} 127.0.0.1:{jwt_loop}",
             wss = LIVEKIT_WSS_ONION_PORT,
-            caddy_wss = CADDY_WSS_PORT,
-            media = LIVEKIT_TCP_PORT,
+            caddy_wss = CADDY_WSS_PORT + o,
+            media = LIVEKIT_TCP_PORT + o,
             jwt = LKJWT_PORT,
+            jwt_loop = LKJWT_PORT + o,
         );
     }
     torrc
@@ -194,6 +215,7 @@ fn tuwunel_toml_string(
     join_token: &str,
     voice: bool,
 ) -> String {
+    let port = port + off(); // loopback bind shifts per instance; onion 8008 maps here
     let mut toml = format!(
         "[global]\n\
          server_name = \"{server_name}\"\n\
@@ -252,7 +274,8 @@ fn tuwunel_toml_string(
     let _ = write!(
         toml,
         "\n[global.proxy.global]\n\
-         url = \"socks5h://127.0.0.1:{socks}\"\n"
+         url = \"socks5h://127.0.0.1:{socks}\"\n",
+        socks = socks + off(),
     );
     toml
 }
@@ -321,9 +344,9 @@ fn turnserver_conf_string(onion: &str, secret: &str) -> String {
          total-quota=200\n\
          user-quota=20\n\
          log-file=stdout\n",
-        turn = TURN_PORT,
-        min = TURN_RELAY_PORT_MIN,
-        max = TURN_RELAY_PORT_MAX,
+        turn = TURN_PORT + off(),
+        min = TURN_RELAY_PORT_MIN + off(),
+        max = TURN_RELAY_PORT_MAX + off(),
     )
 }
 
@@ -348,6 +371,9 @@ fn caddyfile_string(
     peers: &[String],
     voice: bool,
 ) -> String {
+    // Loopback listeners shift per instance; onion ports (8448/7443) map to these.
+    let caddy_port = caddy_port + off();
+    let hs_port = hs_port + off();
     let mut s = format!(
         "{{\n\
          \tauto_https off\n\
@@ -393,10 +419,10 @@ fn caddyfile_string(
              \ttls {cert} {key}\n\
              \treverse_proxy http://127.0.0.1:{livekit}\n\
              }}\n",
-            wss_port = CADDY_WSS_PORT,
+            wss_port = CADDY_WSS_PORT + off(),
             cert = cert,
             key = key,
-            livekit = LIVEKIT_WS_PORT,
+            livekit = LIVEKIT_WS_PORT + off(),
         );
     }
     s
@@ -459,7 +485,10 @@ fn livekit_yaml_string(
     onion: &str,
     turn_secret: &str,
 ) -> String {
-    // UDP port for the local coturn-relay -> SFU hop (never exposed over Tor).
+    // Loopback ports shift per instance (the wss onion 7443 / turn onion 3478
+    // stay standard). UDP port is the local coturn-relay -> SFU hop (not over Tor).
+    let ws_port = ws_port + off();
+    let tcp_port = tcp_port + off();
     let udp_port = tcp_port + 1;
     let mut s = format!(
         "# PurePrivacy LiveKit SFU config (generated, do not edit).\n\
