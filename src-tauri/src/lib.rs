@@ -40,6 +40,27 @@ pub fn run() {
         .setup(|app| {
             state::load_persisted(app.handle());
             tray::init(app.handle())?;
+            // Opt-in auto-resume: with PUREPRIVACY_AUTOSTART=1, a provisioned box
+            // comes back up on launch (tor + homeserver + sidecars) without a manual
+            // Start click. Used by the multi-box demo launcher; default behaviour
+            // (come up Stopped, user starts it) is unchanged when unset.
+            if std::env::var("PUREPRIVACY_AUTOSTART").ok().as_deref() == Some("1") {
+                if state::read(app.handle(), |i| i.onion.is_some()) {
+                    supervisor::start_lifecycle(app.handle(), None);
+                } else if let (Ok(user), Ok(pass)) = (
+                    std::env::var("PUREPRIVACY_PROVISION_USER"),
+                    std::env::var("PUREPRIVACY_PROVISION_PASS"),
+                ) {
+                    // Headless first-run provisioning (demos/tests): same path as the
+                    // GUI wizard — mint the onion + create the admin account — driven
+                    // by env instead of a click. No-op once the box has an onion.
+                    let box_name = std::env::var("PUREPRIVACY_PROVISION_BOX")
+                        .unwrap_or_else(|_| format!("{user}box"));
+                    if let Err(e) = commands::begin_setup(app.handle().clone(), box_name, user, pass) {
+                        eprintln!("[pureprivacy] headless provision failed: {e}");
+                    }
+                }
+            }
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -89,6 +89,11 @@ pub struct Inner {
     /// LiveKit SFU API secret (32 random bytes, hex). The signing secret paired
     /// with `livekit_api_key`. Generated at `begin_setup`. Empty until then.
     pub livekit_api_secret: String,
+    /// The admin account's password. PurePrivacy uses password login between the
+    /// phone and the box, so — unlike a multi-device server — the box persists its
+    /// own admin password (single-user appliance) so the owner's phone can sign in.
+    /// Empty until `begin_setup`.
+    pub admin_password: String,
 }
 
 impl Default for Inner {
@@ -112,6 +117,7 @@ impl Default for Inner {
             join_token: String::new(),
             livekit_api_key: String::new(),
             livekit_api_secret: String::new(),
+            admin_password: String::new(),
         }
     }
 }
@@ -191,14 +197,25 @@ struct PersistedSecrets {
     livekit_api_key: String,
     #[serde(default)]
     livekit_api_secret: String,
+    #[serde(default)]
+    admin_password: String,
 }
 
 pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("couldn't resolve app data dir: {e}"))?;
+    // Per-instance override (env `PUREPRIVACY_DATA_DIR`) so two boxes can run on
+    // one host with separate state (tor onion keys, tuwunel db, secrets). Unset in
+    // production, where Tauri's identifier-derived app-data dir is used.
+    let dir = match std::env::var("PUREPRIVACY_DATA_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("couldn't resolve app data dir: {e}"))?,
+    };
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create app data dir: {e}"))?;
+    // The data dir holds secrets.json, the tor onion keys, and the tuwunel db —
+    // owner-only (single-user appliance), so lock it down to 0700.
+    set_0700(&dir);
     Ok(dir)
 }
 
@@ -210,6 +227,15 @@ fn set_0600(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn set_0600(_path: &std::path::Path) {}
+
+#[cfg(unix)]
+fn set_0700(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn set_0700(_path: &std::path::Path) {}
 
 fn write_private(path: &std::path::Path, contents: &str) -> Result<(), String> {
     std::fs::write(path, contents).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
@@ -235,6 +261,7 @@ pub fn persist(app: &AppHandle) -> Result<(), String> {
                 join_token: inner.join_token.clone(),
                 livekit_api_key: inner.livekit_api_key.clone(),
                 livekit_api_secret: inner.livekit_api_secret.clone(),
+                admin_password: inner.admin_password.clone(),
             },
         )
     });
@@ -276,6 +303,7 @@ pub fn load_persisted(app: &AppHandle) {
         inner.join_token = secrets.join_token;
         inner.livekit_api_key = secrets.livekit_api_key;
         inner.livekit_api_secret = secrets.livekit_api_secret;
+        inner.admin_password = secrets.admin_password;
         inner.paired_count = crate::pairing::onions(&dir).len() as u32;
     });
 }

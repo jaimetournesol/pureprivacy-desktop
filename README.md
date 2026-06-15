@@ -1,10 +1,14 @@
 # PurePrivacy Desktop
 
 Phase-1 **native shell** for PurePrivacy: a [Tauri 2](https://tauri.app) + Svelte app
-that supervises two local sidecar processes —
+that supervises the user's personal box — a set of local sidecar processes —
 
 - **tuwunel** — an embedded Matrix homeserver (the user's personal server)
 - **C-tor** — a Tor client providing the onion transport between instances
+- **Caddy** — TLS-terminating fed-proxy + onion sites (federation allowlist, plus
+  the lk-jwt / client-API / wss-SFU sites the phone's calls need)
+- **coturn + LiveKit SFU + lk-jwt** — the Element Call backend (voice/video over
+  Tor), started when those sidecars are present
 
 The shell owns the sidecars' lifecycle (spawn, health-check, restart, shutdown) and
 renders the onboarding + dashboard UI on top.
@@ -19,7 +23,10 @@ pnpm tauri dev
 ```
 
 `fetch-sidecars.sh` extracts `tuwunel` from the upstream OCI image (requires Docker)
-and copies the system `tor` (or apt-installs it). Binaries land in
+and copies the system `tor` (or apt-installs it); it also fetches `caddy`, `coturn`,
+`lk-jwt-service`, and `livekit-server` (bundled **v1.13.1**, from
+`livekit/livekit-server`) for federation + Element Call. A missing `livekit-server`
+just means group calls are off until it's installed. Binaries land in
 `$HOME/.local/share/ai.tournesol.pureprivacy/bin` by default — override with
 `PUREPRIVACY_BIN_DIR`. Run with `--uninstall` to remove them.
 
@@ -44,10 +51,38 @@ Everything lives under the platform app-data dir (`ai.tournesol.pureprivacy`):
 
 ## Ports
 
-| Service             | Address           | Why                                        |
-| ------------------- | ----------------- | ------------------------------------------ |
-| tuwunel homeserver  | `127.0.0.1:8118`  | loopback-only; never exposed off-box       |
-| tor SOCKS proxy     | `127.0.0.1:9150`  | Tor Browser's port, avoids system tor 9050 |
+Everything binds **loopback only**; Tor maps the box's `.onion` ports onto these
+loopback listeners (federation, calls, and client API are reached only via the onion).
+
+| Service                    | Loopback bind    | Onion port | Why                                                 |
+| -------------------------- | ---------------- | ---------- | --------------------------------------------------- |
+| tuwunel homeserver         | `127.0.0.1:8118` | `8008`, `80` | client API; never exposed off-box. `80` mirrors `8008` so SDK clients that derive calls (e.g. account data) from the bare server_name reach tuwunel |
+| tor SOCKS proxy            | `127.0.0.1:9150` | —          | outbound federation; Tor Browser's port, avoids system tor 9050 |
+| Caddy fed-proxy            | `127.0.0.1:8449` | `8448`     | TLS-terminates inbound federation + enforces the paired-peer allowlist (tuwunel has none of its own) |
+| Caddy lk-jwt (TLS)         | `127.0.0.1:8445` | `8443`     | lk-jwt over **TLS on the onion** — the phone's Element Call reaches it via Tor's HTTP-CONNECT tunnel, which only carries TLS |
+| Caddy client API (TLS)     | `127.0.0.1:8455` | `8009`     | client API over **TLS on the onion**, same reason — so EC can discover the call focus (`rtc_foci`) |
+| Caddy wss SFU              | `127.0.0.1:7444` | `7443`     | LiveKit signaling over wss (EC refuses ws://) |
+| LiveKit SFU / TCP media    | `127.0.0.1:7880` / `7881` | (via 7443) | TCP-only (Tor carries no UDP) |
+| coturn                     | `127.0.0.1:3479` | `3478`     | TURN relay; media rides Tor (TCP) and is forwarded locally to the SFU |
+| lk-jwt-service             | `127.0.0.1:8082` | (via 8443) | mints a LiveKit JWT from a Matrix OpenID token |
+
+> The plain-http onion ports (`8082` lk-jwt, `8008` client API) aren't reachable
+> over Tor's HTTP-CONNECT tunnel (TLS-only), so Caddy **also** serves lk-jwt and the
+> client API over TLS on dedicated onion ports `8443` / `8009`. The phone app's call
+> code targets exactly these — that's how Element Call in the WebView discovers the
+> call focus and connects over Tor. (`PUREPRIVACY_PORT_OFFSET` shifts the loopback
+> binds so two boxes can share one host; onion ports stay standard.)
+
+## QR pairing folds peers into the federation allowlist
+
+PurePrivacy only federates with boxes you've paired with. The phone's QR contact
+exchange drives this: when the owner scans a peer's code, the phone records the
+peer's box onion in the owner's Matrix account data
+(`ai.tournesol.pureprivacy.pairings`). The box **watches** that account data
+(`supervisor.rs`), folds any new peer onion into the fed-proxy allowlist, re-renders
+the Caddyfile, and hot-reloads Caddy — so the two boxes start federating with no
+manual step. (Pair codes can also be exchanged box-to-box directly; both paths land
+in `pairings.json` → `render_caddyfile`.)
 
 ## Docs
 
@@ -62,6 +97,8 @@ Everything lives under the platform app-data dir (`ai.tournesol.pureprivacy`):
 | Onboarding flow (D1–D5)                 | ✅ done    |
 | Dashboard (D6)                          | ✅ done    |
 | Sidecar supervisor + demo mode          | ✅ done    |
+| Federation allowlist + QR-pair watch    | ✅ done    |
+| Element Call backend over Tor (lk-jwt + LiveKit SFU + coturn, TLS on onion) | ✅ done |
 | People / Boxes / Agent / Settings pages | ❌ not yet |
 | `externalBin` packaging + signing       | ❌ not yet |
 | Auto-updater                            | ❌ not yet |

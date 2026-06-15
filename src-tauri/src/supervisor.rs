@@ -34,7 +34,7 @@ use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 
 use crate::config::{
-    self, FEDPROXY_PORT, HOMESERVER_PORT, LIVEKIT_WS_PORT, LIVEKIT_WSS_ONION_PORT, LKJWT_PORT,
+    self, off, FEDPROXY_PORT, HOMESERVER_PORT, LIVEKIT_WS_PORT, LIVEKIT_WSS_ONION_PORT, LKJWT_PORT,
     SOCKS_PORT, TURN_PORT,
 };
 use crate::state::{self, Phase, ServiceState, SetupStage};
@@ -307,7 +307,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
         bins.join("tuwunel"),
         vec!["-c".into(), paths.tuwunel_toml.to_string_lossy().into_owned()],
         vec![],
-        Readiness::Http(HOMESERVER_PORT),
+        Readiness::Http(HOMESERVER_PORT + off()),
     );
 
     // Optional 1:1-voice sidecar. Render its config (needs the onion + secret)
@@ -325,7 +325,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 bins.join("turnserver"),
                 vec!["-c".into(), paths.turnserver_conf.to_string_lossy().into_owned()],
                 vec![],
-                Readiness::Tcp(TURN_PORT),
+                Readiness::Tcp(TURN_PORT + off()),
             );
         }
     }
@@ -356,7 +356,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                     "caddyfile".into(),
                 ],
                 vec![],
-                Readiness::Tcp(FEDPROXY_PORT),
+                Readiness::Tcp(FEDPROXY_PORT + off()),
             ),
             Err(e) => eprintln!("[pureprivacy] federation proxy skipped: {e}"),
         }
@@ -371,9 +371,13 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     if voice {
         if livekit_api_key.is_empty() || livekit_api_secret.is_empty() {
             eprintln!("[pureprivacy] group voice skipped: missing livekit api key/secret");
-        } else if let Err(e) =
-            config::render_livekit_yaml(&app, &livekit_api_key, &livekit_api_secret)
-        {
+        } else if let Err(e) = config::render_livekit_yaml(
+            &app,
+            &livekit_api_key,
+            &livekit_api_secret,
+            &onion,
+            &turn_secret,
+        ) {
             eprintln!("[pureprivacy] group voice skipped: {e}");
         } else {
             // LiveKit SFU: TCP-only signaling + media on loopback.
@@ -384,7 +388,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 bins.join("livekit-server"),
                 vec!["--config".into(), paths.livekit_yaml.to_string_lossy().into_owned()],
                 vec![],
-                Readiness::Tcp(LIVEKIT_WS_PORT),
+                Readiness::Tcp(LIVEKIT_WS_PORT + off()),
             );
             // lk-jwt-service: configured entirely by env (no args). It validates
             // a caller's Matrix OpenID token and mints a LiveKit JWT.
@@ -399,7 +403,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 // 0.2.0 ignores the latter and falls back to 8080, which then
                 // mismatches the torrc onion map. (Caught by the live connect
                 // test, 2026-06-13.)
-                ("LIVEKIT_JWT_PORT".into(), LKJWT_PORT.to_string()),
+                ("LIVEKIT_JWT_PORT".into(), (LKJWT_PORT + off()).to_string()),
                 // The wss SFU URL handed to clients (KEEP — Element Call refuses
                 // ws://). Caddy terminates TLS on the onion's 7443 and proxies
                 // the WS upgrade to LiveKit.
@@ -412,8 +416,8 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 // .onion. PROVEN over Tor by the live two-box connect test
                 // (2026-06-13: "Got user info for @bob:<onion>" → JWT minted).
                 // HTTP_PROXY too for the pre-flight well-known GET.
-                ("HTTPS_PROXY".into(), format!("socks5h://127.0.0.1:{SOCKS_PORT}")),
-                ("HTTP_PROXY".into(), format!("socks5h://127.0.0.1:{SOCKS_PORT}")),
+                ("HTTPS_PROXY".into(), format!("socks5h://127.0.0.1:{}", SOCKS_PORT + off())),
+                ("HTTP_PROXY".into(), format!("socks5h://127.0.0.1:{}", SOCKS_PORT + off())),
                 // Accept the self-signed onion certs the federation path uses.
                 (
                     "LIVEKIT_INSECURE_SKIP_VERIFY_TLS".into(),
@@ -427,12 +431,12 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 bins.join("lk-jwt-service"),
                 vec![],
                 lkjwt_envs,
-                Readiness::Tcp(LKJWT_PORT),
+                Readiness::Tcp(LKJWT_PORT + off()),
             );
         }
     }
 
-    wait_for_http(&app, gen, HOMESERVER_PORT, Duration::from_secs(120)).await?;
+    wait_for_http(&app, gen, HOMESERVER_PORT + off(), Duration::from_secs(120)).await?;
     if is_stale(&app, gen) {
         return Ok(());
     }
@@ -461,7 +465,123 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
         inner.setup_stage = Some(SetupStage::Ready);
         inner.phase = Phase::Running;
     });
+
+    // QR-driven federation pairing: watch the owner's `pairings` account data
+    // (their phone writes a peer's onion there the moment they scan that contact's
+    // QR) and fold any new peer onions into the fed-proxy allowlist. This is what
+    // makes a phone-to-phone QR exchange pair the two boxes — no separate desktop
+    // pairing step. Reads the local client API only; the onion came from a scanned
+    // code, never from federation, so there's no allowlist bootstrap deadlock.
+    let ph = app.clone();
+    tauri::async_runtime::spawn(async move { run_pairing_sync(ph, gen).await });
     Ok(())
+}
+
+/// Account-data event type the phone writes scanned-peer onions into.
+const PAIR_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.pairings";
+
+/// Authenticate to the local homeserver as the box admin; returns an access token.
+async fn pair_login(
+    client: &reqwest::Client,
+    base: &str,
+    user: &str,
+    pass: &str,
+) -> Option<String> {
+    let r = client
+        .post(format!("{base}/_matrix/client/v3/login"))
+        .json(&serde_json::json!({
+            "type": "m.login.password",
+            "identifier": { "type": "m.id.user", "user": user },
+            "password": pass,
+        }))
+        .send()
+        .await
+        .ok()?;
+    let v: serde_json::Value = r.json().await.ok()?;
+    v.get("access_token").and_then(|t| t.as_str()).map(String::from)
+}
+
+/// Fetch the owner's recorded pairing onions. `Err(true)` = token rejected
+/// (re-login), `Err(false)` = transient (retry), `Ok(vec)` = current list
+/// (empty if the account data doesn't exist yet).
+async fn pair_fetch_onions(
+    client: &reqwest::Client,
+    base: &str,
+    user_id: &str,
+    token: &str,
+) -> Result<Vec<String>, bool> {
+    // Percent-encode the user id for the path (@ and : are reserved).
+    let enc = user_id.replace('@', "%40").replace(':', "%3A");
+    let url = format!("{base}/_matrix/client/v3/user/{enc}/account_data/{PAIR_ACCOUNT_DATA_TYPE}");
+    let r = client.get(url).bearer_auth(token).send().await.map_err(|_| false)?;
+    if r.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(true);
+    }
+    if r.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Vec::new()); // owner hasn't scanned anyone yet
+    }
+    if !r.status().is_success() {
+        return Err(false);
+    }
+    let v: serde_json::Value = r.json().await.map_err(|_| false)?;
+    Ok(v.get("onions")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default())
+}
+
+/// Poll the owner's pairing account data and keep the fed-proxy allowlist in sync.
+async fn run_pairing_sync(app: AppHandle, gen: u64) {
+    let (username, onion, password) = state::read(&app, |i| {
+        (
+            i.username.clone(),
+            i.onion.clone().unwrap_or_default(),
+            i.admin_password.clone(),
+        )
+    });
+    if username.is_empty() || onion.is_empty() || password.is_empty() {
+        return; // can't authenticate (e.g. a box from before passwords were stored)
+    }
+    let Ok(paths) = config::ensure_dirs(&app) else { return };
+    let base = format!("http://127.0.0.1:{}", HOMESERVER_PORT + off());
+    let user_id = format!("@{username}:{onion}");
+    let client = reqwest::Client::new();
+    let mut token: Option<String> = None;
+    loop {
+        if is_stale(&app, gen) {
+            return;
+        }
+        if token.is_none() {
+            token = pair_login(&client, &base, &username, &password).await;
+        }
+        if let Some(t) = token.clone() {
+            match pair_fetch_onions(&client, &base, &user_id, &t).await {
+                Ok(onions) => {
+                    let known: std::collections::HashSet<String> =
+                        crate::pairing::onions(&paths.data_root).into_iter().collect();
+                    let mut changed = false;
+                    for o in onions {
+                        // Strict v3-onion check before this account-data value
+                        // reaches the Caddy allowlist (regex-injection surface).
+                        if crate::pairing::is_valid_onion(&o)
+                            && o != onion
+                            && !known.contains(&o)
+                            && crate::pairing::add(&paths.data_root, &o).is_ok()
+                        {
+                            eprintln!("[pureprivacy] QR pairing: allowlisting {o}");
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        reload_fedproxy(&app);
+                    }
+                }
+                Err(true) => token = None, // re-login on next tick
+                Err(false) => {}           // transient; retry
+            }
+        }
+        sleep(Duration::from_secs(3)).await;
+    }
 }
 
 async fn wait_for_hostname(

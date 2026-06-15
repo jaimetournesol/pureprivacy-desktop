@@ -18,7 +18,7 @@ set -euo pipefail
 
 BIN_DIR="${PUREPRIVACY_BIN_DIR:-$HOME/.local/share/ai.tournesol.pureprivacy/bin}"
 TUWUNEL_IMAGE="ghcr.io/matrix-construct/tuwunel:latest"
-LIVEKIT_IMAGE="livekit/livekit-server:v1.7.2"
+LIVEKIT_IMAGE="livekit/livekit-server:v1.13.1"
 LKJWT_IMAGE="ghcr.io/element-hq/lk-jwt-service:0.2.0"
 
 # ---------------------------------------------------------------- colors ----

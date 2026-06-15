@@ -35,3 +35,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # for the Caddy fed-proxy's TLS termination.
 base64 = "0.22"
 rcgen = "0.13"
+# Mint a long-lived TURN REST credential (HMAC-SHA1 of the shared coturn secret)
+# so the LiveKit SFU can force-relay group-call media through coturn-at-onion —
+# the proven media-over-Tor path (see docs/redesign/2026-06-media-over-tor.md).
+hmac = "0.12"
+sha1 = "0.10"
