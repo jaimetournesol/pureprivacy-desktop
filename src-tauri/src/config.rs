@@ -559,7 +559,22 @@ fn livekit_yaml_string(
          \x20 # rides Tor (TCP) to coturn; this is only the local relay->SFU hop.\n\
          \x20 udp_port: {udp_port}\n\
          \x20 use_external_ip: false\n\
-         \x20 enable_loopback_candidate: true\n"
+         \x20 # Announce 127.0.0.1 as the SFU's ICE candidate. The SFU BINDS to\n\
+         \x20 # loopback (bind_addresses), but node-IP auto-detection would otherwise\n\
+         \x20 # advertise a docker/LAN IP it isn't listening on — so coturn relays the\n\
+         \x20 # client's media to a dead address and ICE never completes (verified:\n\
+         \x20 # 'removing participant without connection'). Forcing the announced IP to\n\
+         \x20 # match the loopback bind makes the coturn-relay->SFU hop land correctly.\n\
+         \x20 node_ip: 127.0.0.1\n\
+         \x20 enable_loopback_candidate: true\n\
+         \x20 # Gather ONLY the loopback candidate. Without this the SFU also offers\n\
+         \x20 # docker/LAN/IPv6 host candidates; the relay-only phone wastes its ICE\n\
+         \x20 # check budget on those unreachable pairs and times out before it\n\
+         \x20 # nominates the working loopback pair (call connects, then drops). This\n\
+         \x20 # also stops the box leaking its LAN/public IP as an ICE candidate.\n\
+         \x20 ips:\n\
+         \x20   includes:\n\
+         \x20     - 127.0.0.1/32\n"
     );
     // Advertise the coturn-at-onion to clients so they gather a *relay* candidate
     // (the only ICE candidate type that survives Tor). Plaintext `turn:` over TCP
@@ -727,7 +742,11 @@ mod tests {
         assert!(yaml.contains("tcp_port: 7881"));
         assert!(yaml.contains("udp_port: 7882"));
         assert!(yaml.contains("use_external_ip: false"));
+        // Announce loopback (match the bind) so coturn relays media to a live port,
+        // and gather ONLY the loopback candidate (no docker/LAN/public-IP leak).
+        assert!(yaml.contains("node_ip: 127.0.0.1"));
         assert!(yaml.contains("enable_loopback_candidate: true"));
+        assert!(yaml.contains("127.0.0.1/32"));
         // The shared api_key: api_secret pair lk-jwt also signs with.
         assert!(yaml.contains("lkkey: lksecret"));
         // Built-in TURN stays off — we relay over Tor, not LiveKit's TURN.
