@@ -39,6 +39,18 @@
     { title: "Back up now", blurb: "Keep a fresh copy of your keys.", go: "settings" },
   ];
 
+  // Map a service state to its status-dot class (healthy=green, starting=amber,
+  // stopped=dim, error=red). Shared by the always-on System row and the error list.
+  function dotClass(state: string) {
+    return state === "healthy"
+      ? "dot-ok"
+      : state === "starting"
+        ? "dot-warn"
+        : state === "error"
+          ? "dot-err"
+          : "dim";
+  }
+
   function showToast(msg: string) {
     toast = msg;
     if (toastTimer) clearTimeout(toastTimer);
@@ -191,20 +203,23 @@
       <ul class="services">
         {#each st.services as svc}
           <li>
-            <span
-              aria-hidden="true"
-              class={svc.state === "healthy"
-                ? "dot-ok"
-                : svc.state === "starting"
-                  ? "dot-warn"
-                  : svc.state === "error"
-                    ? "dot-err"
-                    : "dim"}>&#9679;</span
-            >
+            <span aria-hidden="true" class={dotClass(svc.state)}>&#9679;</span>
             {svc.name} — {svc.state}
           </li>
         {/each}
       </ul>
+    {/if}
+
+    {#if st.services.length}
+      <div class="system-row" aria-label="System services">
+        <span class="system-label dim">System</span>
+        {#each st.services as svc}
+          <span class="system-svc" title="{svc.name} — {svc.state}">
+            <span aria-hidden="true" class={dotClass(svc.state)}>&#9679;</span>
+            {svc.name}
+          </span>
+        {/each}
+      </div>
     {/if}
 
     <section class="card address-card">
@@ -231,9 +246,16 @@
           </button>
         </div>
       </div>
-      <p class="mono address">
-        {st.onion ?? "— still minting your address —"}
-      </p>
+      {#if st.onion}
+        <p class="mono address">{st.onion}</p>
+      {:else}
+        <div class="address-minting" aria-live="polite">
+          <span class="spinner" aria-hidden="true"></span>
+          <span class="dim"
+            >Building your private address — usually under a minute.</span
+          >
+        </div>
+      {/if}
       {#if showQr && qr}
         <div
           class="qr-box"
@@ -380,6 +402,28 @@
     color: var(--text-dim);
   }
 
+  .system-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--sp-2) var(--sp-4);
+    padding: 0 var(--sp-2);
+    font-size: var(--fs-xs);
+    color: var(--text-dim);
+  }
+
+  .system-label {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .system-svc {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+
   .address-card h2 {
     font-size: var(--fs-md);
   }
@@ -400,6 +444,29 @@
   .address {
     color: var(--text);
     font-size: var(--fs-sm);
+  }
+
+  .address-minting {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: var(--fs-sm);
+  }
+
+  .spinner {
+    width: 0.9rem;
+    height: 0.9rem;
+    flex: none;
+    border: 2px solid var(--hairline-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   .qr-box {

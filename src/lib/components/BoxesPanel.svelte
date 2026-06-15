@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
     copyText,
     pairAccept,
@@ -22,6 +22,34 @@
   let err = $state("");
   let copied = $state(false);
 
+  // Pair codes carry a 15-minute expiry (pairing.rs CODE_TTL_SECS). Tick a live
+  // countdown down from 15:00 once a code is created so it never looks stale.
+  const CODE_TTL_SECS = 15 * 60;
+  let secsLeft = $state(0);
+  let ticker: ReturnType<typeof setInterval> | null = null;
+
+  function startCountdown() {
+    secsLeft = CODE_TTL_SECS;
+    if (ticker) clearInterval(ticker);
+    ticker = setInterval(() => {
+      secsLeft = Math.max(0, secsLeft - 1);
+      if (secsLeft === 0 && ticker) {
+        clearInterval(ticker);
+        ticker = null;
+      }
+    }, 1000);
+  }
+
+  function mmss(s: number) {
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${String(r).padStart(2, "0")}`;
+  }
+
+  onDestroy(() => {
+    if (ticker) clearInterval(ticker);
+  });
+
   async function refresh() {
     try {
       peers = await pairList();
@@ -36,6 +64,7 @@
     err = "";
     try {
       mine = await pairCreate();
+      startCountdown();
     } catch (e) {
       err = String(e);
     } finally {
@@ -109,8 +138,17 @@
             >{copied ? "✓" : "copy"}</button
           >
         </div>
+        {#if secsLeft > 0}
+          <p class="dim sm countdown" aria-live="polite">
+            Expires in <span class="mono">{mmss(secsLeft)}</span>
+          </p>
+        {:else}
+          <p class="expired" role="status">
+            This code has expired — generate a fresh one.
+          </p>
+        {/if}
         <button class="btn btn-subtle" onclick={createCode} disabled={mineBusy}
-          >Fresh code</button
+          >Generate a fresh code</button
         >
       {:else}
         <button class="btn btn-primary" onclick={createCode} disabled={mineBusy}>
@@ -234,6 +272,14 @@
   }
   .peers .mono {
     flex: 1;
+  }
+  .countdown {
+    margin: 0 0 var(--sp-3);
+  }
+  .expired {
+    color: var(--warn);
+    font-size: var(--fs-sm);
+    margin: 0 0 var(--sp-3);
   }
   .err {
     color: var(--err);

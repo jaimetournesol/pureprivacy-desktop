@@ -18,7 +18,7 @@ export type SetupStage = "starting_services" | "minting_address" | "ready";
 export type ServiceState = "starting" | "healthy" | "stopped" | "error";
 
 export interface Service {
-  name: "homeserver" | "tor";
+  name: "homeserver" | "tor" | "voice";
   state: ServiceState;
 }
 
