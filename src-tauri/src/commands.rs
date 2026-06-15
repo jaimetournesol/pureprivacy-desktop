@@ -350,6 +350,11 @@ pub fn pair_create(app: AppHandle) -> Result<PairCodeOut, String> {
 pub fn pair_accept(app: AppHandle, code: String) -> Result<String, String> {
     let my_onion = state::read(&app, |i| i.onion.clone());
     let peer = pairing::parse_code(&code)?;
+    // Defence in depth: parse_code already validates the onion, but never let
+    // anything that isn't a strict v3 onion reach the Caddy allowlist.
+    if !pairing::is_valid_onion(&peer) {
+        return Err("That pair code doesn't contain a valid address.".into());
+    }
     if my_onion.as_deref() == Some(peer.as_str()) {
         return Err("That's this box's own code — paste your friend's code instead.".into());
     }

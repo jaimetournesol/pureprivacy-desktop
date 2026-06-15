@@ -53,6 +53,18 @@ pub const LKJWT_PORT: u16 = 8082;
 pub const LIVEKIT_WSS_ONION_PORT: u16 = 7443;
 /// Caddy's loopback listener for the wss SFU site; tor maps 7443 here.
 pub const CADDY_WSS_PORT: u16 = 7444;
+/// Element Call (in the phone WebView) reaches the box over Tor's HTTP CONNECT
+/// tunnel, which only tunnels TLS — plain-http onion ports (8082 lk-jwt, 8008
+/// client API) aren't reachable that way. So Caddy ALSO TLS-terminates lk-jwt and
+/// the client API on dedicated onion ports, mirroring the wss SFU site. (The phone
+/// app's call code targets exactly these: https onion:8443 / :8009.)
+pub const LKJWT_TLS_ONION_PORT: u16 = 8443;
+/// Caddy loopback listener for the TLS lk-jwt site; tor maps 8443 here.
+pub const CADDY_JWT_PORT: u16 = 8445;
+/// Onion port serving the client API (well-known + C-S) over TLS, same reason.
+pub const HS_TLS_ONION_PORT: u16 = 8009;
+/// Caddy loopback listener for the TLS client-API site; tor maps 8009 here.
+pub const CADDY_HS_PORT: u16 = 8455;
 
 /// Per-instance LOOPBACK port offset (env `PUREPRIVACY_PORT_OFFSET`, default 0).
 /// Lets two boxes run on one host: every loopback bind/map target shifts by this,
@@ -130,6 +142,9 @@ pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
     }
+    // config_dir holds rendered files carrying secrets (registration_token,
+    // turn_secret, livekit api secret, fed key) — owner-only.
+    set_0700(&p.config_dir);
     set_0700(&p.tor_data);
     set_0700(&p.hs_dir);
     Ok(p)
@@ -140,8 +155,11 @@ pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
 /// API (8008) and TURN go straight to their services.
 fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, voice: bool) -> String {
     // Loopback bind/map targets shift by off() per instance; the onion-facing
-    // ports (8448/8008/3478/5349/7443/8082) stay standard so clients see the same
+    // ports (8448/8008/80/3478/5349/7443/8082) stay standard so clients see the same
     // ports on every box. off() == 0 in production + tests (env unset).
+    // Port 80 → tuwunel mirrors 8008: matrix-rust-sdk derives some client calls
+    // (e.g. account data) from the bare server_name and hits the onion's default
+    // http port, so the homeserver must answer there too.
     let o = off();
     // NoIsolateClientAddr: share circuits across local SOCKS clients.
     // G1 finding (2026-06-13): tor's default per-client isolation hands the
@@ -153,6 +171,7 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, vo
          HiddenServiceDir {hs}\n\
          HiddenServicePort 8448 127.0.0.1:{fedproxy}\n\
          HiddenServicePort 8008 127.0.0.1:{hsport}\n\
+         HiddenServicePort 80 127.0.0.1:{hsport}\n\
          HiddenServicePort 3478 127.0.0.1:{turn}\n\
          HiddenServicePort 5349 127.0.0.1:{turn}\n",
         socks = socks + o,
@@ -176,12 +195,18 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, vo
             torrc,
             "HiddenServicePort {wss} 127.0.0.1:{caddy_wss}\n\
              HiddenServicePort {media} 127.0.0.1:{media}\n\
-             HiddenServicePort {jwt} 127.0.0.1:{jwt_loop}",
+             HiddenServicePort {jwt} 127.0.0.1:{jwt_loop}\n\
+             HiddenServicePort {jwt_tls} 127.0.0.1:{caddy_jwt}\n\
+             HiddenServicePort {hs_tls} 127.0.0.1:{caddy_hs}",
             wss = LIVEKIT_WSS_ONION_PORT,
             caddy_wss = CADDY_WSS_PORT + o,
             media = LIVEKIT_TCP_PORT + o,
             jwt = LKJWT_PORT,
             jwt_loop = LKJWT_PORT + o,
+            jwt_tls = LKJWT_TLS_ONION_PORT,
+            caddy_jwt = CADDY_JWT_PORT + o,
+            hs_tls = HS_TLS_ONION_PORT,
+            caddy_hs = CADDY_HS_PORT + o,
         );
     }
     torrc
@@ -261,14 +286,15 @@ fn tuwunel_toml_string(
         // tuwunel publish org.matrix.msc4143.rtc_foci, which clients read to
         // discover the SFU + the lk-jwt token endpoint. client must be set
         // alongside it (tuwunel only emits the rtc_foci block when both are
-        // present). lk-jwt is fetched over http://<onion>:8082 — Tor maps that
-        // onion port to the loopback lk-jwt service.
+        // present). The client (phone WebView) reaches lk-jwt over Tor's HTTP CONNECT
+        // tunnel, which only tunnels TLS — so advertise the TLS lk-jwt onion port
+        // (Caddy site below), NOT the plain-http 8082.
         let _ = write!(
             toml,
             "\n[global.well_known]\n\
              client = \"http://{server_name}\"\n\
-             livekit_url = \"http://{server_name}:{jwt}\"\n",
-            jwt = LKJWT_PORT,
+             livekit_url = \"https://{server_name}:{jwt_tls}\"\n",
+            jwt_tls = LKJWT_TLS_ONION_PORT,
         );
     }
     let _ = write!(
@@ -302,7 +328,11 @@ pub fn render_tuwunel(
         join_token,
         voice,
     );
-    std::fs::write(&p.tuwunel_toml, toml).map_err(|e| format!("couldn't write tuwunel.toml: {e}"))
+    std::fs::write(&p.tuwunel_toml, toml)
+        .map_err(|e| format!("couldn't write tuwunel.toml: {e}"))?;
+    // Carries the registration_token + turn_secret — owner-only.
+    set_0600(&p.tuwunel_toml);
+    Ok(())
 }
 
 /// Render turnserver.conf for the 1:1-voice coturn sidecar, mirroring the
@@ -354,7 +384,10 @@ pub fn render_turnserver(app: &AppHandle, onion: &str, turn_secret: &str) -> Res
     let p = paths(app)?;
     let conf = turnserver_conf_string(onion, turn_secret);
     std::fs::write(&p.turnserver_conf, conf)
-        .map_err(|e| format!("couldn't write turnserver.conf: {e}"))
+        .map_err(|e| format!("couldn't write turnserver.conf: {e}"))?;
+    // Carries the static-auth-secret — owner-only.
+    set_0600(&p.turnserver_conf);
+    Ok(())
 }
 
 /// Pure builder for the fed-proxy Caddyfile — unit-tested. Enforces the
@@ -423,6 +456,28 @@ fn caddyfile_string(
             cert = cert,
             key = key,
             livekit = LIVEKIT_WS_PORT + off(),
+        );
+        // TLS lk-jwt + client-API sites: Element Call in the phone WebView reaches
+        // the box over Tor's HTTP CONNECT tunnel (TLS-only), so these onion services
+        // must be TLS, not plain http. Same self-signed onion cert as above. lk-jwt
+        // is authed by the Matrix OpenID token it validates; the client API by access
+        // tokens — so neither is allowlist-gated. tor maps onion 8443/8009 here.
+        let _ = write!(
+            s,
+            "https://:{jwt_port} {{\n\
+             \ttls {cert} {key}\n\
+             \treverse_proxy http://127.0.0.1:{lkjwt}\n\
+             }}\n\
+             https://:{hs_tls_port} {{\n\
+             \ttls {cert} {key}\n\
+             \treverse_proxy http://127.0.0.1:{hs}\n\
+             }}\n",
+            jwt_port = CADDY_JWT_PORT + off(),
+            hs_tls_port = CADDY_HS_PORT + off(),
+            cert = cert,
+            key = key,
+            lkjwt = LKJWT_PORT + off(),
+            hs = HOMESERVER_PORT + off(),
         );
     }
     s
@@ -557,7 +612,11 @@ pub fn render_livekit_yaml(
         onion,
         turn_secret,
     );
-    std::fs::write(&p.livekit_yaml, conf).map_err(|e| format!("couldn't write livekit.yaml: {e}"))
+    std::fs::write(&p.livekit_yaml, conf)
+        .map_err(|e| format!("couldn't write livekit.yaml: {e}"))?;
+    // Carries the LiveKit api secret + the coturn REST credential — owner-only.
+    set_0600(&p.livekit_yaml);
+    Ok(())
 }
 
 /// Mint the fed-proxy's self-signed TLS cert (CN = the onion). Peers accept it
@@ -590,12 +649,15 @@ mod tests {
     fn torrc_publishes_every_relay_port_plus_the_fixed_ones() {
         let torrc = torrc_string(9150, "/d", "/d/hs", 8118, 8449, false);
         let lines = torrc.matches("HiddenServicePort").count();
-        // 8448 + 8008 + 3478 + 5349 fixed, plus one per relay port.
-        assert_eq!(lines, 4 + relay_count());
+        // 8448 + 8008 + 80 + 3478 + 5349 fixed, plus one per relay port.
+        assert_eq!(lines, 5 + relay_count());
         assert!(torrc.contains("SocksPort 9150 NoIsolateClientAddr"));
-        // Federation (8448) goes to the fed-proxy; client API (8008) to tuwunel.
+        // Federation (8448) goes to the fed-proxy; client API (8008 and 80) to tuwunel.
+        // Port 80 too: matrix-rust-sdk derives some calls (account data) from the bare
+        // server_name, hitting the onion on the default http port.
         assert!(torrc.contains("HiddenServicePort 8448 127.0.0.1:8449"));
         assert!(torrc.contains("HiddenServicePort 8008 127.0.0.1:8118"));
+        assert!(torrc.contains("HiddenServicePort 80 127.0.0.1:8118"));
         // The coturn relay range and torrc MUST agree port-for-port.
         for p in [TURN_RELAY_PORT_MIN, TURN_RELAY_PORT_MAX] {
             assert!(torrc.contains(&format!("HiddenServicePort {p} 127.0.0.1:{p}")));
@@ -727,7 +789,7 @@ mod tests {
         let with = tuwunel_toml_string(onion, "/db", 8118, 9150, "deadbeef", "jointok", true);
         assert!(with.contains("[global.well_known]"));
         assert!(with.contains("client = \"http://abc123.onion\""));
-        assert!(with.contains(&format!("livekit_url = \"http://abc123.onion:{LKJWT_PORT}\"")));
+        assert!(with.contains(&format!("livekit_url = \"https://abc123.onion:{LKJWT_TLS_ONION_PORT}\"")));
 
         // voice=false → no well_known block.
         let no_voice = tuwunel_toml_string(onion, "/db", 8118, 9150, "deadbeef", "jointok", false);

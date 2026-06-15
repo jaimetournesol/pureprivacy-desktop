@@ -40,6 +40,15 @@ pub fn run() {
         .setup(|app| {
             state::load_persisted(app.handle());
             tray::init(app.handle())?;
+            // Opt-in auto-resume: with PUREPRIVACY_AUTOSTART=1, a provisioned box
+            // comes back up on launch (tor + homeserver + sidecars) without a manual
+            // Start click. Used by the multi-box demo launcher; default behaviour
+            // (come up Stopped, user starts it) is unchanged when unset.
+            if std::env::var("PUREPRIVACY_AUTOSTART").ok().as_deref() == Some("1")
+                && state::read(app.handle(), |i| i.onion.is_some())
+            {
+                supervisor::start_lifecycle(app.handle(), None);
+            }
             Ok(())
         })
         .build(tauri::generate_context!())

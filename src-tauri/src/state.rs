@@ -213,6 +213,9 @@ pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
             .map_err(|e| format!("couldn't resolve app data dir: {e}"))?,
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create app data dir: {e}"))?;
+    // The data dir holds secrets.json, the tor onion keys, and the tuwunel db —
+    // owner-only (single-user appliance), so lock it down to 0700.
+    set_0700(&dir);
     Ok(dir)
 }
 
@@ -224,6 +227,15 @@ fn set_0600(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn set_0600(_path: &std::path::Path) {}
+
+#[cfg(unix)]
+fn set_0700(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn set_0700(_path: &std::path::Path) {}
 
 fn write_private(path: &std::path::Path, contents: &str) -> Result<(), String> {
     std::fs::write(path, contents).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
