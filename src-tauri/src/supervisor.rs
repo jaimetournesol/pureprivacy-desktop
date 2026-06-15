@@ -680,6 +680,25 @@ fn set_service(app: &AppHandle, name: &'static str, value: ServiceState) {
     });
 }
 
+/// stdout+stderr targets for a sidecar. /dev/null unless PUREPRIVACY_SIDECAR_LOGS=1,
+/// in which case both go to <data>/logs/<name>.log (debug aid for call/media issues).
+fn sidecar_stdio(app: &AppHandle, name: &str) -> (Stdio, Stdio) {
+    if std::env::var("PUREPRIVACY_SIDECAR_LOGS").ok().as_deref() == Some("1") {
+        if let Ok(p) = config::paths(app) {
+            let dir = p.data_root.join("logs");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join(format!("{name}.log"));
+            if let (Ok(o), Ok(e)) = (
+                std::fs::OpenOptions::new().create(true).append(true).open(&path),
+                std::fs::OpenOptions::new().create(true).append(true).open(&path),
+            ) {
+                return (Stdio::from(o), Stdio::from(e));
+            }
+        }
+    }
+    (Stdio::null(), Stdio::null())
+}
+
 /// Spawn `program`, restart on crash with capped exponential backoff, and
 /// die quietly when the generation goes stale (stop/restart/app exit).
 fn spawn_supervised(
@@ -699,12 +718,17 @@ fn spawn_supervised(
             }
             set_service(&app, name, ServiceState::Starting);
 
+            // Sidecar logs go to /dev/null by default (privacy + tidiness). For
+            // debugging, PUREPRIVACY_SIDECAR_LOGS=1 redirects each sidecar's
+            // stdout+stderr to <data>/logs/<name>.log so a call/media failure can be
+            // traced (coturn allocations, LiveKit ICE state, tuwunel federation).
+            let (out, err) = sidecar_stdio(&app, name);
             let mut cmd = Command::new(&program);
             cmd.args(&args)
                 .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(out)
+                .stderr(err)
                 // Backstop: SIGKILL if the runtime drops us with the child alive.
                 .kill_on_drop(true);
 
