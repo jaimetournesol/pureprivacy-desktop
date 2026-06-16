@@ -8,6 +8,7 @@
     type AppInfo,
     type Status,
   } from "$lib/api";
+  import { mapError } from "$lib/errors";
 
   let { st }: { st: Status } = $props();
 
@@ -39,7 +40,8 @@
     try {
       kitPath = await saveRecoveryKitHtml();
     } catch (e) {
-      kitErr = String(e);
+      console.error("saveRecoveryKitHtml failed:", e);
+      kitErr = mapError(e);
     }
   }
 
@@ -49,7 +51,8 @@
       await resetBox();
       // status polling will flip the app back to the fresh/onboarding view
     } catch (e) {
-      kitErr = String(e);
+      console.error("resetBox failed:", e);
+      kitErr = mapError(e);
       resetting = false;
       confirmReset = false;
     }

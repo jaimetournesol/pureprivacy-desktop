@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { beginSetup, copyText, hasTauri, suggestPassword } from "$lib/api";
+  import { mapError } from "$lib/errors";
 
   let { onNext }: { onNext: () => void } = $props();
 
@@ -21,7 +22,8 @@
     try {
       password = await suggestPassword();
     } catch (e) {
-      error = String(e);
+      console.error("suggestPassword failed:", e);
+      error = mapError(e);
     }
   }
 
@@ -53,8 +55,9 @@
         password,
       });
       onNext();
-    } catch (err) {
-      error = String(err);
+    } catch (e) {
+      console.error("beginSetup failed:", e);
+      error = mapError(e);
     } finally {
       busy = false;
     }
