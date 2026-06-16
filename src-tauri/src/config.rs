@@ -39,6 +39,15 @@ pub const TURN_RELAY_PORT_MAX: u16 = 61039;
 /// federation port 8448 here; Caddy reverse-proxies to the homeserver.
 pub const FEDPROXY_PORT: u16 = 8449;
 
+/// Caddy's local admin/config API. Caddy defaults every instance to :2019; when
+/// several boxes share one host (the dev testbed), they all bind that single
+/// endpoint and the last `caddy run` POSTs its config to it — silently clobbering
+/// the others' running config (so only one box's fed-proxy ports stay served, and
+/// every other box's federation goes dark). Offsetting it per instance gives each
+/// box its own admin endpoint. In production (one box per host) off()=0 keeps it
+/// at the default :2019 — no behaviour change.
+pub const CADDY_ADMIN_PORT: u16 = 2019;
+
 /// LiveKit SFU group-call sidecars (Element Call). All loopback; Tor maps the
 /// well-known onion ports here. These mirror the v0.1 appliance exactly:
 /// LiveKit is TCP-only (Tor carries no UDP) and the SFU URL handed to clients
@@ -407,8 +416,12 @@ fn caddyfile_string(
     // Loopback listeners shift per instance; onion ports (8448/7443) map to these.
     let caddy_port = caddy_port + off();
     let hs_port = hs_port + off();
+    // Admin endpoint shifts too, so co-hosted boxes don't clobber each other's
+    // running config through the shared default :2019 (see CADDY_ADMIN_PORT).
+    let admin_port = CADDY_ADMIN_PORT + off();
     let mut s = format!(
         "{{\n\
+         \tadmin 127.0.0.1:{admin_port}\n\
          \tauto_https off\n\
          }}\n\
          https://:{caddy_port} {{\n\
