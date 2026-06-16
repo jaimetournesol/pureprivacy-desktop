@@ -177,6 +177,9 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, vo
     let mut torrc = format!(
         "SocksPort {socks} NoIsolateClientAddr\n\
          DataDirectory {data}\n\
+         # Exercise OR-connections more often (default 300s) so a half-dead\n\
+         # circuit is detected/torn down sooner, not only on a homeserver send.\n\
+         KeepalivePeriod 60\n\
          HiddenServiceDir {hs}\n\
          HiddenServicePort 8448 127.0.0.1:{fedproxy}\n\
          HiddenServicePort 8008 127.0.0.1:{hsport}\n\
@@ -266,7 +269,21 @@ fn tuwunel_toml_string(
          request_total_timeout = 320\n\
          sender_timeout = 300\n\
          well_known_conn_timeout = 30\n\
-         well_known_timeout = 60\n"
+         well_known_timeout = 60\n\
+         # Federation self-recovery over flaky Tor. tuwunel marks a timed-out\n\
+         # destination Failed and backs off min(sender_timeout*tries^2, limit) — a\n\
+         # SILENT, timer-less window (300s on the FIRST failure) that does NOT\n\
+         # re-probe when the Tor circuit heals, so messages + Megolm key-shares\n\
+         # stall for minutes until a manual restart. Cap the window so a healed\n\
+         # circuit retries within ~a minute. (Bounds retry SCHEDULING, not the\n\
+         # cold-start request timeouts above — first contact is unaffected.)\n\
+         sender_retry_backoff_limit = 60\n\
+         # Evict idle pooled sockets fast so a retry dials a FRESH Tor stream\n\
+         # instead of reusing a keep-alive socket wedged on a dead circuit.\n\
+         sender_idle_timeout = 15\n\
+         federation_idle_timeout = 5\n\
+         # Re-attempt every queued event on (re)start without trimming (lossless).\n\
+         startup_netburst_keep = -1\n"
     );
     if !join_token.is_empty() {
         // Registration is token-gated, never open. The app creates the admin
