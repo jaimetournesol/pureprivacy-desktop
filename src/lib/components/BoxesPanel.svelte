@@ -10,6 +10,7 @@
     type Pairing,
     type Status,
   } from "$lib/api";
+  import { mapError } from "$lib/errors";
 
   let { st }: { st: Status } = $props();
 
@@ -54,7 +55,8 @@
     try {
       peers = await pairList();
     } catch (e) {
-      err = String(e);
+      console.error("pairList failed:", e);
+      err = mapError(e);
     }
   }
   onMount(refresh);
@@ -66,7 +68,8 @@
       mine = await pairCreate();
       startCountdown();
     } catch (e) {
-      err = String(e);
+      console.error("pairCreate failed:", e);
+      err = mapError(e);
     } finally {
       mineBusy = false;
     }
@@ -90,7 +93,8 @@
       theirs = "";
       await refresh();
     } catch (e) {
-      err = String(e);
+      console.error("pairAccept failed:", e);
+      err = mapError(e);
     } finally {
       acceptBusy = false;
     }
@@ -102,7 +106,8 @@
       await pairRemove(onion);
       await refresh();
     } catch (e) {
-      err = String(e);
+      console.error("pairRemove failed:", e);
+      err = mapError(e);
     }
   }
 

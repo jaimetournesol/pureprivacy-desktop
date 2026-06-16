@@ -1,5 +1,6 @@
 <script lang="ts">
   import { copyText, getJoinInfo, type JoinInfo, type Status } from "$lib/api";
+  import { mapError } from "$lib/errors";
 
   let { st }: { st: Status } = $props();
 
@@ -18,7 +19,8 @@
     try {
       info = await getJoinInfo();
     } catch (e) {
-      err = String(e);
+      console.error("getJoinInfo failed:", e);
+      err = mapError(e);
     } finally {
       busy = false;
     }

@@ -7,6 +7,8 @@
     type RecoveryKit,
     type Status,
   } from "$lib/api";
+  import { mapError } from "$lib/errors";
+  import Sunflower from "./Sunflower.svelte";
 
   let { st, onNext }: { st: Status | null; onNext: () => void } = $props();
 
@@ -56,7 +58,8 @@
     try {
       savedPath = await saveRecoveryKitHtml();
     } catch (e) {
-      saveError = String(e);
+      console.error("saveRecoveryKitHtml failed:", e);
+      saveError = mapError(e);
     } finally {
       saving = false;
     }
@@ -106,7 +109,7 @@
   {#if kit}
     <div class="card kit print-area">
       <div class="kit-head">
-        <span class="wordmark-glyph" aria-hidden="true">&#10059;</span>
+        <Sunflower size={20} />
         <strong>PurePrivacy recovery kit</strong>
       </div>
       <ol class="phrase mono">

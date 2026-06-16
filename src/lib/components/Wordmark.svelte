@@ -1,16 +1,21 @@
 <script lang="ts">
+  import Sunflower from "./Sunflower.svelte";
+
   let { size = "md" }: { size?: "sm" | "md" | "lg" } = $props();
+
+  // Match the glyph to the wordmark's font size.
+  const glyphPx = $derived({ sm: 18, md: 22, lg: 38 }[size]);
 </script>
 
 <span class="wordmark {size}">
-  <span class="wordmark-glyph" aria-hidden="true">&#10059;</span>
+  <Sunflower size={glyphPx} />
   <span class="name">PurePrivacy</span>
 </span>
 
 <style>
   .wordmark {
     display: inline-flex;
-    align-items: baseline;
+    align-items: center;
     gap: 0.45em;
     font-weight: 700;
     letter-spacing: -0.01em;

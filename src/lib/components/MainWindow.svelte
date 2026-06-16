@@ -2,16 +2,25 @@
   import {
     copyText,
     getConnectQr,
+    liveness,
+    refreshStatus,
     startBox,
     stopBox,
     type ConnectQr,
     type Status,
   } from "$lib/api";
+  import { mapError } from "$lib/errors";
   import PeoplePanel from "./PeoplePanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import BoxesPanel from "./BoxesPanel.svelte";
+  import Sunflower from "./Sunflower.svelte";
 
   let { st }: { st: Status } = $props();
+
+  // Poll liveness — when this goes stale the metric numbers below are frozen,
+  // not live, so we say so instead of leaving a green "all good" lie on screen.
+  const live = $derived($liveness);
+  const stale = $derived(live.stale);
 
   type View = "home" | "people" | "boxes" | "agent" | "settings";
   let view = $state<View>("home");
@@ -21,8 +30,18 @@
   let qrBusy = $state(false);
   let copied = $state(false);
   let powerBusy = $state(false);
+  // A persistent, friendly reason the last start/pause/restart failed. Lives
+  // inside the (aria-live) status card; cleared on the next successful power()
+  // or once the box is observed running again.
+  let powerError = $state("");
+  let reloadBusy = $state(false);
   let toast = $state("");
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // The box came back to life on its own → drop any stale power error.
+  $effect(() => {
+    if (st.phase === "running" && !stale) powerError = "";
+  });
 
   // Boxes (pairing) + Agent (MCP) land in later builds.
   const nav: { key: View; label: string; soon?: boolean }[] = [
@@ -97,17 +116,35 @@
     try {
       if (action === "start") await startBox();
       else await stopBox();
+      // Success clears any lingering error row. Keep toasts for ephemeral
+      // success cues only (e.g. "coming soon"), never for failures.
+      powerError = "";
     } catch (e) {
-      showToast(String(e));
+      console.error(`power(${action}) failed:`, e);
+      powerError = mapError(e);
     } finally {
       powerBusy = false;
+    }
+  }
+
+  function retryPower() {
+    // Retry whichever direction makes sense for the current phase.
+    power(st.phase === "running" ? "stop" : "start");
+  }
+
+  async function reload() {
+    reloadBusy = true;
+    try {
+      await refreshStatus();
+    } finally {
+      reloadBusy = false;
     }
   }
 </script>
 
 <div class="shell">
   <nav class="rail" aria-label="Main">
-    <div class="rail-brand" aria-hidden="true">&#10059;</div>
+    <div class="rail-brand"><Sunflower size={24} /></div>
     {#each nav as item}
       {#if item.soon}
         <button class="rail-item" disabled title="Soon">
@@ -137,7 +174,7 @@
   <main class="content">
     <header class="topline">
       <h1>{st.box_name || "Your box"}</h1>
-      <p class="dim counts">
+      <p class="dim counts" class:frozen={stale}>
         {st.people_count}
         {st.people_count === 1 ? "person" : "people"} &middot; {st.paired_count}
         paired {st.paired_count === 1 ? "box" : "boxes"}
@@ -155,7 +192,19 @@
     {/if}
 
     <section class="card status-card" aria-live="polite">
-      {#if st.phase === "running"}
+      {#if stale}
+        <p class="sentence">
+          <span class="dot-warn" aria-hidden="true">&#9679;</span> Lost contact with
+          your box — checking again…
+        </p>
+        <button
+          class="btn btn-subtle"
+          onclick={reload}
+          disabled={reloadBusy}
+        >
+          {reloadBusy ? "Checking…" : "Reload"}
+        </button>
+      {:else if st.phase === "running"}
         <p class="sentence">
           <span class="dot-ok" aria-hidden="true">&#9679;</span> All good. Reachable
           over the private network.
@@ -197,6 +246,20 @@
           almost there…
         </p>
       {/if}
+
+      {#if powerError}
+        <p class="power-error" role="alert">
+          <span class="dot-err" aria-hidden="true">&#9679;</span>
+          <span class="power-error-msg">{powerError} — Try again</span>
+          <button
+            class="btn-mini retry"
+            onclick={retryPower}
+            disabled={powerBusy}
+          >
+            {powerBusy ? "…" : "Retry"}
+          </button>
+        </p>
+      {/if}
     </section>
 
     {#if st.phase === "error" && st.services.length}
@@ -211,7 +274,7 @@
     {/if}
 
     {#if st.services.length}
-      <div class="system-row" aria-label="System services">
+      <div class="system-row" class:frozen={stale} aria-label="System services">
         <span class="system-label dim">System</span>
         {#each st.services as svc}
           <span class="system-svc" title="{svc.name} — {svc.state}">
@@ -381,10 +444,36 @@
   }
 
   .status-card {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: var(--sp-3) var(--sp-4);
+  }
+
+  /* The persistent power-error row spans both columns, under the sentence. */
+  .power-error {
+    grid-column: 1 / -1;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: var(--sp-4);
+    gap: var(--sp-2);
+    color: var(--err);
+    font-size: var(--fs-sm);
+    border-top: 1px solid var(--hairline);
+    padding-top: var(--sp-3);
+  }
+
+  .power-error-msg {
+    flex: 1;
+  }
+
+  .power-error .retry {
+    flex: none;
+  }
+
+  /* Frozen / stale metrics — dimmed so they don't read as live. */
+  .counts.frozen,
+  .system-row.frozen {
+    opacity: 0.45;
   }
 
   .sentence {

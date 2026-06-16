@@ -171,6 +171,33 @@ export function pairRemove(onion: string): Promise<null> {
 
 export const status: Writable<Status | null> = writable(null);
 
+/**
+ * Liveness of the status poll itself — separate from the box's phase.
+ *
+ * get_status can fail silently for a beat while the box is mid-restart; that's
+ * normal on Tor. But if every poll keeps failing we must NOT keep rendering the
+ * last-known (likely green) status as if it were live. After STALE_AFTER_MS of
+ * unbroken failure we flip `stale` so the UI can show "lost contact" and dim
+ * the now-frozen numbers. `lastOk` is the epoch-ms of the last good poll.
+ */
+export interface Liveness {
+  /** True once we've had no successful poll for STALE_AFTER_MS. */
+  stale: boolean;
+  /** Consecutive failed polls since the last success. */
+  failures: number;
+  /** Epoch ms of the last successful poll, or null before the first. */
+  lastOk: number | null;
+}
+
+/** Go stale after ~5 s of unbroken poll failure (≈3 missed 1.5 s ticks). */
+export const STALE_AFTER_MS = 5000;
+
+export const liveness: Writable<Liveness> = writable({
+  stale: false,
+  failures: 0,
+  lastOk: null,
+});
+
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 export function startStatusPolling(intervalMs = 1500): void {
@@ -178,9 +205,22 @@ export function startStatusPolling(intervalMs = 1500): void {
   const tick = async () => {
     if (!hasTauri()) return; // plain-browser context: nothing to poll
     try {
-      status.set(await getStatus());
-    } catch {
-      // box may be mid-restart — keep the last known status, try again
+      const s = await getStatus();
+      status.set(s);
+      // A good poll clears any staleness immediately.
+      liveness.set({ stale: false, failures: 0, lastOk: Date.now() });
+    } catch (e) {
+      // Box may be mid-restart — keep the last known status, but COUNT the
+      // failure and flag staleness once we've been dark too long.
+      console.error("get_status poll failed:", e);
+      liveness.update((l) => {
+        const failures = l.failures + 1;
+        const since = l.lastOk;
+        // Never had a good poll yet, or it's been too long → stale.
+        const stale =
+          since === null ? failures >= 3 : Date.now() - since >= STALE_AFTER_MS;
+        return { stale, failures, lastOk: since };
+      });
     }
   };
   void tick();
@@ -191,6 +231,19 @@ export function stopStatusPolling(): void {
   if (pollTimer !== null) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+}
+
+/** Force one immediate poll — wired to the dashboard's Reload button. */
+export async function refreshStatus(): Promise<void> {
+  if (!hasTauri()) return;
+  try {
+    const s = await getStatus();
+    status.set(s);
+    liveness.set({ stale: false, failures: 0, lastOk: Date.now() });
+  } catch (e) {
+    console.error("manual refreshStatus failed:", e);
+    liveness.update((l) => ({ ...l, failures: l.failures + 1 }));
   }
 }
 
