@@ -382,7 +382,13 @@ pub fn pair_list(app: AppHandle) -> Result<Vec<PairingView>, String> {
 }
 
 #[tauri::command]
-pub fn pair_remove(app: AppHandle, onion: String) -> Result<(), String> {
+pub async fn pair_remove(app: AppHandle, onion: String) -> Result<(), String> {
+    // Clear account-data FIRST (guard #4): account-data is the authoritative
+    // source the box reconcile syncs against, so if we dropped pairings.json
+    // before account-data the add-and-remove reconcile would re-add the peer
+    // within ~3s. Best-effort — a failure here (e.g. flaky Tor) must not block
+    // the local cut, which still removes the peer from this box's allowlist.
+    let _ = supervisor::pair_remove_onion_from_account_data(&app, &onion).await;
     let dir = state::app_data_dir(&app)?;
     pairing::remove(&dir, &onion)?;
     refresh_paired_count(&app, &dir);

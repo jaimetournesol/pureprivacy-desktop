@@ -524,10 +524,94 @@ async fn pair_fetch_onions(
         return Err(false);
     }
     let v: serde_json::Value = r.json().await.map_err(|_| false)?;
-    Ok(v.get("onions")
-        .and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_default())
+    // SAFETY (guard #1): under the reconcile, an empty result WIPES the
+    // allowlist — so the only thing that may yield Ok(empty) is a *genuine*
+    // empty list (or the 404 above). The `onions` key being absent entirely
+    // means the value is some other shape we don't understand → treat as a bad
+    // read (Err) rather than collapsing to empty. If the key IS present it must
+    // be an array of strings; anything else (object, string, number, an array
+    // with a non-string element) is hostile/corrupt and must NOT clear live
+    // federation — return Err(false) so the caller retries instead of wiping.
+    match v.get("onions") {
+        None => Err(false),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => return Err(false), // non-string element → bad read
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(false), // present but not an array → bad read
+    }
+}
+
+/// Remove a single onion from the owner's `pairings` account data (the
+/// authoritative source the reconcile syncs against). Called by the desktop
+/// `pair_remove` command BEFORE it touches `pairings.json`, so the add-and-
+/// remove reconcile can't re-add the peer within a tick (guard #4).
+///
+/// Idempotent + re-runnable: it logs in fresh, re-reads the current list, drops
+/// `target`, and PUTs the remainder back, retrying ~5× over flaky Tor. If creds
+/// are missing it's a no-op (the in-memory/local removal still proceeds).
+pub(crate) async fn pair_remove_onion_from_account_data(
+    app: &AppHandle,
+    target: &str,
+) -> Result<(), String> {
+    let (username, onion, password) = state::read(app, |i| {
+        (
+            i.username.clone(),
+            i.onion.clone().unwrap_or_default(),
+            i.admin_password.clone(),
+        )
+    });
+    if username.is_empty() || onion.is_empty() || password.is_empty() {
+        // No way to authenticate (e.g. a box from before passwords were
+        // stored). The local removal still cuts the allowlist; the reconcile
+        // can't re-add because there's no account-data path here at all.
+        return Ok(());
+    }
+    let base = format!("http://127.0.0.1:{}", HOMESERVER_PORT + off());
+    let user_id = format!("@{username}:{onion}");
+    // Same percent-encode as pair_fetch_onions (@ and : are reserved in the path).
+    let enc = user_id.replace('@', "%40").replace(':', "%3A");
+    let url = format!("{base}/_matrix/client/v3/user/{enc}/account_data/{PAIR_ACCOUNT_DATA_TYPE}");
+    let client = reqwest::Client::new();
+
+    for _ in 0..5 {
+        let Some(token) = pair_login(&client, &base, &username, &password).await else {
+            sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        let current = match pair_fetch_onions(&client, &base, &user_id, &token).await {
+            Ok(c) => c,
+            Err(_) => {
+                // Token rejected or transient — back off and retry the whole
+                // login+read so we never PUT against a bad read.
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let kept: Vec<String> = current.into_iter().filter(|o| o != target).collect();
+        let put = client
+            .put(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "onions": kept }))
+            .send()
+            .await;
+        match put {
+            Ok(r) if r.status().is_success() => {
+                eprintln!("[pureprivacy] pairing remove: dropped {target} from account-data");
+                return Ok(());
+            }
+            _ => {
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    Err(format!("couldn't drop {target} from pairing account-data after retries"))
 }
 
 /// Poll the owner's pairing account data and keep the fed-proxy allowlist in sync.
@@ -557,23 +641,72 @@ async fn run_pairing_sync(app: AppHandle, gen: u64) {
         if let Some(t) = token.clone() {
             match pair_fetch_onions(&client, &base, &user_id, &t).await {
                 Ok(onions) => {
+                    // RECONCILE: account-data is the single source of truth. We
+                    // add desired−known AND remove known−desired so a removal on
+                    // the phone (which drops the onion from account-data) cuts
+                    // the allowlist within a tick. The strict v3-onion check +
+                    // self-onion filter (guard #7) gate what reaches the desired
+                    // set, so a malformed/own onion can never be allowlisted and
+                    // never counts as "desired".
+                    let desired: std::collections::HashSet<String> = onions
+                        .into_iter()
+                        .filter(|o| crate::pairing::is_valid_onion(o) && *o != onion)
+                        .collect();
                     let known: std::collections::HashSet<String> =
                         crate::pairing::onions(&paths.data_root).into_iter().collect();
                     let mut changed = false;
-                    for o in onions {
-                        // Strict v3-onion check before this account-data value
-                        // reaches the Caddy allowlist (regex-injection surface).
-                        if crate::pairing::is_valid_onion(&o)
-                            && o != onion
-                            && !known.contains(&o)
-                            && crate::pairing::add(&paths.data_root, &o).is_ok()
-                        {
-                            eprintln!("[pureprivacy] QR pairing: allowlisting {o}");
+
+                    // Add: desired − known.
+                    for o in desired.difference(&known) {
+                        if crate::pairing::add(&paths.data_root, o).is_ok() {
+                            eprintln!("[pureprivacy] pairing reconcile: allowlisting {o}");
                             changed = true;
                         }
                     }
+
+                    // Remove: known − desired. WIPE-GUARD: if the authoritative
+                    // list came back empty while we still know peers, this could
+                    // be a transient/hostile read that pair_fetch_onions let
+                    // through as a *genuine* empty (404 / empty array). Before
+                    // honouring a mass-removal, re-fetch once more; only proceed
+                    // if the SECOND read is ALSO Ok(empty). If it's Err or
+                    // non-empty, skip removal this tick (no wipe on a fluke).
+                    let mut do_remove = true;
+                    if desired.is_empty() && !known.is_empty() {
+                        match pair_fetch_onions(&client, &base, &user_id, &t).await {
+                            Ok(second) => {
+                                let confirmed_empty = second
+                                    .iter()
+                                    .all(|o| !crate::pairing::is_valid_onion(o) || *o == onion);
+                                if !confirmed_empty {
+                                    // Second read disagrees — not actually empty.
+                                    do_remove = false;
+                                }
+                            }
+                            // Err on the re-fetch → don't trust the empty.
+                            Err(_) => do_remove = false,
+                        }
+                        if !do_remove {
+                            eprintln!(
+                                "[pureprivacy] pairing reconcile: empty list unconfirmed on re-fetch — skipping mass removal this tick"
+                            );
+                        }
+                    }
+                    if do_remove {
+                        for o in known.difference(&desired) {
+                            if crate::pairing::remove(&paths.data_root, o).is_ok() {
+                                eprintln!("[pureprivacy] pairing reconcile: revoking {o}");
+                                changed = true;
+                            }
+                        }
+                    }
+
                     if changed {
                         reload_fedproxy(&app);
+                        state::update(&app, |i| {
+                            i.paired_count =
+                                crate::pairing::onions(&paths.data_root).len() as u32
+                        });
                     }
                 }
                 Err(true) => token = None, // re-login on next tick
