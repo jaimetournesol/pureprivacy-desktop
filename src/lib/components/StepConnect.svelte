@@ -81,7 +81,10 @@
   </div>
 
   <div class="actions">
-    <button class="btn btn-subtle" onclick={onNext}>Skip for now</button>
+    <p class="dim later">
+      You can connect your phone now, or any time later from the dashboard.
+    </p>
+    <button class="btn btn-primary" onclick={onNext}>Continue</button>
   </div>
 </div>
 
@@ -185,5 +188,14 @@
 
   .actions {
     margin-top: var(--sp-2);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--sp-3);
+  }
+
+  .later {
+    font-size: var(--fs-sm);
+    max-width: 36ch;
   }
 </style>

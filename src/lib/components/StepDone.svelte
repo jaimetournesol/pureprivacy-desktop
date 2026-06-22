@@ -2,6 +2,11 @@
   import type { Status } from "$lib/api";
 
   let { st, onOpen }: { st: Status | null; onOpen: () => void } = $props();
+
+  // Don't claim "running" while the box is still settling — derive the headline
+  // from the live phase so setup reads as amber "almost there", green only once
+  // the box is actually up.
+  const ready = $derived(st?.phase === "running");
 </script>
 
 <div class="step">
@@ -9,9 +14,16 @@
   <h1>That's everything</h1>
 
   <div class="card summary">
-    <p class="headline">
-      Your box is running <span class="dot-ok" aria-hidden="true">&#9679;</span>
-    </p>
+    {#if ready}
+      <p class="headline">
+        Your box is running <span class="dot-ok" aria-hidden="true">&#9679;</span>
+      </p>
+    {:else}
+      <p class="headline">
+        Finishing setup — almost there
+        <span class="dot-warn" aria-hidden="true">&#9679;</span>
+      </p>
+    {/if}
     {#if st}
       <dl class="meta">
         <div><dt class="dim">Box</dt><dd>{st.box_name}</dd></div>

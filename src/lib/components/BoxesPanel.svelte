@@ -22,6 +22,9 @@
   let msg = $state("");
   let err = $state("");
   let copied = $state(false);
+  // Which peer row is mid-confirm for removal (null = none). Two-step so a
+  // single stray click never silently un-pairs a box.
+  let confirmingOnion = $state<string | null>(null);
 
   // Pair codes carry a 15-minute expiry (pairing.rs CODE_TTL_SECS). Tick a live
   // countdown down from 15:00 once a code is created so it never looks stale.
@@ -102,6 +105,7 @@
 
   async function remove(onion: string) {
     err = "";
+    confirmingOnion = null;
     try {
       await pairRemove(onion);
       await refresh();
@@ -191,9 +195,28 @@
           <li>
             <span class="dot-ok" aria-hidden="true">&#9679;</span>
             <span class="mono" title={p.onion}>{short(p.onion)}</span>
-            <button class="btn-mini" onclick={() => remove(p.onion)}>remove</button
-            >
+            {#if confirmingOnion === p.onion}
+              <div class="confirm" role="group" aria-label="Confirm remove">
+                <span class="confirm-q">Stop messaging this box?</span>
+                <button class="btn-mini danger" onclick={() => remove(p.onion)}
+                  >Remove</button
+                >
+                <button class="btn-mini" onclick={() => (confirmingOnion = null)}
+                  >Cancel</button
+                >
+              </div>
+            {:else}
+              <button
+                class="btn-mini"
+                onclick={() => (confirmingOnion = p.onion)}>remove</button
+              >
+            {/if}
           </li>
+          {#if confirmingOnion === p.onion}
+            <li class="confirm-note dim sm">
+              You'll need to pair again to reconnect.
+            </li>
+          {/if}
         {/each}
       </ul>
     {/if}
@@ -277,6 +300,21 @@
   }
   .peers .mono {
     flex: 1;
+  }
+  .confirm {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+  .confirm-q {
+    font-size: var(--fs-sm);
+  }
+  .btn-mini.danger {
+    color: var(--err);
+  }
+  .confirm-note {
+    margin: calc(-1 * var(--sp-1)) 0 0;
+    padding-left: 1.4rem;
   }
   .countdown {
     margin: 0 0 var(--sp-3);

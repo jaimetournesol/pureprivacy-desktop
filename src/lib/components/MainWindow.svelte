@@ -9,6 +9,7 @@
     type ConnectQr,
     type Status,
   } from "$lib/api";
+  import { onDestroy } from "svelte";
   import { mapError } from "$lib/errors";
   import PeoplePanel from "./PeoplePanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
@@ -21,6 +22,14 @@
   // not live, so we say so instead of leaving a green "all good" lie on screen.
   const live = $derived($liveness);
   const stale = $derived(live.stale);
+
+  // A 1 s clock so "last seen Xs ago" counts up live while contact is lost.
+  let now = $state(Date.now());
+  const nowTimer = setInterval(() => (now = Date.now()), 1000);
+  onDestroy(() => clearInterval(nowTimer));
+  const lastSeenSecs = $derived(
+    live.lastOk ? Math.max(0, Math.round((now - live.lastOk) / 1000)) : null,
+  );
 
   type View = "home" | "people" | "boxes" | "agent" | "settings";
   let view = $state<View>("home");
@@ -194,8 +203,12 @@
     <section class="card status-card" aria-live="polite">
       {#if stale}
         <p class="sentence">
-          <span class="dot-warn" aria-hidden="true">&#9679;</span> Lost contact with
-          your box — checking again…
+          <span class="dot-warn" aria-hidden="true">&#9679;</span> Lost contact
+          {#if lastSeenSecs !== null}
+            — last seen {lastSeenSecs}s ago
+          {:else}
+            — checking again…
+          {/if}
         </p>
         <button
           class="btn btn-subtle"
