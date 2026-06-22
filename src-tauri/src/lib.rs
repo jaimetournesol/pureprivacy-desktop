@@ -4,6 +4,7 @@
 mod account;
 mod commands;
 mod config;
+mod crypto;
 mod pairing;
 mod state;
 mod supervisor;

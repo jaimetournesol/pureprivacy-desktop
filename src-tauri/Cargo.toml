@@ -40,3 +40,13 @@ rcgen = "0.13"
 # the proven media-over-Tor path (see docs/redesign/2026-06-media-over-tor.md).
 hmac = "0.12"
 sha1 = "0.10"
+# At-rest encryption of secrets.json (review finding H2). AES-256-GCM the secrets
+# envelope with a 32-byte master key held OUTSIDE the data dir — the OS keychain
+# (keyring), or a PUREPRIVACY_SECRETS_KEY env override for headless/CI boxes — so a
+# snapshotted/stolen data dir no longer yields the cleartext admin password, TURN
+# secret, registration token or LiveKit keys. crypto-rust keeps it pure-Rust (no
+# system OpenSSL/libdbus); the apple/windows-native features are inert on Linux.
+aes-gcm = "0.10"
+sha2 = "0.10"
+zeroize = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }

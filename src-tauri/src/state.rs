@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
+use zeroize::Zeroize;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,6 +202,64 @@ struct PersistedSecrets {
     admin_password: String,
 }
 
+/// On-disk envelope for `secrets.json` (review finding H2). v2 wraps the
+/// `PersistedSecrets` JSON encrypted with AES-256-GCM (see [`crate::crypto`]);
+/// `key_source` records which master-key source to decrypt with. v1 (legacy) had
+/// no version field — the bare `PersistedSecrets` JSON in cleartext — and is
+/// auto-migrated to v2 on first load.
+#[derive(Serialize, Deserialize)]
+struct SecretsFile {
+    secrets_version: u32,
+    key_source: String,
+    enc: String,
+}
+
+const SECRETS_VERSION: u32 = 2;
+
+/// Outcome of reading `secrets.json`.
+enum SecretsLoad {
+    /// Decrypted v2 envelope.
+    Ok(PersistedSecrets),
+    /// Cleartext v1 file — caller migrates it to v2.
+    Legacy(PersistedSecrets),
+    /// No file yet (fresh box) or unrecognisable contents — load empty.
+    Missing,
+    /// v2 envelope present but undecryptable (missing/wrong key, tampered).
+    Error(String),
+}
+
+fn load_secrets(dir: &std::path::Path) -> SecretsLoad {
+    let Ok(raw) = std::fs::read_to_string(dir.join("secrets.json")) else {
+        return SecretsLoad::Missing;
+    };
+    // v2 encrypted envelope?
+    if let Ok(file) = serde_json::from_str::<SecretsFile>(&raw) {
+        if file.secrets_version >= SECRETS_VERSION {
+            let Some(source) = crate::crypto::KeySource::parse(&file.key_source) else {
+                return SecretsLoad::Error(format!("unknown key_source '{}'", file.key_source));
+            };
+            let mut key = match crate::crypto::key_for_decrypt(source) {
+                Ok(k) => k,
+                Err(e) => return SecretsLoad::Error(e),
+            };
+            let plaintext = crate::crypto::decrypt(&file.enc, &key);
+            key.zeroize();
+            return match plaintext {
+                Ok(p) => match serde_json::from_str::<PersistedSecrets>(&p) {
+                    Ok(s) => SecretsLoad::Ok(s),
+                    Err(e) => SecretsLoad::Error(format!("decrypted secrets not valid JSON: {e}")),
+                },
+                Err(e) => SecretsLoad::Error(e),
+            };
+        }
+    }
+    // Legacy cleartext PersistedSecrets (v1, no version field).
+    match serde_json::from_str::<PersistedSecrets>(&raw) {
+        Ok(s) => SecretsLoad::Legacy(s),
+        Err(_) => SecretsLoad::Missing,
+    }
+}
+
 pub fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     // Per-instance override (env `PUREPRIVACY_DATA_DIR`) so two boxes can run on
     // one host with separate state (tor onion keys, tuwunel db, secrets). Unset in
@@ -269,9 +328,26 @@ pub fn persist(app: &AppHandle) -> Result<(), String> {
         &dir.join("box.json"),
         &serde_json::to_string_pretty(&boxed).map_err(|e| e.to_string())?,
     )?;
+    // Encrypt the whole secrets envelope at rest (H2): the PersistedSecrets JSON —
+    // admin password, recovery phrase, TURN secret, registration token, LiveKit
+    // keys — is AES-256-GCM'd with a master key held outside the data dir. box.json
+    // holds no secrets and stays cleartext. The native daemons' own config files
+    // (tuwunel.toml, turnserver.conf, livekit.yaml) must stay 0600 plaintext —
+    // they read them directly and can't decrypt — so this protects the one copy we
+    // control, not the daemon configs.
+    let mut plaintext = serde_json::to_string(&secrets).map_err(|e| e.to_string())?;
+    let (mut key, source) = crate::crypto::key_for_encrypt();
+    let enc = crate::crypto::encrypt(&plaintext, &key);
+    plaintext.zeroize();
+    key.zeroize();
+    let file = SecretsFile {
+        secrets_version: SECRETS_VERSION,
+        key_source: source.as_str().to_string(),
+        enc: enc?,
+    };
     write_private(
         &dir.join("secrets.json"),
-        &serde_json::to_string_pretty(&secrets).map_err(|e| e.to_string())?,
+        &serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?,
     )?;
     Ok(())
 }
@@ -287,12 +363,20 @@ pub fn load_persisted(app: &AppHandle) {
     let Ok(dir) = app_data_dir(app) else { return };
     let Ok(raw) = std::fs::read_to_string(dir.join("box.json")) else { return };
     let Ok(boxed) = serde_json::from_str::<PersistedBox>(&raw) else { return };
-    let secrets: PersistedSecrets = std::fs::read_to_string(dir.join("secrets.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+
+    // Decrypt the v2 envelope, or read-then-migrate a legacy v1 cleartext file.
+    let loaded = load_secrets(&dir);
+    let was_legacy = matches!(loaded, SecretsLoad::Legacy(_));
+    let (secrets, decrypt_err) = match loaded {
+        SecretsLoad::Ok(s) | SecretsLoad::Legacy(s) => (s, None),
+        SecretsLoad::Missing => (PersistedSecrets::default(), None),
+        SecretsLoad::Error(e) => (PersistedSecrets::default(), Some(e)),
+    };
+
     update(app, |inner| {
-        inner.phase = Phase::Stopped;
+        // A box whose secrets won't decrypt comes up in `Error`, not `Stopped` —
+        // it must not spawn daemons with empty credentials.
+        inner.phase = if decrypt_err.is_some() { Phase::Error } else { Phase::Stopped };
         inner.box_name = boxed.box_name;
         inner.username = boxed.username;
         inner.created = boxed.created;
@@ -306,4 +390,19 @@ pub fn load_persisted(app: &AppHandle) {
         inner.admin_password = secrets.admin_password;
         inner.paired_count = crate::pairing::onions(&dir).len() as u32;
     });
+
+    if let Some(e) = decrypt_err {
+        eprintln!(
+            "[pp][state] secrets.json could not be decrypted: {e}. The box is in an error \
+             state — provide the right PUREPRIVACY_SECRETS_KEY or restore the OS keychain."
+        );
+        return;
+    }
+    // One-shot upgrade of a legacy cleartext secrets.json to the encrypted v2 form.
+    if was_legacy {
+        match persist(app) {
+            Ok(()) => eprintln!("[pp][state] migrated secrets.json to encrypted at-rest (v2)."),
+            Err(e) => eprintln!("[pp][state] failed to migrate secrets.json to v2: {e}"),
+        }
+    }
 }
