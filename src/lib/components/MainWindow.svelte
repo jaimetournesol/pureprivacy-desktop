@@ -11,7 +11,6 @@
   } from "$lib/api";
   import { onDestroy } from "svelte";
   import { mapError } from "$lib/errors";
-  import PeoplePanel from "./PeoplePanel.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
   import BoxesPanel from "./BoxesPanel.svelte";
   import Sunflower from "./Sunflower.svelte";
@@ -31,7 +30,7 @@
     live.lastOk ? Math.max(0, Math.round((now - live.lastOk) / 1000)) : null,
   );
 
-  type View = "home" | "people" | "boxes" | "agent" | "settings";
+  type View = "home" | "people" | "agent" | "settings";
   let view = $state<View>("home");
 
   let qr = $state<ConnectQr | null>(null);
@@ -52,18 +51,17 @@
     if (st.phase === "running" && !stale) powerError = "";
   });
 
-  // Boxes (pairing) + Agent (MCP) land in later builds.
+  // People = the pairing panel (each person runs their own box, so a paired box
+  // *is* a person). Agent (MCP) lands in a later build.
   const nav: { key: View; label: string; soon?: boolean }[] = [
     { key: "home", label: "Home" },
     { key: "people", label: "People" },
-    { key: "boxes", label: "Boxes" },
     { key: "agent", label: "Agent", soon: true },
     { key: "settings", label: "Settings" },
   ];
 
   const actionCards: { title: string; blurb: string; go?: View }[] = [
-    { title: "Add a person", blurb: "Invite someone to message you.", go: "people" },
-    { title: "Pair with a box", blurb: "Link up with a friend's box.", go: "boxes" },
+    { title: "Add a person", blurb: "Pair with a friend's box.", go: "people" },
     { title: "Back up now", blurb: "Keep a fresh copy of your keys.", go: "settings" },
   ];
 
@@ -174,8 +172,6 @@
   </nav>
 
   {#if view === "people"}
-    <main class="content"><PeoplePanel {st} /></main>
-  {:else if view === "boxes"}
     <main class="content"><BoxesPanel {st} /></main>
   {:else if view === "settings"}
     <main class="content"><SettingsPanel {st} /></main>

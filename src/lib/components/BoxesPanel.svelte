@@ -122,11 +122,11 @@
 
 <div class="panel">
   <header>
-    <h1>Boxes</h1>
+    <h1>People</h1>
     <p class="dim">
-      Pair with a friend's box to message across the two. You each share a code,
-      over a channel you trust — then read the address back to each other before
-      you accept.
+      Each person runs their own box. Pair with a friend's box to message across
+      the two — you each share a code over a channel you trust, then read the
+      address back to each other before you accept.
     </p>
   </header>
 
