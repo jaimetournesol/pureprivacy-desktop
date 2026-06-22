@@ -474,6 +474,15 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     // code, never from federation, so there's no allowlist bootstrap deadlock.
     let ph = app.clone();
     tauri::async_runtime::spawn(async move { run_pairing_sync(ph, gen).await });
+
+    // Tier-2 invisible federation keepalive: tuwunel's federation sender is
+    // event-driven — a `Failed` destination only retries when a NEW outbound
+    // event is queued. This sibling task periodically sends an INVISIBLE
+    // `m.dummy` to-device message to each paired peer, which federates a
+    // to-device EDU and wakes the sender so any stuck backlog flushes — with no
+    // presence/read-receipt leak. See run_federation_keepalive below for detail.
+    let fh = app.clone();
+    tauri::async_runtime::spawn(async move { run_federation_keepalive(fh, gen).await });
     Ok(())
 }
 
@@ -715,6 +724,189 @@ async fn run_pairing_sync(app: AppHandle, gen: u64) {
         }
         sleep(Duration::from_secs(3)).await;
     }
+}
+
+/// Tier-2 invisible federation keepalive.
+///
+/// tuwunel's federation sender is event-driven: once a destination is marked
+/// `Failed` it only retries when the NEXT outbound event is queued for it —
+/// nothing wakes it on a timer. In a totally silent room a message sent into a
+/// transient outage stays stuck until some new traffic appears. This loop
+/// closes that gap (Tier-2) WITHOUT leaking presence or
+/// read position: every ~30s it sends an invisible `m.dummy` to-device message
+/// to each paired peer. A to-device EDU federates to the peer's server, waking
+/// tuwunel's sender for that destination so any backlog flushes — and is fully
+/// invisible (no timeline event, no presence, no read marker). `m.dummy` is the
+/// same benign no-op the matrix-rust-sdk already emits for key verification.
+///
+/// 30s cadence sits well under the 60s backoff cap (Tier-1), so a silent-room
+/// stall is bounded to ~one cadence + flush. Terminates cleanly on is_stale
+/// (box stop/restart) like every other supervision loop.
+async fn run_federation_keepalive(app: AppHandle, gen: u64) {
+    let (username, onion, password) = state::read(&app, |i| {
+        (
+            i.username.clone(),
+            i.onion.clone().unwrap_or_default(),
+            i.admin_password.clone(),
+        )
+    });
+    if username.is_empty() || onion.is_empty() || password.is_empty() {
+        return; // can't authenticate (e.g. a box from before passwords were stored)
+    }
+    let Ok(paths) = config::ensure_dirs(&app) else { return };
+    let base = format!("http://127.0.0.1:{}", HOMESERVER_PORT + off());
+    let client = reqwest::Client::new();
+    let mut token: Option<String> = None;
+    // Monotonic transaction-id counter — a unique txn id per send guarantees the
+    // PUT is treated as a new request (not a dedup retry) without any reliance on
+    // wall-clock/random uniqueness.
+    let mut txn: u64 = 0;
+
+    loop {
+        if is_stale(&app, gen) {
+            return;
+        }
+
+        // Cache the admin token; re-login on None (first tick, or after a prior
+        // request error cleared it). Mirrors run_pairing_sync.
+        if token.is_none() {
+            token = pair_login(&client, &base, &username, &password).await;
+        }
+        let Some(t) = token.clone() else {
+            sleep(Duration::from_secs(30)).await;
+            continue;
+        };
+
+        // The box's allowlisted onions are exactly the paired destinations we
+        // want to keep warm. Nothing paired → nothing to nudge. Apply the same
+        // is_valid_onion + self-onion filter run_pairing_sync uses on its
+        // desired set (parity): a malformed entry in pairings.json never matches
+        // a real joined-room peer anyway, but filtering here keeps the two loops
+        // consistent and excludes our own onion up front.
+        let desired: std::collections::HashSet<String> =
+            crate::pairing::onions(&paths.data_root)
+                .into_iter()
+                .filter(|o| crate::pairing::is_valid_onion(o) && *o != onion)
+                .collect();
+        if desired.is_empty() {
+            sleep(Duration::from_secs(30)).await;
+            continue;
+        }
+
+        // Resolve the paired peers' full user ids from the rooms we're joined to,
+        // then nudge each distinct peer once. keepalive_tick is best-effort —
+        // one peer's/room's transport error is skipped, not fatal. It returns
+        // Err(()) ONLY when the auth-bearing joined_rooms GET itself fails, in
+        // which case we drop the token to force a fresh login next tick rather
+        // than aborting the loop.
+        let nudged = match keepalive_tick(&client, &base, &t, &onion, &desired, &mut txn).await {
+            Ok(n) => n,
+            Err(()) => {
+                // joined_rooms GET failed (likely a rejected/expired token) —
+                // re-login next time.
+                token = None;
+                sleep(Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        // At most ONE concise line per tick (never per-peer).
+        if nudged > 0 {
+            eprintln!("[pureprivacy] federation keepalive: nudged {nudged} peer(s)");
+        }
+
+        sleep(Duration::from_secs(30)).await;
+    }
+}
+
+/// One keepalive pass: enumerate joined rooms, find the distinct paired-peer
+/// user ids in them, and send each an invisible `m.dummy` to-device message.
+/// Returns the number of peers nudged, or `Err(())` only when the auth-bearing
+/// `joined_rooms` GET fails (so the caller can re-login next tick). Best-effort,
+/// one failure does not abort the tick: a transport error on any single
+/// per-room `joined_members` GET or per-peer `sendToDevice` PUT is skipped so it
+/// can never starve the remaining rooms/peers — the full set is retried 30s
+/// later anyway. Nothing here mutates box state.
+async fn keepalive_tick(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    our_onion: &str,
+    desired: &std::collections::HashSet<String>,
+    txn: &mut u64,
+) -> Result<usize, ()> {
+    // GET joined rooms. This is the auth-bearing call that gates the whole tick:
+    // a transport error here is the ONLY thing that returns Err(()) (so the
+    // caller drops the token and re-logins). Per-room and per-peer calls below
+    // are best-effort and never abort the tick.
+    let r = client
+        .get(format!("{base}/_matrix/client/v3/joined_rooms"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|_| ())?;
+    let v: serde_json::Value = r.json().await.map_err(|_| ())?;
+    let rooms: Vec<String> = v
+        .get("joined_rooms")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    // Collect the DISTINCT set of paired-peer user ids across all joined rooms.
+    // One room's transport error is skipped (continue) so it can't abort the
+    // enumeration of every later room.
+    let mut peers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for room in &rooms {
+        // Percent-encode the room id for the path (! and : are reserved).
+        let enc = room.replace('!', "%21").replace(':', "%3A");
+        let r = match client
+            .get(format!("{base}/_matrix/client/v3/rooms/{enc}/joined_members"))
+            .bearer_auth(token)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue, // transport error on this room → skip, keep going
+        };
+        let Ok(v) = r.json::<serde_json::Value>().await else {
+            continue; // unparseable body → skip this room
+        };
+        if let Some(joined) = v.get("joined").and_then(|x| x.as_object()) {
+            for user_id in joined.keys() {
+                // Server part = everything after the last ':'. Keep it only if
+                // it's a paired onion AND not our own server.
+                if let Some(server) = user_id.rsplit(':').next() {
+                    if server != our_onion && desired.contains(server) {
+                        peers.insert(user_id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Nudge each distinct peer with an invisible to-device m.dummy. The "*"
+    // device wildcard targets all of the peer's devices; the empty body is a
+    // benign no-op — the EDU's federation to the peer's server is the point.
+    // One peer's transport error is skipped (it just isn't counted) so it can
+    // never starve the remaining peers; only 2xx counts as nudged.
+    let mut nudged = 0usize;
+    for peer in &peers {
+        *txn += 1;
+        let url = format!("{base}/_matrix/client/v3/sendToDevice/m.dummy/{txn}");
+        match client
+            .put(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "messages": { peer: { "*": {} } }
+            }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => nudged += 1,
+            _ => {} // transport error or non-2xx → skip this peer, keep going
+        }
+    }
+    Ok(nudged)
 }
 
 async fn wait_for_hostname(
