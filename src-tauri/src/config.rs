@@ -449,20 +449,25 @@ fn caddyfile_string(
          \t}}\n"
     );
     if !peers.is_empty() {
-        // ^X-Matrix\s+origin="?(p1\.onion|p2\.onion)"?[,\s]. SECURITY: the match
-        // is ANCHORED to the start of the X-Matrix credential and requires a
-        // trailing delimiter, so the allowlisted onion must be the LEADING
-        // `origin=` param that tuwunel actually parses + signature-verifies —
-        // not a substring an attacker buried in a later key/sig param. Go's
-        // header_regexp is unanchored (substring) MatchString: without the ^
-        // anchor an UNPAIRED box could set origin=<their-own-onion> (so tuwunel's
-        // sig check passes) and append `origin=<a-paired-onion>` elsewhere in the
-        // header to get routed past the allowlist — paired onions aren't secret
-        // (QR-exchanged, in room state), so that fully defeated the allowlist.
-        // Quotes stay OPTIONAL ("?) per the Matrix spec (tuwunel sends origin
-        // first + unquoted; a strict-quote version 403'd real federation — live
-        // two-box test, 2026-06-13). Onions are [a-z2-7]+.onion, so only the dot
-        // needs escaping. Do NOT wrap the regex in backticks — it silently fails.
+        // origin="?(p1\.onion|p2\.onion)"?. The X-Matrix auth header's params
+        // may be quoted OR unquoted per the Matrix spec (tuwunel sends them
+        // unquoted) — so the surrounding quotes are OPTIONAL, or paired real
+        // federation gets 403'd. (Live two-box test caught this, 2026-06-13.)
+        // Onions are [a-z2-7]+.onion, so only the dot needs escaping. Do NOT
+        // wrap the regex in backticks — that silently fails to match.
+        //
+        // SECURITY — KNOWN GAP, do NOT "fix" by anchoring: this matcher is
+        // UNANCHORED (Go header_regexp is substring MatchString), so an unpaired
+        // box that knows a paired onion (non-secret — QR-exchanged, in room
+        // state) can bury `origin=<paired>` in a junk/sig param and bypass the
+        // allowlist. BUT anchoring to `^X-Matrix\s+origin=` BREAKS real federation
+        // — tuwunel does NOT emit origin as the first credential param (verified
+        // live 2026-06-22: anchoring 403'd legit traffic), and a quote-aware
+        // "match only the origin tuwunel actually parses" is not expressible as a
+        // regex. The proper fix enforces the allowlist where the X-Matrix header
+        // is genuinely PARSED: a tuwunel-side federation allowlist, or a Caddy
+        // forward_auth that extracts the canonical origin. Tracked in the security
+        // review. Until then this origin-only substring gate stands as-is.
         let alt = peers
             .iter()
             .map(|o| o.replace('.', "\\."))
@@ -470,7 +475,7 @@ fn caddyfile_string(
             .join("|");
         let _ = write!(
             s,
-            "\t@paired header_regexp Authorization ^X-Matrix\\s+origin=\"?({alt})\"?[,\\s]\n\
+            "\t@paired header_regexp Authorization origin=\"?({alt})\"?\n\
              \thandle @paired {{\n\
              \t\treverse_proxy http://127.0.0.1:{hs_port}\n\
              \t}}\n"
