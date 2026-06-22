@@ -5,6 +5,7 @@ mod account;
 mod commands;
 mod config;
 mod crypto;
+mod fedauth;
 mod pairing;
 mod state;
 mod supervisor;

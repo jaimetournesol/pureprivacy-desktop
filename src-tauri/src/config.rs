@@ -74,6 +74,11 @@ pub const CADDY_JWT_PORT: u16 = 8445;
 pub const HS_TLS_ONION_PORT: u16 = 8009;
 /// Caddy loopback listener for the TLS client-API site; tor maps 8009 here.
 pub const CADDY_HS_PORT: u16 = 8455;
+/// Loopback federation-allowlist validator (review item W3-T1). Caddy
+/// `forward_auth`s authenticated federation requests here; it parses the
+/// X-Matrix Authorization origin and 200/403s it against the live pairings
+/// allowlist. Not exposed via tor — pure loopback between Caddy and the box.
+pub const FEDAUTH_PORT: u16 = 8460;
 
 /// The highest fixed loopback base port any `PORT + off()` expression adds the
 /// offset to (the top of the coturn TCP relay range). The offset is clamped so
@@ -432,25 +437,38 @@ pub fn render_turnserver(app: &AppHandle, onion: &str, turn_secret: &str) -> Res
 }
 
 /// Pure builder for the fed-proxy Caddyfile — unit-tested. Enforces the
-/// paired-peer allowlist (Option B, verified): key-exchange/discovery is open
-/// (peers need it before they can be allowlisted); the authenticated federation
-/// API is allowed only when the X-Matrix `Authorization` origin is a paired
-/// peer; everything else is 403. With NO peers, the `@paired` block is omitted
-/// entirely, so all authenticated federation is refused.
+/// paired-peer allowlist: key-exchange/discovery is open (peers need it before
+/// they can be allowlisted); the authenticated federation API is allowed only
+/// when the X-Matrix `Authorization` origin is a paired peer, enforced by a
+/// loopback `forward_auth` validator (see [`crate::fedauth`]); everything else is
+/// 403. With no peers the validator's allowlist is empty, so all authenticated
+/// federation is refused.
 fn caddyfile_string(
     caddy_port: u16,
     hs_port: u16,
     cert: &str,
     key: &str,
-    peers: &[String],
+    _peers: &[String],
     voice: bool,
 ) -> String {
     // Loopback listeners shift per instance; onion ports (8448/7443) map to these.
     let caddy_port = caddy_port + off();
     let hs_port = hs_port + off();
+    let fedauth_port = FEDAUTH_PORT + off();
     // Admin endpoint shifts too, so co-hosted boxes don't clobber each other's
     // running config through the shared default :2019 (see CADDY_ADMIN_PORT).
     let admin_port = CADDY_ADMIN_PORT + off();
+    // Authenticated federation is gated by a loopback validator (fedauth.rs) via
+    // forward_auth: it parses the X-Matrix Authorization header and exact-matches
+    // the canonical `origin` param against the live pairings allowlist, returning
+    // 200 (proxy on to tuwunel) or 403. This REPLACES the old `@paired
+    // header_regexp` matcher, which substring-matched the whole header and let an
+    // unpaired box bury `origin=<paired>` in a junk/sig param to bypass the gate
+    // (and couldn't be anchored — tuwunel doesn't emit origin first). The validator
+    // re-reads pairings.json per request, so the allowlist is live with no Caddy
+    // reload, and the empty-allowlist case denies everything by construction. The
+    // `_peers` arg is no longer needed in the Caddyfile but kept on the signature
+    // for callers. The `route` block forces forward_auth to run before the proxy.
     let mut s = format!(
         "{{\n\
          \tadmin 127.0.0.1:{admin_port}\n\
@@ -461,42 +479,17 @@ fn caddyfile_string(
          \t@open path /_matrix/key/* /_matrix/federation/v1/version /_matrix/federation/v1/openid/* /.well-known/*\n\
          \thandle @open {{\n\
          \t\treverse_proxy http://127.0.0.1:{hs_port}\n\
-         \t}}\n"
+         \t}}\n\
+         \thandle {{\n\
+         \t\troute {{\n\
+         \t\t\tforward_auth http://127.0.0.1:{fedauth_port} {{\n\
+         \t\t\t\turi /check\n\
+         \t\t\t}}\n\
+         \t\t\treverse_proxy http://127.0.0.1:{hs_port}\n\
+         \t\t}}\n\
+         \t}}\n\
+         }}\n"
     );
-    if !peers.is_empty() {
-        // origin="?(p1\.onion|p2\.onion)"?. The X-Matrix auth header's params
-        // may be quoted OR unquoted per the Matrix spec (tuwunel sends them
-        // unquoted) — so the surrounding quotes are OPTIONAL, or paired real
-        // federation gets 403'd. (Live two-box test caught this, 2026-06-13.)
-        // Onions are [a-z2-7]+.onion, so only the dot needs escaping. Do NOT
-        // wrap the regex in backticks — that silently fails to match.
-        //
-        // SECURITY — KNOWN GAP, do NOT "fix" by anchoring: this matcher is
-        // UNANCHORED (Go header_regexp is substring MatchString), so an unpaired
-        // box that knows a paired onion (non-secret — QR-exchanged, in room
-        // state) can bury `origin=<paired>` in a junk/sig param and bypass the
-        // allowlist. BUT anchoring to `^X-Matrix\s+origin=` BREAKS real federation
-        // — tuwunel does NOT emit origin as the first credential param (verified
-        // live 2026-06-22: anchoring 403'd legit traffic), and a quote-aware
-        // "match only the origin tuwunel actually parses" is not expressible as a
-        // regex. The proper fix enforces the allowlist where the X-Matrix header
-        // is genuinely PARSED: a tuwunel-side federation allowlist, or a Caddy
-        // forward_auth that extracts the canonical origin. Tracked in the security
-        // review. Until then this origin-only substring gate stands as-is.
-        let alt = peers
-            .iter()
-            .map(|o| o.replace('.', "\\."))
-            .collect::<Vec<_>>()
-            .join("|");
-        let _ = write!(
-            s,
-            "\t@paired header_regexp Authorization origin=\"?({alt})\"?\n\
-             \thandle @paired {{\n\
-             \t\treverse_proxy http://127.0.0.1:{hs_port}\n\
-             \t}}\n"
-        );
-    }
-    s.push_str("\thandle {\n\t\trespond \"not a paired peer\" 403\n\t}\n}\n");
     if voice {
         // Second site: TLS-terminate the wss SFU signaling path and reverse-proxy
         // the WS upgrade to LiveKit. NOT allowlist-gated — call participants are

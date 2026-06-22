@@ -35,8 +35,8 @@ use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 
 use crate::config::{
-    self, off, FEDPROXY_PORT, HOMESERVER_PORT, LIVEKIT_WS_PORT, LIVEKIT_WSS_ONION_PORT, LKJWT_PORT,
-    SOCKS_PORT, TURN_PORT,
+    self, off, FEDAUTH_PORT, FEDPROXY_PORT, HOMESERVER_PORT, LIVEKIT_WS_PORT,
+    LIVEKIT_WSS_ONION_PORT, LKJWT_PORT, SOCKS_PORT, TURN_PORT,
 };
 use crate::state::{self, Phase, ServiceState, SetupStage};
 
@@ -556,6 +556,13 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     // presence/read-receipt leak. See run_federation_keepalive below for detail.
     let fh = app.clone();
     tauri::async_runtime::spawn(async move { run_federation_keepalive(fh, gen).await });
+
+    // Federation allowlist validator (review item W3-T1): Caddy forward_auths each
+    // authenticated federation request to this loopback endpoint, which parses the
+    // X-Matrix Authorization origin and matches it against the live pairings
+    // allowlist — replacing the old substring-bypassable header_regexp matcher.
+    let gh = app.clone();
+    tauri::async_runtime::spawn(async move { run_fedauth(gh, gen).await });
     Ok(())
 }
 
@@ -794,6 +801,42 @@ pub(crate) async fn pair_add_onion_to_account_data(
 }
 
 /// Poll the owner's pairing account data and keep the fed-proxy allowlist in sync.
+/// Loopback federation-allowlist validator (review item W3-T1). Binds for the
+/// life of this box generation; Caddy `forward_auth`s authenticated federation
+/// requests here and we 200/403 each by matching the X-Matrix Authorization
+/// origin against the live pairings allowlist (see [`crate::fedauth`]). A restart
+/// (gen bump) drops the listener and frees the port; a malformed header fails
+/// CLOSED. The `select!` races `accept()` against a short timer so the stale-gen
+/// check runs even with no traffic.
+async fn run_fedauth(app: AppHandle, gen: u64) {
+    let Ok(paths) = config::ensure_dirs(&app) else { return };
+    let port = FEDAUTH_PORT + off();
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[pp][fedauth] could not bind 127.0.0.1:{port}: {e}");
+            return;
+        }
+    };
+    eprintln!("[pp][fedauth] federation allowlist validator on 127.0.0.1:{port}");
+    loop {
+        if is_stale(&app, gen) {
+            return;
+        }
+        tokio::select! {
+            res = listener.accept() => {
+                if let Ok((mut sock, _)) = res {
+                    let dir = paths.data_root.clone();
+                    tauri::async_runtime::spawn(async move {
+                        crate::fedauth::handle_conn(&mut sock, &dir).await;
+                    });
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+    }
+}
+
 async fn run_pairing_sync(app: AppHandle, gen: u64) {
     let (username, onion, password) = state::read(&app, |i| {
         (
