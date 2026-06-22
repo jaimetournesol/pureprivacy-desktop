@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use rand::Rng; // [QW-rust b] gen_range for jittered respawn backoff
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -87,6 +88,21 @@ impl Supervisor {
 
 fn is_stale(app: &AppHandle, gen: u64) -> bool {
     app.state::<Supervisor>().current_gen() != gen
+}
+
+/// [QW-rust b] Jittered backoff sleep: wait `backoff/2 + rand(0..backoff/2)`.
+/// Decorrelating the respawn delay stops every sidecar that crashed at the same
+/// instant (e.g. a Tor outage took them all down) from retrying in lockstep —
+/// the thundering-herd that would re-hammer a still-flaky network simultaneously.
+/// On average it's the same as `backoff` but spread across a window.
+async fn jittered_sleep(backoff: Duration) {
+    let half = backoff / 2;
+    let extra = if half.is_zero() {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos(rand::thread_rng().gen_range(0..=half.as_nanos() as u64))
+    };
+    sleep(half + extra).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,19 +223,38 @@ pub fn reload_fedproxy(app: &AppHandle) {
         return;
     }
     if let Ok(bins) = bin_dir(app) {
-        // `caddy reload` talks to the running instance's admin API and swaps
-        // config atomically; no-op (errors ignored) if caddy isn't running.
-        let _ = std::process::Command::new(bins.join("caddy"))
-            .args([
-                "reload",
-                "--config",
-                &paths.caddyfile.to_string_lossy(),
-                "--adapter",
-                "caddyfile",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // [QW-rust a] `caddy reload` talks to the running instance's admin API
+        // and swaps config atomically. A FAILED reload silently keeps the stale
+        // allowlist (a just-paired peer stays blocked, or a just-revoked peer
+        // stays allowed) — so check the exit status and retry ONCE before giving
+        // up. If caddy isn't running (box stopped), both attempts fail harmlessly
+        // and the new Caddyfile applies on the next start (it's re-rendered from
+        // pairings on boot). Worth noting: a reload while caddy is down is the
+        // expected no-op, not an error to act on.
+        let run_reload = || {
+            std::process::Command::new(bins.join("caddy"))
+                .args([
+                    "reload",
+                    "--config",
+                    &paths.caddyfile.to_string_lossy(),
+                    "--adapter",
+                    "caddyfile",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        };
+        let ok = matches!(run_reload(), Ok(s) if s.success());
+        if !ok {
+            // Retry once — a transient admin-API hiccup shouldn't strand a stale
+            // allowlist. Second failure is logged (likely caddy-down, benign).
+            let ok2 = matches!(run_reload(), Ok(s) if s.success());
+            if !ok2 {
+                eprintln!(
+                    "[pureprivacy] caddy reload failed (twice) — allowlist change will apply on next box start"
+                );
+            }
+        }
     }
 }
 
@@ -254,6 +289,25 @@ async fn run_demo(app: AppHandle, gen: u64) {
 // ---------------------------------------------------------------------------
 // Real mode — tor first, mint onion, then tuwunel
 // ---------------------------------------------------------------------------
+
+/// [H5] Tear down a half-brought-up box on a genuine (non-stale) run_real
+/// failure and surface the Error phase HERE. We must set phase=Error before
+/// calling shutdown(): shutdown() bumps the generation, after which the caller's
+/// `is_stale` guard would skip its own phase=Error write — so the UI would be
+/// stuck "setting up" forever. Setting it here keeps the error visible AND stops
+/// the already-spawned tor/homeserver/voice/fedproxy/livekit/lkjwt loops from
+/// orphaning (each loop notices the bumped generation and kills its child).
+/// No-op state write if we're already stale (a concurrent stop/restart owns it).
+fn fail_real(app: &AppHandle, gen: u64, err: String) -> String {
+    if !is_stale(app, gen) {
+        state::update(app, |inner| {
+            inner.phase = Phase::Error;
+            inner.setup_stage = None;
+        });
+        app.state::<Supervisor>().shutdown();
+    }
+    err
+}
 
 async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> Result<(), String> {
     let paths = config::ensure_dirs(&app)?;
@@ -291,8 +345,15 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
 
     state::update(&app, |inner| inner.setup_stage = Some(SetupStage::MintingAddress));
 
-    // Wait for tor to mint (or re-load) the hidden-service hostname.
-    let onion = wait_for_hostname(&app, gen, &paths.hostname_file, Duration::from_secs(180)).await?;
+    // Wait for tor to mint (or re-load) the hidden-service hostname. [H5] tor's
+    // supervision loop is already running by now, so a timeout here would orphan
+    // it holding the SOCKS/onion ports — tear it down on error before returning.
+    let onion = match wait_for_hostname(&app, gen, &paths.hostname_file, Duration::from_secs(180))
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return Err(fail_real(&app, gen, e)),
+    };
     state::update(&app, |inner| inner.onion = Some(onion.clone()));
     let _ = state::persist(&app);
 
@@ -436,7 +497,16 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
         }
     }
 
-    wait_for_http(&app, gen, HOMESERVER_PORT + off(), Duration::from_secs(120)).await?;
+    // [H5] On a later-step failure (the wait_for_http timeout here, or the
+    // create_admin error below), the already-spawned tor/homeserver/voice/
+    // fedproxy/livekit/lkjwt loops keep running and holding their ports. fail_real
+    // tears them down (and surfaces phase=Error) so a failed bring-up never
+    // orphans loops.
+    if let Err(e) =
+        wait_for_http(&app, gen, HOMESERVER_PORT + off(), Duration::from_secs(120)).await
+    {
+        return Err(fail_real(&app, gen, e));
+    }
     if is_stale(&app, gen) {
         return Ok(());
     }
@@ -450,8 +520,11 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
             match crate::account::create_admin(&username, &password, &join_token).await {
                 Ok(()) => eprintln!("[pureprivacy] admin account @{username} ready"),
                 Err(e) => {
+                    // [H5] Same teardown as the wait_for_http path: a create_admin
+                    // failure must not leave the sidecar loops orphaned holding
+                    // ports. fail_real is a no-op when we're already stale.
                     if !is_stale(&app, gen) {
-                        return Err(e);
+                        return Err(fail_real(&app, gen, e));
                     }
                 }
             }
@@ -488,6 +561,20 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
 
 /// Account-data event type the phone writes scanned-peer onions into.
 const PAIR_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.pairings";
+
+/// [QW-rust c] A reqwest client with a request timeout, for the box's local
+/// homeserver calls (login / account-data / keepalive). Without it, a hung
+/// connection over flaky Tor could block a poll loop indefinitely (reqwest has
+/// NO default timeout). All these calls hit loopback (the local tuwunel), so 15s
+/// is generous headroom over a healthy local response while still bounding a
+/// wedge. Falls back to the default client if the builder ever fails (it won't
+/// for a plain timeout) so a loop never fails to start over this.
+fn box_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 /// Authenticate to the local homeserver as the box admin; returns an access token.
 async fn pair_login(
@@ -587,7 +674,7 @@ pub(crate) async fn pair_remove_onion_from_account_data(
     // Same percent-encode as pair_fetch_onions (@ and : are reserved in the path).
     let enc = user_id.replace('@', "%40").replace(':', "%3A");
     let url = format!("{base}/_matrix/client/v3/user/{enc}/account_data/{PAIR_ACCOUNT_DATA_TYPE}");
-    let client = reqwest::Client::new();
+    let client = box_http_client(); // [QW-rust c] request timeout (no reqwest default)
 
     for _ in 0..5 {
         let Some(token) = pair_login(&client, &base, &username, &password).await else {
@@ -623,6 +710,89 @@ pub(crate) async fn pair_remove_onion_from_account_data(
     Err(format!("couldn't drop {target} from pairing account-data after retries"))
 }
 
+/// Add a single onion to the owner's `pairings` account data (the authoritative
+/// source the reconcile syncs against). Called by the desktop `pair_accept`
+/// command BEFORE it touches `pairings.json`, so the add-and-remove reconcile
+/// can't REVOKE the just-added peer within a tick (finding C5: account-data is
+/// the single source of truth — run_pairing_sync removes known−desired each
+/// tick, so a peer that's only in pairings.json gets revoked within ~3s, making
+/// the desktop "Connect a box" button non-functional).
+///
+/// Idempotent + re-runnable: it logs in fresh, re-reads the current list, adds
+/// `target` if absent, and PUTs the union back, retrying up to `attempts` times
+/// over flaky Tor. If creds are missing it's an Err (the caller still does the
+/// local add, but the reconcile would then revoke it — so the caller logs the
+/// gap). Mirrors pair_remove_onion_from_account_data exactly, inverted.
+///
+/// `attempts` lets the caller bound the interactive blast radius: the desktop
+/// `pair_accept` command (which blocks the "Connect a box" button on its await)
+/// passes a small budget so a fully-failing-Tor box can't hang the UI for
+/// minutes — on a healthy box this completes in well under a second, and if it
+/// does fail the reconcile (run_pairing_sync) union-adds from account-data on its
+/// next good tick anyway, so a low budget never loses a pairing that can succeed.
+pub(crate) async fn pair_add_onion_to_account_data(
+    app: &AppHandle,
+    target: &str,
+    attempts: u32,
+) -> Result<(), String> {
+    let (username, onion, password) = state::read(app, |i| {
+        (
+            i.username.clone(),
+            i.onion.clone().unwrap_or_default(),
+            i.admin_password.clone(),
+        )
+    });
+    if username.is_empty() || onion.is_empty() || password.is_empty() {
+        // No way to authenticate (e.g. a box from before passwords were stored).
+        // Signal it so the caller can warn: without an account-data write, the
+        // reconcile will revoke the local add on its next tick.
+        return Err("no admin credentials to record the pairing in account-data".into());
+    }
+    let base = format!("http://127.0.0.1:{}", HOMESERVER_PORT + off());
+    let user_id = format!("@{username}:{onion}");
+    // Same percent-encode as pair_fetch_onions (@ and : are reserved in the path).
+    let enc = user_id.replace('@', "%40").replace(':', "%3A");
+    let url = format!("{base}/_matrix/client/v3/user/{enc}/account_data/{PAIR_ACCOUNT_DATA_TYPE}");
+    let client = box_http_client(); // [QW-rust c] request timeout (no reqwest default)
+
+    for _ in 0..attempts {
+        let Some(token) = pair_login(&client, &base, &username, &password).await else {
+            sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        let current = match pair_fetch_onions(&client, &base, &user_id, &token).await {
+            Ok(c) => c,
+            Err(_) => {
+                // Token rejected or transient — back off and retry the whole
+                // login+read so we never PUT against a bad read.
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        // Idempotent union: keep the current set, add target if absent.
+        let mut next = current.clone();
+        if !next.iter().any(|o| o == target) {
+            next.push(target.to_string());
+        }
+        let put = client
+            .put(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "onions": next }))
+            .send()
+            .await;
+        match put {
+            Ok(r) if r.status().is_success() => {
+                eprintln!("[pureprivacy] pairing accept: recorded {target} in account-data");
+                return Ok(());
+            }
+            _ => {
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    Err(format!("couldn't record {target} in pairing account-data after retries"))
+}
+
 /// Poll the owner's pairing account data and keep the fed-proxy allowlist in sync.
 async fn run_pairing_sync(app: AppHandle, gen: u64) {
     let (username, onion, password) = state::read(&app, |i| {
@@ -638,7 +808,7 @@ async fn run_pairing_sync(app: AppHandle, gen: u64) {
     let Ok(paths) = config::ensure_dirs(&app) else { return };
     let base = format!("http://127.0.0.1:{}", HOMESERVER_PORT + off());
     let user_id = format!("@{username}:{onion}");
-    let client = reqwest::Client::new();
+    let client = box_http_client(); // [QW-rust c] request timeout (no reqwest default)
     let mut token: Option<String> = None;
     loop {
         if is_stale(&app, gen) {
@@ -755,7 +925,7 @@ async fn run_federation_keepalive(app: AppHandle, gen: u64) {
     }
     let Ok(paths) = config::ensure_dirs(&app) else { return };
     let base = format!("http://127.0.0.1:{}", HOMESERVER_PORT + off());
-    let client = reqwest::Client::new();
+    let client = box_http_client(); // [QW-rust c] request timeout (no reqwest default)
     let mut token: Option<String> = None;
     // Monotonic transaction-id counter — a unique txn id per send guarantees the
     // PUT is treated as a new request (not a dedup retry) without any reliance on
@@ -1062,7 +1232,7 @@ fn spawn_supervised(
                 Err(err) => {
                     eprintln!("[pureprivacy] couldn't start {name}: {err}");
                     set_service(&app, name, ServiceState::Error);
-                    sleep(backoff).await;
+                    jittered_sleep(backoff).await; // [QW-rust b] decorrelate respawns
                     backoff = (backoff * 2).min(BACKOFF_CAP);
                     continue;
                 }
@@ -1107,7 +1277,7 @@ fn spawn_supervised(
             }
             // Crash: mark, back off, respawn.
             set_service(&app, name, ServiceState::Error);
-            sleep(backoff).await;
+            jittered_sleep(backoff).await; // [QW-rust b] decorrelate respawns
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }
     });

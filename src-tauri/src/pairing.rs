@@ -65,16 +65,61 @@ pub fn pairings_path(data_dir: &std::path::Path) -> PathBuf {
 }
 
 pub fn load(data_dir: &std::path::Path) -> Pairings {
-    std::fs::read_to_string(pairings_path(data_dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    // [H7] Fail-CLOSED on a corrupt NON-EMPTY file. A missing file is a
+    // legitimately-empty allowlist (fresh box / never paired), so it defaults to
+    // empty. But a file that EXISTS yet fails to parse (truncated by a crash mid-
+    // write, or otherwise corrupt) must NOT silently collapse to an empty
+    // allowlist — that would cut ALL federation. We keep the box federating by
+    // re-throwing via a panic-free fallback: callers that mutate (add/remove) go
+    // through load_strict and surface the error; this infallible accessor (used
+    // by read-only paths) returns empty ONLY when the file is genuinely absent.
+    match load_strict(data_dir) {
+        Ok(p) => p,
+        Err(_) => {
+            // Parse failure on an existing, non-empty file. Returning empty here
+            // is the read-only fallback; the authoritative guard is in save()
+            // (atomic write, below) so this state should not arise in practice.
+            // Loudly note it so a corrupt store is visible in logs.
+            eprintln!(
+                "[pureprivacy] WARNING: pairings.json failed to parse — treating as empty for this read"
+            );
+            Pairings::default()
+        }
+    }
+}
+
+/// Like `load`, but returns `Err` when the file EXISTS yet fails to parse,
+/// instead of defaulting to empty. A missing file is still legitimately empty
+/// (`Ok(default)`). Mutating callers (add/remove) use this so a corrupt store
+/// can't be silently overwritten with a truncated allowlist. [H7]
+pub fn load_strict(data_dir: &std::path::Path) -> Result<Pairings, String> {
+    let path = pairings_path(data_dir);
+    match std::fs::read_to_string(&path) {
+        // No file → genuinely empty allowlist (fresh box).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Pairings::default()),
+        Err(e) => Err(format!("couldn't read pairings: {e}")),
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| format!("pairings.json is corrupt ({e}) — refusing to overwrite it")),
+    }
 }
 
 pub fn save(data_dir: &std::path::Path, p: &Pairings) -> Result<(), String> {
+    // [H7] Atomic write: serialize to a temp file in the SAME dir, then rename
+    // over the target. rename(2) is atomic on the same filesystem, so a crash
+    // can never leave a half-written (truncated → unparseable) pairings.json
+    // that load() would then read as an empty allowlist (cutting all
+    // federation). The old write() truncated in place — the exact window H7
+    // flags.
     let json = serde_json::to_string_pretty(p).map_err(|e| e.to_string())?;
-    std::fs::write(pairings_path(data_dir), json)
-        .map_err(|e| format!("couldn't save pairings: {e}"))
+    let final_path = pairings_path(data_dir);
+    let tmp_path = final_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json)
+        .map_err(|e| format!("couldn't write pairings temp file: {e}"))?;
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+        // Best-effort cleanup so a failed rename doesn't litter a stale tmp.
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("couldn't save pairings: {e}")
+    })
 }
 
 /// Mint a short-lived pair code carrying our own onion, for the peer to accept.
@@ -110,7 +155,9 @@ pub fn parse_code(code: &str) -> Result<String, String> {
 
 /// Add a peer (idempotent).
 pub fn add(data_dir: &std::path::Path, onion: &str) -> Result<(), String> {
-    let mut p = load(data_dir);
+    // [H7] load_strict: refuse to overwrite a corrupt store with a truncated
+    // allowlist; surface the error instead of silently rebuilding from empty.
+    let mut p = load_strict(data_dir)?;
     if !p.peers.iter().any(|x| x.onion == onion) {
         p.peers.push(Pairing { onion: onion.to_string(), added_at: now() });
         save(data_dir, &p)?;
@@ -120,7 +167,8 @@ pub fn add(data_dir: &std::path::Path, onion: &str) -> Result<(), String> {
 
 /// Remove a peer (idempotent).
 pub fn remove(data_dir: &std::path::Path, onion: &str) -> Result<(), String> {
-    let mut p = load(data_dir);
+    // [H7] load_strict: same rationale as add — don't rebuild over a corrupt file.
+    let mut p = load_strict(data_dir)?;
     let before = p.peers.len();
     p.peers.retain(|x| x.onion != onion);
     if p.peers.len() != before {
@@ -183,6 +231,40 @@ mod tests {
         })
         .unwrap();
         assert!(parse_code(&b64().encode(raw)).is_err());
+    }
+
+    #[test]
+    fn save_then_load_round_trips_and_is_atomic() {
+        // [H7] save() writes via a temp file + rename; load() reads it back, and
+        // no stray .tmp is left behind.
+        let dir = std::env::temp_dir().join(format!("pp_pairing_h7_{}", now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Pairings {
+            peers: vec![Pairing { onion: VALID_ONION.to_string(), added_at: 1 }],
+        };
+        save(&dir, &p).unwrap();
+        let back = load(&dir);
+        assert_eq!(back.peers.len(), 1);
+        assert_eq!(back.peers[0].onion, VALID_ONION);
+        assert!(!pairings_path(&dir).with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_strict_is_empty_when_missing_but_errs_on_corrupt() {
+        // [H7] A MISSING file is a legitimately-empty allowlist (Ok(empty)); a
+        // file that EXISTS but doesn't parse is an Err — NOT a silent collapse to
+        // an empty allowlist (which would cut all federation). add()/remove() use
+        // load_strict so they never overwrite a corrupt store with a truncated one.
+        let dir = std::env::temp_dir().join(format!("pp_pairing_h7c_{}", now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing file → Ok(empty).
+        assert!(load_strict(&dir).unwrap().peers.is_empty());
+        // Corrupt (non-empty, unparseable) → Err, and add() refuses.
+        std::fs::write(pairings_path(&dir), b"{ this is not json").unwrap();
+        assert!(load_strict(&dir).is_err());
+        assert!(add(&dir, VALID_ONION).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

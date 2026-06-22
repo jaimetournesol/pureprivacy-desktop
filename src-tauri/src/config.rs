@@ -75,16 +75,31 @@ pub const HS_TLS_ONION_PORT: u16 = 8009;
 /// Caddy loopback listener for the TLS client-API site; tor maps 8009 here.
 pub const CADDY_HS_PORT: u16 = 8455;
 
+/// The highest fixed loopback base port any `PORT + off()` expression adds the
+/// offset to (the top of the coturn TCP relay range). The offset is clamped so
+/// even this port can't overflow a u16 — see `off()`. [QW-rust d]
+const MAX_BASE_PORT: u16 = TURN_RELAY_PORT_MAX;
+/// Largest offset that keeps every `PORT + off()` inside u16 (no wraparound).
+const MAX_PORT_OFFSET: u16 = u16::MAX - MAX_BASE_PORT;
+
 /// Per-instance LOOPBACK port offset (env `PUREPRIVACY_PORT_OFFSET`, default 0).
 /// Lets two boxes run on one host: every loopback bind/map target shifts by this,
 /// while the .onion-facing ports stay standard (each box has its own onion, so
 /// 8008/8448/3478/7443/8082 never collide and clients see the same ports on both).
 /// Unset (= 0) in production and tests, so behaviour is unchanged by default.
+///
+/// [QW-rust d] CLAMP against port overflow: every loopback port is computed as
+/// `<base> + off()` (u16 + u16). An offset large enough to push the highest base
+/// port (the coturn relay-range top, ~61039) past 65535 would silently WRAP in
+/// release builds, mapping a sidecar to a bogus low port. So we clamp the parsed
+/// value to `MAX_PORT_OFFSET` — the largest offset that keeps every `PORT+off()`
+/// inside u16. A non-numeric / absent env stays 0 (the production default).
 pub fn off() -> u16 {
     std::env::var("PUREPRIVACY_PORT_OFFSET")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0)
+        .min(MAX_PORT_OFFSET)
 }
 
 pub struct Paths {

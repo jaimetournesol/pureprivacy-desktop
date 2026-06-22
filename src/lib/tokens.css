@@ -287,6 +287,20 @@ p {
   color: var(--accent);
 }
 
+/* ── reduced motion ───────────────────────────────────────────── */
+/* [QW-svelte] Honour the OS "reduce motion" preference: kill the spinner
+   animations. .spin / .spinner live in component-scoped styles, where Svelte
+   appends a hash class (.spin.svelte-xxxx, specificity 0-2-0) that outranks this
+   un-scoped global rule (0-1-0) — and a media query adds no specificity. So we
+   use !important here, the accepted pattern for reduced-motion resets, to win
+   the cascade regardless of Svelte scoping. Accessibility-only; no flow impact. */
+@media (prefers-reduced-motion: reduce) {
+  .spin,
+  .spinner {
+    animation: none !important;
+  }
+}
+
 /* ── print: only the recovery kit sheet ───────────────────────── */
 
 @media print {

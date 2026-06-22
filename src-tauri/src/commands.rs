@@ -26,6 +26,17 @@ pub fn suggest_password() -> Result<String, String> {
     Ok(format!("{}-{}", words.join("-"), digits))
 }
 
+/// [QW-rust e] A valid Matrix localpart: non-empty, within the spec grammar
+/// `[a-z0-9._=/+-]`, and short enough that `@<localpart>:<onion>` stays under
+/// Matrix's 255-byte user-id cap (a v3 onion server_name is 62 bytes, plus `@`
+/// and `:`, leaving ~190 — we cap the localpart at 180 with generous headroom).
+fn is_valid_localpart(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 180
+        && s.bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'=' | b'/' | b'+' | b'-'))
+}
+
 #[tauri::command]
 pub fn begin_setup(
     app: AppHandle,
@@ -40,6 +51,19 @@ pub fn begin_setup(
     }
     if username.is_empty() {
         return Err("Pick a username first.".into());
+    }
+    // [QW-rust e] Validate the username is a valid Matrix localpart BEFORE it's
+    // baked into @user:onion (used for login, account-data paths, and the admin
+    // registration). The Matrix spec restricts a localpart to the grammar
+    // [a-z0-9._=/+-]; anything else (uppercase, spaces, @, :) yields a malformed
+    // user id that registration rejects — better to reject it here with a clear
+    // message than to fail opaquely mid-setup. We also bound the length so the
+    // full user id stays well under Matrix's 255-byte user-id limit.
+    if !is_valid_localpart(&username) {
+        return Err(
+            "Usernames can only use lowercase letters, numbers, and . _ = + / - (no spaces or capitals)."
+                .into(),
+        );
     }
     if password.trim().is_empty() {
         return Err("Pick a password first.".into());
@@ -347,7 +371,7 @@ pub fn pair_create(app: AppHandle) -> Result<PairCodeOut, String> {
 /// Accept another box's pair code: add it to the federation allowlist and
 /// hot-reload the fed-proxy. Returns the peer's onion.
 #[tauri::command]
-pub fn pair_accept(app: AppHandle, code: String) -> Result<String, String> {
+pub async fn pair_accept(app: AppHandle, code: String) -> Result<String, String> {
     let my_onion = state::read(&app, |i| i.onion.clone());
     let peer = pairing::parse_code(&code)?;
     // Defence in depth: parse_code already validates the onion, but never let
@@ -357,6 +381,25 @@ pub fn pair_accept(app: AppHandle, code: String) -> Result<String, String> {
     }
     if my_onion.as_deref() == Some(peer.as_str()) {
         return Err("That's this box's own code — paste your friend's code instead.".into());
+    }
+    // Write account-data FIRST (finding C5): account-data is the authoritative
+    // source the box reconcile (run_pairing_sync) syncs against — it revokes any
+    // peer in known−desired every ~3s. If we only added to pairings.json the
+    // reconcile would revoke this peer within a tick, making "Connect a box"
+    // non-functional. Recording it in account-data BEFORE the local add makes the
+    // peer part of the "desired" set, so the reconcile keeps it. Best-effort: a
+    // failure here (e.g. flaky Tor, or a pre-passwords box with no creds) is
+    // logged but does not block the local add — the next phone QR scan or a
+    // re-accept still records it, and the operator sees the warning.
+    //
+    // Bounded retries (3) on this interactive path: pair_accept blocks the
+    // "Connect a box" button on this await, so a small budget keeps a
+    // fully-failing-Tor box from hanging the UI for minutes (a healthy box
+    // completes in well under a second). On a box where Tor is so broken the
+    // write can't land in 3 tries, federation/calls to the peer wouldn't work
+    // anyway — and a re-accept (or phone QR scan) records it when Tor recovers.
+    if let Err(e) = supervisor::pair_add_onion_to_account_data(&app, &peer, 3).await {
+        eprintln!("[pureprivacy] pair_accept: account-data not updated ({e}); the reconcile may revoke {peer} until it's recorded");
     }
     let dir = state::app_data_dir(&app)?;
     pairing::add(&dir, &peer)?;
