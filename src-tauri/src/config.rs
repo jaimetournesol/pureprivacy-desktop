@@ -751,22 +751,30 @@ mod tests {
     }
 
     #[test]
-    fn caddyfile_allowlists_paired_peers_only() {
-        let peers = vec!["aaa.onion".to_string(), "bbb.onion".to_string()];
-        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &peers, false);
-        // open endpoints + allowlist + catch-all 403
+    fn caddyfile_gates_federation_via_forward_auth() {
+        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false);
+        // Open (unauthenticated) federation paths bypass the allowlist.
         assert!(cf.contains("@open path /_matrix/key/*"));
-        // openid/userinfo MUST be open — lk-jwt's cross-box call validation hits
-        // it with no X-Matrix origin header, so @paired can't match it.
+        // openid MUST be open — lk-jwt's cross-box validation hits it with no X-Matrix
+        // origin header, so the auth gate can't match it.
         assert!(cf.contains("/_matrix/federation/v1/openid/*"));
-        assert!(cf.contains(r#"@paired header_regexp Authorization origin="?(aaa\.onion|bbb\.onion)"?"#));
-        assert!(cf.contains("respond \"not a paired peer\" 403"));
+        // Authenticated federation is gated by the loopback forward_auth validator
+        // (fedauth.rs), which parses the canonical `origin` and 200/403s it against the
+        // live pairings allowlist — replacing the substring-bypassable header_regexp.
+        assert!(cf.contains(&format!("forward_auth http://127.0.0.1:{}", FEDAUTH_PORT + off())));
+        assert!(cf.contains("uri /check"));
         assert!(cf.contains("reverse_proxy http://127.0.0.1:8118"));
+        // Per-instance admin port so co-hosted boxes don't clobber each other's config.
+        assert!(cf.contains(&format!("admin 127.0.0.1:{}", CADDY_ADMIN_PORT + off())));
+        // The old bypassable matcher and its static 403 handler are gone.
+        assert!(!cf.contains("@paired header_regexp"));
 
-        // No peers → NO @paired block → all authed federation refused.
-        let none = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false);
-        assert!(!none.contains("@paired"));
-        assert!(none.contains("respond \"not a paired peer\" 403"));
+        // The Caddyfile no longer varies by peers — the validator reads pairings.json
+        // live, so allowlist changes need no Caddy reload and deny-by-default (empty
+        // allowlist) lives in fedauth.rs. Same config with or without peers.
+        let with_peers =
+            caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &["aaa.onion".into()], false);
+        assert_eq!(cf, with_peers);
     }
 
     #[test]

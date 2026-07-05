@@ -297,8 +297,48 @@ fn set_0700(path: &std::path::Path) {
 fn set_0700(_path: &std::path::Path) {}
 
 fn write_private(path: &std::path::Path, contents: &str) -> Result<(), String> {
-    std::fs::write(path, contents).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
-    set_0600(path);
+    // Atomic write (review CRITICAL): write a sibling temp (created 0600 BEFORE any
+    // bytes, so secrets are never briefly world-readable), fsync it, then rename(2)
+    // over the target — atomic on the same filesystem. A crash / power-loss / OOM-kill
+    // mid-write can therefore never leave a truncated secrets.json, which would read as
+    // "Missing" → an empty admin_password → a permanent, unrecoverable box lockout (that
+    // password is the only login credential and nobody can reset it). The v1→v2 secrets
+    // migration, which rewrites the sole cleartext copy in place, is the exact moment
+    // this protects. Mirrors the temp+rename pairing.rs already uses for pairings.json.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_tmp = || -> std::io::Result<()> {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?; // durable on disk before the rename
+        Ok(())
+    };
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("couldn't write {}: {e}", tmp.display()));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("couldn't finalize {}: {e}", path.display())
+    })?;
+    set_0600(path); // rename preserves the temp's mode; explicit for non-unix/clarity
     Ok(())
 }
 

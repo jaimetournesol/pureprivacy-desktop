@@ -309,6 +309,69 @@ fn fail_real(app: &AppHandle, gen: u64, err: String) -> String {
     err
 }
 
+/// Reap a stale `lk-jwt-service` still bound to `port` before spawning a fresh one.
+/// lk-jwt is configured entirely by env (no data-dir in its cmdline), so a SIGKILL / OOM /
+/// crash of a previous box generation orphans it holding LIVEKIT_JWT_PORT with the OLD
+/// box's LiveKit keys — the new lk-jwt then can't bind, crash-loops, and Element Call
+/// fails with "livekit failed" (a JWT signed by mismatched keys). We match on BOTH the
+/// binary name AND the exact `LIVEKIT_JWT_PORT={port}` in the process env, so only our own
+/// orphan for THIS box's port is ever killed — a co-hosted box's lk-jwt (different port) or
+/// any unrelated process on the port is never touched. Linux-only (/proc); no-op elsewhere.
+#[cfg(target_os = "linux")]
+fn reap_stale_lkjwt(port: u16) {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let needle = format!("LIVEKIT_JWT_PORT={port}");
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if !cmd.contains("lk-jwt-service") {
+            continue;
+        }
+        // /proc/<pid>/environ is NUL-separated KEY=VALUE; an exact-entry match is precise.
+        let env = std::fs::read_to_string(format!("/proc/{pid}/environ")).unwrap_or_default();
+        if env.split('\0').any(|kv| kv == needle) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+            eprintln!("[pp] reaped stale lk-jwt orphan pid {pid} on :{port}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_stale_lkjwt(_port: u16) {}
+
+/// Best-effort: open/refresh the Tor circuit to a peer's box so the FIRST federated
+/// invite/event lands quickly instead of paying full cold-circuit cost — which made
+/// first-time pairing take minutes or stall in testing. We GET the peer's onion
+/// `/_matrix/federation/v1/version` (an `@open` path that bypasses the allowlist) over
+/// the box's Tor SOCKS proxy. Fire-and-forget: a cold/offline peer just fails here and
+/// the invite retry keeps trying — this only makes the happy path fast.
+async fn warm_peer_circuit(peer_onion: &str) {
+    let socks = format!("socks5h://127.0.0.1:{}", SOCKS_PORT + off());
+    let Ok(proxy) = reqwest::Proxy::all(&socks) else {
+        return;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .proxy(proxy)
+        .danger_accept_invalid_certs(true) // the onion's federation cert is self-signed
+        .timeout(Duration::from_secs(60)) // Tor onion circuits can be slow to build
+        .build()
+    else {
+        return;
+    };
+    // Onion virtual port 8448 = the peer's Caddy fed-proxy (torrc HiddenServicePort 8448),
+    // regardless of the peer's local PORT_OFFSET.
+    let url = format!("https://{peer_onion}:8448/_matrix/federation/v1/version");
+    if client.get(&url).send().await.is_ok() {
+        eprintln!("[pp] warmed Tor circuit to {peer_onion}");
+    }
+}
+
 async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> Result<(), String> {
     let paths = config::ensure_dirs(&app)?;
     // Group calls (Element Call / LiveKit) are enabled only when both the SFU
@@ -485,6 +548,11 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                     "YES_I_KNOW_WHAT_I_AM_DOING".into(),
                 ),
             ];
+            // Reap a stale lk-jwt orphaned by a prior generation's hard kill/crash before
+            // we spawn the fresh one — otherwise the orphan keeps this port bound with the
+            // OLD box's LiveKit keys, the new lk-jwt crash-loops on EADDRINUSE, and calls
+            // fail with "livekit failed" (a JWT signed by mismatched keys). See below.
+            reap_stale_lkjwt(LKJWT_PORT + off());
             spawn_supervised(
                 app.clone(),
                 gen,
@@ -811,11 +879,23 @@ pub(crate) async fn pair_add_onion_to_account_data(
 async fn run_fedauth(app: AppHandle, gen: u64) {
     let Ok(paths) = config::ensure_dirs(&app) else { return };
     let port = FEDAUTH_PORT + off();
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[pp][fedauth] could not bind 127.0.0.1:{port}: {e}");
+    // Bind with retry: on a fast restart the PREVIOUS generation's run_fedauth can still
+    // hold this port until its ~2s select() cycle notices the stale gen and drops the
+    // listener. A single bind would then hit EADDRINUSE and give up — leaving Caddy's
+    // forward_auth with nothing to call (connection-refused) so ALL authenticated
+    // federation is DENIED until a lucky later restart. Retry for a few seconds (bailing
+    // if this generation itself goes stale), the same resilience spawn_supervised gives
+    // every other sidecar.
+    let listener = loop {
+        if is_stale(&app, gen) {
             return;
+        }
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => break l,
+            Err(e) => {
+                eprintln!("[pp][fedauth] bind 127.0.0.1:{port} failed ({e}); retrying…");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
     };
     eprintln!("[pp][fedauth] federation allowlist validator on 127.0.0.1:{port}");
@@ -883,6 +963,12 @@ async fn run_pairing_sync(app: AppHandle, gen: u64) {
                         if crate::pairing::add(&paths.data_root, o).is_ok() {
                             eprintln!("[pureprivacy] pairing reconcile: allowlisting {o}");
                             changed = true;
+                            // Pre-warm the Tor circuit to this brand-new peer so the first
+                            // federated invite/event lands in seconds instead of paying the
+                            // full cold-circuit cost (which stalled first-time pairing for
+                            // minutes in testing). Fire-and-forget.
+                            let peer = o.clone();
+                            tauri::async_runtime::spawn(async move { warm_peer_circuit(&peer).await });
                         }
                     }
 
