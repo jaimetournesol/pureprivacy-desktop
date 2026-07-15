@@ -1,17 +1,45 @@
-# PurePrivacy Desktop
+# PurePrivacy Desktop — your box
 
-Phase-1 **native shell** for PurePrivacy: a [Tauri 2](https://tauri.app) + Svelte app
-that supervises the user's personal box — a set of local sidecar processes —
+> **Take your data back.** Run your own private server — your *box* — that hosts
+> your apps, over Tor, end-to-end encrypted, with no corporation in the middle.
 
-- **tuwunel** — an embedded Matrix homeserver (the user's personal server)
-- **C-tor** — a Tor client providing the onion transport between instances
-- **Caddy** — TLS-terminating fed-proxy + onion sites (federation allowlist, plus
-  the lk-jwt / client-API / wss-SFU sites the phone's calls need)
-- **coturn + LiveKit SFU + lk-jwt** — the Element Call backend (voice/video over
-  Tor), started when those sidecars are present
+Your messages, your friends, your files, your feed — right now they live on
+corporate servers, harvested for profit and surveillance. **PurePrivacy is how you
+take them back.** You run your own private server, and it hosts your apps. Your data
+lives with you. Everything is end-to-end encrypted and travels **only over Tor** —
+no central platform, no clearnet, no ads, no algorithm, no data broker in the path.
 
-The shell owns the sidecars' lifecycle (spawn, health-check, restart, shutdown) and
-renders the onboarding + dashboard UI on top.
+**This desktop app *is* the box.** It runs quietly on your computer (or a Raspberry
+Pi) and keeps your personal server alive — reachable only at its own `.onion`, and
+only by the people you've paired with.
+
+## A platform, not just a messenger
+
+Your box is your always-on private cloud. What it hosts today, and where it's going:
+
+- **✅ Messaging + calls (working today)** — end-to-end encrypted chat and
+  voice/video, federated box-to-box over Tor, from the
+  [PurePrivacy phone app](../pureprivacy-mobile).
+- **🚧 Social (planned)** — a Tor-only, self-hosted, federated alternative to the
+  corporate timeline: post from your box, follow other boxes, and content flows
+  box-to-box over Tor — no company, no algorithm, no clearnet.
+- **🚧 Files & personal agents (planned)** — the box is built to host apps; the
+  phone becomes the launcher for all of them.
+
+## What the desktop app does
+
+It's a [Tauri 2](https://tauri.app) + Svelte shell that owns the lifecycle (spawn,
+health-check, restart, shutdown) of the local services that make up your box:
+
+- **tuwunel** — an embedded Matrix homeserver (your personal server)
+- **C-tor** — the Tor client providing the onion transport between boxes
+- **Caddy** — TLS-terminating fed-proxy + onion sites (the paired-peer federation
+  allowlist, plus the lk-jwt / client-API / wss-SFU sites the phone's calls need)
+- **coturn + LiveKit SFU + lk-jwt** — the call backend (voice/video over Tor)
+
+Nothing binds to the open internet: every service listens on loopback, and Tor maps
+your box's `.onion` ports onto those listeners. You are reachable only over Tor, and
+only by boxes you've paired with.
 
 ## Dev quickstart
 
@@ -102,3 +130,12 @@ in `pairings.json` → `render_caddyfile`.)
 | People / Boxes / Agent / Settings pages | ❌ not yet |
 | `externalBin` packaging + signing       | ❌ not yet |
 | Auto-updater                            | ❌ not yet |
+
+### Apps on the box (the ecosystem)
+
+| App                                     | Status     |
+| --------------------------------------- | ---------- |
+| Messaging + voice/video calls           | ✅ working |
+| Social — Tor-only federated timeline (ActivityPub over onion) | 🚧 planned |
+| File storage / sync                     | 🚧 planned |
+| Personal agents (cross-box agent mesh)  | 🚧 planned |
