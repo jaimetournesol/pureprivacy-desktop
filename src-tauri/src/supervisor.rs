@@ -351,7 +351,7 @@ fn reap_stale_lkjwt(_port: u16) {}
 /// `/_matrix/federation/v1/version` (an `@open` path that bypasses the allowlist) over
 /// the box's Tor SOCKS proxy. Fire-and-forget: a cold/offline peer just fails here and
 /// the invite retry keeps trying — this only makes the happy path fast.
-async fn warm_peer_circuit(peer_onion: &str) {
+async fn warm_peer_circuit(peer_onion: &str, log: bool) {
     let socks = format!("socks5h://127.0.0.1:{}", SOCKS_PORT + off());
     let Ok(proxy) = reqwest::Proxy::all(&socks) else {
         return;
@@ -367,7 +367,7 @@ async fn warm_peer_circuit(peer_onion: &str) {
     // Onion virtual port 8448 = the peer's Caddy fed-proxy (torrc HiddenServicePort 8448),
     // regardless of the peer's local PORT_OFFSET.
     let url = format!("https://{peer_onion}:8448/_matrix/federation/v1/version");
-    if client.get(&url).send().await.is_ok() {
+    if client.get(&url).send().await.is_ok() && log {
         eprintln!("[pp] warmed Tor circuit to {peer_onion}");
     }
 }
@@ -624,6 +624,16 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     // presence/read-receipt leak. See run_federation_keepalive below for detail.
     let fh = app.clone();
     tauri::async_runtime::spawn(async move { run_federation_keepalive(fh, gen).await });
+
+    // Tier-3 TRANSPORT federation keepalive: Tier-1 (backoff cap) and Tier-2 (m.dummy
+    // nudge) both ride tuwunel's own federation path, so if the Tor CIRCUIT to a peer
+    // went cold they can't recover it. A call does exactly that — its media saturates
+    // the box's shared Tor and starves the federation circuit, which stays cold after
+    // the call (observed: a call killed jaime<->arnaud messaging both ways until the
+    // circuit was manually re-warmed). This task keeps each paired peer's Tor circuit
+    // warm directly, so messaging heals within a cadence of a call ending.
+    let cw = app.clone();
+    tauri::async_runtime::spawn(async move { run_federation_circuit_warm(cw, gen).await });
 
     // Federation allowlist validator (review item W3-T1): Caddy forward_auths each
     // authenticated federation request to this loopback endpoint, which parses the
@@ -968,7 +978,7 @@ async fn run_pairing_sync(app: AppHandle, gen: u64) {
                             // full cold-circuit cost (which stalled first-time pairing for
                             // minutes in testing). Fire-and-forget.
                             let peer = o.clone();
-                            tauri::async_runtime::spawn(async move { warm_peer_circuit(&peer).await });
+                            tauri::async_runtime::spawn(async move { warm_peer_circuit(&peer, true).await });
                         }
                     }
 
@@ -1022,6 +1032,57 @@ async fn run_pairing_sync(app: AppHandle, gen: u64) {
             }
         }
         sleep(Duration::from_secs(3)).await;
+    }
+}
+
+/// Tier-3 TRANSPORT federation keepalive — keep the Tor CIRCUIT to each paired peer
+/// warm so a call (or any Tor pressure) can't leave federation wedged.
+///
+/// Tier-1 caps tuwunel's federation backoff (`sender_retry_backoff_limit`) and Tier-2
+/// ([run_federation_keepalive]) sends an `m.dummy` to wake tuwunel's sender — but BOTH
+/// ride tuwunel's own federation path. If the underlying Tor circuit to a peer went
+/// cold, the nudge fails too and federation stays stuck. A call does exactly that: its
+/// media saturates the box's shared Tor and starves the federation circuit, which then
+/// stays cold after the call (observed live — a jaime↔arnaud call killed messaging in
+/// BOTH directions until the circuit was manually re-warmed with a `/version` GET).
+///
+/// This loop closes the gap at the TRANSPORT layer: every ~15s it GETs each paired
+/// peer's `/_matrix/federation/v1/version` (an `@open` path) over the box's SOCKS,
+/// forcing Tor to keep — and, after a call, rebuild — the rendezvous circuit that
+/// tuwunel's sender then reuses. So a call can leave federation cold for at most one
+/// cadence, and messaging heals within ~15s of the call ending instead of staying stuck.
+/// Auth-free (no admin token needed), so it runs even when Tier-2's login can't.
+async fn run_federation_circuit_warm(app: AppHandle, gen: u64) {
+    let Ok(paths) = config::ensure_dirs(&app) else {
+        return;
+    };
+    let mut ticks: u64 = 0;
+    loop {
+        if is_stale(&app, gen) {
+            return;
+        }
+        let own = state::read(&app, |i| i.onion.clone().unwrap_or_default());
+        // Same desired set as Tier-2: the allowlisted onions ARE the paired peers,
+        // minus our own and any malformed entry.
+        let peers: Vec<String> = crate::pairing::onions(&paths.data_root)
+            .into_iter()
+            .filter(|o| crate::pairing::is_valid_onion(o) && *o != own)
+            .collect();
+        for p in &peers {
+            let p = p.clone();
+            // Fire-and-forget + quiet (no per-tick log spam) — a cold/offline peer just
+            // fails and the next tick retries.
+            tauri::async_runtime::spawn(async move { warm_peer_circuit(&p, false).await });
+        }
+        // Rare heartbeat (~every 5 min) so the log shows the loop is alive, never per-peer.
+        ticks += 1;
+        if !peers.is_empty() && ticks % 20 == 1 {
+            eprintln!(
+                "[pureprivacy] federation circuit-warm: keeping {} peer(s) warm",
+                peers.len()
+            );
+        }
+        sleep(Duration::from_secs(15)).await;
     }
 }
 
