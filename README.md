@@ -57,11 +57,14 @@ pnpm tauri dev
 ```
 
 `fetch-sidecars.sh` extracts `tuwunel` from the upstream OCI image (requires Docker)
-and copies the system `tor` (or apt-installs it); it also fetches `caddy`, `coturn`,
-`lk-jwt-service`, and `livekit-server` (bundled **v1.13.1**, from
-`livekit/livekit-server`) for federation + Element Call. A missing `livekit-server`
-just means group calls are off until it's installed. Binaries land in
-`$HOME/.local/share/ai.tournesol.pureprivacy/bin` by default — override with
+and fetches a **pinned, current `tor`** — the Tor Expert Bundle (`TOR_EB_VER`, currently
+15.0.18 → tor 0.4.9.11), *not* whatever tor the build machine happens to have. It enforces
+a floor (`TOR_MIN`) and refuses to ship an end-of-life tor: EOL tor (0.4.8.x and older) is
+dropped from the network and silently breaks federation, so pinning avoids a box that "looks
+fine" but can't reach peers. It also fetches `caddy`, `coturn`, `lk-jwt-service`, and
+`livekit-server` (bundled **v1.13.1**, from `livekit/livekit-server`) for federation +
+Element Call. A missing `livekit-server` just means group calls are off until it's installed.
+Binaries land in `$HOME/.local/share/ai.tournesol.pureprivacy/bin` by default — override with
 `PUREPRIVACY_BIN_DIR`. Run with `--uninstall` to remove them.
 
 ## Demo mode

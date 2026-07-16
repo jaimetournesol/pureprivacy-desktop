@@ -21,6 +21,15 @@ TUWUNEL_IMAGE="ghcr.io/matrix-construct/tuwunel:latest"
 LIVEKIT_IMAGE="livekit/livekit-server:v1.13.1"
 LKJWT_IMAGE="ghcr.io/element-hq/lk-jwt-service:0.2.0"
 
+# tor is PINNED to a current release, not copied from the build machine's system tor.
+# Shipping "whatever tor the build box had" meant a box built on a stale distro shipped an
+# EOL tor — and EOL tor (0.4.8.x, dead on the network after 2026-09-01) can't federate, so
+# peers had to hand-upgrade tor to connect. We fetch the Tor Expert Bundle (the Tor Project's
+# official standalone tor) at a pinned version, and REFUSE to ship anything below TOR_MIN.
+# Bump TOR_EB_VER from https://www.torproject.org/download/tor/ (it names the bundled tor).
+TOR_EB_VER="15.0.18"   # Tor Expert Bundle (Tor Browser) version → bundles tor 0.4.9.11
+TOR_MIN="0.4.9.5"      # hard floor: below this is EOL/too-old and won't stay on the network
+
 # ---------------------------------------------------------------- colors ----
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_RED=$'\033[31m' C_BLUE=$'\033[34m' C_BOLD=$'\033[1m'
@@ -71,6 +80,11 @@ fi
 # verify <path> — true if the binary runs and reports a version
 verify() { "$1" --version >/dev/null 2>&1; }
 
+# tor_ver <path>  → the dotted tor version ("0.4.9.11") or empty.
+tor_ver() { "$1" --version 2>/dev/null | head -n1 | grep -oE '[0-9]+(\.[0-9]+){3}' | head -n1; }
+# ver_ge A B  → success if version A >= version B (dotted numeric, via sort -V).
+ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+
 FAILURES=0
 
 # --------------------------------------------------------------- tuwunel ----
@@ -110,15 +124,49 @@ fetch_tuwunel() {
 }
 
 # ------------------------------------------------------------------- tor ----
+# Ship a PINNED, current tor (Expert Bundle), never "whatever the build box had". A too-old
+# tor silently breaks federation (EOL tor is dropped from the network), which is invisible
+# until a peer can't connect — so we also enforce TOR_MIN and refuse to ship below it.
 fetch_tor() {
   local dest="$BIN_DIR/tor"
 
   if [[ "$FORCE" == 0 && -x "$dest" ]] && verify "$dest"; then
-    ok "tor already present ($("$dest" --version 2>/dev/null | head -n1)) — skipping"
-    return 0
+    local cur; cur="$(tor_ver "$dest")"
+    if [[ -n "$cur" ]] && ver_ge "$cur" "$TOR_MIN"; then
+      ok "tor already present ($cur ≥ $TOR_MIN) — skipping"
+      return 0
+    fi
+    warn "present tor (${cur:-unknown}) is below floor $TOR_MIN — refetching a current one"
   fi
 
-  # find_system_tor: PATH first, then sbin dirs (Debian installs to /usr/sbin)
+  # 1) Preferred: the pinned Tor Expert Bundle — deterministic + current on every build host.
+  #    Prebuilt only for these arches; anything else falls through to system tor.
+  local eb_arch=""
+  case "$(uname -m)" in
+    x86_64|amd64)  eb_arch="linux-x86_64" ;;
+    aarch64|arm64) eb_arch="linux-aarch64" ;;
+    i686|i386)     eb_arch="linux-i686" ;;
+  esac
+  if [[ -n "$eb_arch" ]] && command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+    local url="https://archive.torproject.org/tor-package-archive/torbrowser/${TOR_EB_VER}/tor-expert-bundle-${eb_arch}-${TOR_EB_VER}.tar.gz"
+    local tmp; tmp="$(mktemp -d)"
+    info "Fetching pinned Tor Expert Bundle ${TOR_EB_VER} (${eb_arch})"
+    if curl -fsSL "$url" -o "$tmp/teb.tgz" && tar -xzf "$tmp/teb.tgz" -C "$tmp" tor/tor 2>/dev/null && [[ -x "$tmp/tor/tor" ]]; then
+      cp "$tmp/tor/tor" "$dest" && chmod 0755 "$dest"
+      rm -rf "$tmp"
+      local v; v="$(tor_ver "$dest")"
+      if verify "$dest" && [[ -n "$v" ]] && ver_ge "$v" "$TOR_MIN"; then
+        ok "tor installed from Expert Bundle: $v"
+        return 0
+      fi
+      warn "Expert-Bundle tor failed verify/floor (${v:-unknown}) — trying system tor"
+    else
+      rm -rf "$tmp"
+      warn "Expert Bundle download failed (offline? arch not built?) — trying system tor"
+    fi
+  fi
+
+  # 2) Fallback: system tor / apt — accepted ONLY if it meets the floor.
   find_system_tor() {
     command -v tor 2>/dev/null && return 0
     local p
@@ -136,7 +184,7 @@ fetch_tor() {
     sudo apt-get install -y tor || { err "apt-get install tor failed"; return 1; }
     sys_tor="$(find_system_tor)" || { err "tor installed but binary not found"; return 1; }
   else
-    err "No system tor and no apt-get available."
+    err "No pinned bundle and no system tor available."
     err "Install the Tor Expert Bundle manually:"
     err "  1. Download for your platform: https://www.torproject.org/download/tor/"
     err "  2. Extract and copy the 'tor' binary to: $dest"
@@ -146,12 +194,19 @@ fetch_tor() {
 
   cp "$sys_tor" "$dest" || { err "failed to copy $sys_tor"; return 1; }
   chmod 0755 "$dest"
-  if verify "$dest"; then
-    ok "tor installed: $("$dest" --version 2>/dev/null | head -n1)"
-  else
+  if ! verify "$dest"; then
     err "tor was copied but '$dest --version' failed"
-    return 1
+    rm -f "$dest"; return 1
   fi
+  local v; v="$(tor_ver "$dest")"
+  if [[ -z "$v" ]] || ! ver_ge "$v" "$TOR_MIN"; then
+    err "system tor is ${v:-unparseable} — below the floor $TOR_MIN and cannot federate."
+    err "  0.4.8.x and older are EOL and dropped from the Tor network (after 2026-09-01)."
+    err "  Fix: install a current tor from the Tor Project apt repo (deb.torproject.org),"
+    err "  or let the pinned Expert Bundle download succeed (needs network + curl/tar)."
+    rm -f "$dest"; return 1
+  fi
+  ok "tor installed: $v"
 }
 
 # ------------------------------------------------------------- turnserver ----
