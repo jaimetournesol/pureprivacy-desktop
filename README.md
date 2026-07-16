@@ -41,6 +41,12 @@ Nothing binds to the open internet: every service listens on loopback, and Tor m
 your box's `.onion` ports onto those listeners. You are reachable only over Tor, and
 only by boxes you've paired with.
 
+## Updating an existing box
+
+Already running a box and want the latest version **without losing your onion,
+account, pairings, or chats**? See **[UPDATING.md](UPDATING.md)** — the short version
+is: quit the app cleanly, replace the binary, restart. Never delete the data dir.
+
 ## Dev quickstart
 
 ```bash
