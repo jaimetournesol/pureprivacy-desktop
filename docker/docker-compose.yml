@@ -1,0 +1,19 @@
+# Run a PurePrivacy box in one command:  docker compose up -d  &&  docker compose logs -f
+# It's reached only via its .onion (outbound Tor), so there are NO ports to publish —
+# just a named volume that holds the box's identity (onion key, admin, secrets, pairings).
+services:
+  box:
+    image: pureprivacy-box:dev          # built by ./build.sh
+    container_name: pureprivacy-box
+    restart: unless-stopped
+    environment:
+      PP_USER: "${PP_USER:-jaime}"        # the account your phone logs in as
+      PP_PASS: "${PP_PASS:?set PP_PASS}"  # box admin password (required)
+      PP_BOX:  "${PP_BOX:-mybox}"
+      # Stable key so secrets.json decrypts across restarts. Generate once, keep it:
+      #   PP_SECRETS_KEY=$(openssl rand -base64 32)
+      PP_SECRETS_KEY: "${PP_SECRETS_KEY:?set PP_SECRETS_KEY}"
+    volumes:
+      - pp-data:/data
+volumes:
+  pp-data:
