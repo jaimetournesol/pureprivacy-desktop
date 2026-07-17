@@ -107,9 +107,15 @@ Then: .\pp-box.ps1 init ; .\pp-box.ps1 up
     Have-Env
     $o = Onion; $u = Env-Val 'PP_USER'
     if (-not $o) { Die "no onion yet - the box is still minting it (give it a minute), or it isn't running (.\pp-box.ps1 up)" }
+    $payload = "pureprivacy:@${u}:${o}"
     Write-Host "Scan this in the PurePrivacy phone app to connect:"
     Write-Host "  @${u}:${o}"
-    docker exec pureprivacy-box qrencode -t ANSIUTF8 "pureprivacy:@${u}:${o}"
+    docker exec pureprivacy-box qrencode -t ANSIUTF8 $payload
+    # Terminal QRs don't always camera-scan (line spacing / font). Also write a PNG that
+    # reliably does - open connect-qr.png in any image viewer and scan that.
+    docker exec pureprivacy-box qrencode -o /tmp/pp-qr.png -s 8 -m 4 $payload 2>$null
+    docker cp pureprivacy-box:/tmp/pp-qr.png "$Here\connect-qr.png" 2>$null
+    if (Test-Path "$Here\connect-qr.png") { Write-Host "If the code above won't scan, open  connect-qr.png  (in this folder) and scan that." }
   }
 
   'status' {

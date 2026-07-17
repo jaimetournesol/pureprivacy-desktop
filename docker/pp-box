@@ -82,10 +82,16 @@ EOF
     have_env
     o="$(onion)"; u="$(envval PP_USER)"
     [ -n "$o" ] || die "no onion yet — the box is still minting it (give it a minute), or it isn't running (./pp-box up)"
+    payload="pureprivacy:@${u}:${o}"
     echo "Scan this in the PurePrivacy phone app to connect:"
     echo "  @${u}:${o}"
-    docker exec pureprivacy-box qrencode -t ANSIUTF8 "pureprivacy:@${u}:${o}" 2>/dev/null \
-      || echo "  (install qrencode to render — payload above works by hand)"
+    docker exec pureprivacy-box qrencode -t ANSIUTF8 "$payload" 2>/dev/null || true
+    # Terminal QRs don't always camera-scan (line spacing / font). Also write a PNG that
+    # reliably does — open connect-qr.png in any image viewer and scan that.
+    if docker exec pureprivacy-box qrencode -o /tmp/pp-qr.png -s 8 -m 4 "$payload" 2>/dev/null \
+       && docker cp pureprivacy-box:/tmp/pp-qr.png "$HERE/connect-qr.png" >/dev/null 2>&1; then
+      echo "If the code above won't scan, open  connect-qr.png  (in this folder) and scan that."
+    fi
     ;;
 
   status)
