@@ -17,3 +17,4 @@ services:
       - pp-data:/data
 volumes:
   pp-data:
+    name: pureprivacy-data      # stable name so `pp-box backup`/`restore` can find it

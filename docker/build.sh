@@ -24,9 +24,6 @@ echo "staged $(du -sh "$HERE/bin" | cut -f1) sidecars + $(du -h "$HERE/purepriva
 docker build -t "$IMG" "$HERE"
 echo "✓ built $IMG"
 echo
-echo "Run a box (reached only via its .onion — no ports to publish):"
-echo "  docker volume create pp-data"
-echo "  docker run -d --name mybox -v pp-data:/data \\"
-echo "    -e PP_USER=jaime -e PP_PASS=your-strong-pass -e PP_BOX=mybox \\"
-echo "    -e PP_SECRETS_KEY=\$(openssl rand -base64 32) $IMG"
-echo "  docker logs -f mybox   # watch it mint its onion + print the connect QR"
+echo "Run it (reached only via its .onion — no ports to publish):"
+echo "  ./pp-box up        # then: ./pp-box qr   (scan it in the phone app)"
+echo "See ./pp-box help for status / logs / backup / restore."

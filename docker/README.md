@@ -4,62 +4,101 @@ Run your box as a container — on a Linux server, a NAS, a Raspberry Pi, a clou
 Windows/macOS via Docker Desktop. One image, everywhere Docker runs.
 
 **No ports to publish.** The box is reached only through its `.onion` (outbound Tor
-rendezvous), so there's nothing to expose or forward — just a **named volume** that holds
-the box's identity (onion key, admin account, `secrets.json`, `pairings.json`). Lose that
-volume and you lose the box.
+rendezvous), so there's nothing to expose or forward. Its whole identity — the onion key,
+the admin account, `secrets.json`, and `pairings.json` — lives in **one named volume**
+(`pureprivacy-data`). Lose that volume and the box is gone for good, so **back it up**.
 
-## Build
+## Quick start
+
+Everything goes through the **`pp-box`** helper in this directory:
 
 ```bash
-./build.sh          # stages the host-built binary + sidecars, then `docker build`
+./pp-box init      # asks for a login user/box name + password, generates a secrets key → .env
+./pp-box build     # build the image from the host-built binary + sidecars
+./pp-box up        # start the box (detached); it mints its onion on first run
+./pp-box qr        # once it's up, print the QR — scan it in the PurePrivacy phone app
 ```
 
-Stage 1 reuses the **prebuilt** Tauri binary + sidecars from your machine (fast to iterate).
-A shipping image will build both inside a multi-stage Dockerfile.
+That's it — scan the QR and your phone is connected, all over Tor.
 
-## Run
+## All commands
+
+| Command | What it does |
+|---|---|
+| `./pp-box init` | Create `.env` — admin user/box name, password, and a fresh `PP_SECRETS_KEY`. |
+| `./pp-box build` | Build the `pureprivacy-box:dev` image (stages the binary + sidecars). |
+| `./pp-box up` | Start the box. First run mints the onion + creates the admin account. |
+| `./pp-box qr` | Print the phone-connect QR (and the `@user:onion` payload). |
+| `./pp-box status` | Running? Shows the onion, uptime, and the volume name. |
+| `./pp-box logs` | Follow the logs (watch it mint the onion + boot the sidecars). |
+| `./pp-box restart` | Restart the box. |
+| `./pp-box down` | Stop the box — identity is kept in the volume. |
+| `./pp-box update` | Rebuild the image + recreate the box on the same volume (same onion). |
+| `./pp-box backup [dir]` | Tar the volume (onion key + secrets + pairings) → `backups/`. **Do this.** |
+| `./pp-box restore <file>` | Restore a backup into the volume (stop the box first). |
+| `./pp-box shell` | Open a shell inside the container. |
+| `./pp-box destroy` | Remove the box **and** its volume (asks you to type the box name). |
+
+## Back up your box — it's the whole identity
+
+An `.onion` address is derived from a secret key that exists **only** in the
+`pureprivacy-data` volume. If that volume is deleted, the address can never come back and
+your phone is orphaned on a dead box. So keep a backup:
 
 ```bash
-docker compose up -d           # (edit PP_* in your env / an .env file first)
-docker compose logs -f box     # watch it mint its onion + print the connect QR
+./pp-box backup                     # → docker/backups/pp-box-<onion>-N.tgz
 ```
 
-or plain Docker:
+Recovering onto a new machine (or after an accidental wipe) is the reverse — and it brings
+back the **same onion**, so your phone reconnects with no re-pairing:
 
 ```bash
-docker volume create pp-data
-docker run -d --name pureprivacy-box --restart unless-stopped -v pp-data:/data \
+./pp-box restore backups/pp-box-….tgz
+./pp-box up
+```
+
+`PP_SECRETS_KEY` (in `.env`) must also stay the same across restarts — it decrypts
+`secrets.json`. `init` generates it once; keep `.env` private (it's `chmod 600` and
+git-ignored) and store a copy alongside your backup.
+
+## Verified
+
+- Boots, provisions, mints its onion + admin account inside the container.
+- Identity persists in the `pureprivacy-data` volume; a fresh container **resumes with the
+  same onion**, and survives `docker restart` / a host reboot.
+- **Reachable over Tor via its `.onion` with no published ports** (proven box-to-box).
+- **Full feature parity — voice + video calls included.** All six sidecars run (tor,
+  tuwunel, caddy, coturn, livekit-server, lk-jwt-service); coturn comes from apt so it gets
+  its correct libs.
+- **`backup` → wipe → `restore` round-trips the identity** (same onion returns).
+
+## Without the CLI (plain docker / compose)
+
+The CLI just wraps these. `docker compose` reads the `.env` that `init` wrote:
+
+```bash
+docker compose up -d           # start        (needs PP_PASS + PP_SECRETS_KEY in .env)
+docker compose logs -f box     # watch it mint its onion + print the QR
+docker compose down            # stop
+```
+
+or one plain `docker run` (identity in the `pureprivacy-data` volume):
+
+```bash
+docker volume create pureprivacy-data
+docker run -d --name pureprivacy-box --restart unless-stopped -v pureprivacy-data:/data \
   -e PP_USER=jaime -e PP_PASS='a-strong-password' -e PP_BOX=mybox \
   -e PP_SECRETS_KEY="$(openssl rand -base64 32)" \
   pureprivacy-box:dev
 docker logs -f pureprivacy-box
 ```
 
-On first run it provisions (mints the onion, creates the admin account) and prints a
-scannable QR in the logs — open the PurePrivacy phone app and scan it to connect. On every
-later run it just resumes on the persisted volume (same onion, no re-provision).
+## Notes & known limits (Stage 1)
 
-`PP_SECRETS_KEY` must stay the **same** across restarts (it decrypts `secrets.json`) —
-generate it once and keep it.
-
-## Verified (Stage 1)
-
-- Boots, provisions, mints its onion + admin account inside the container.
-- Identity persists in `/data`; a fresh container **resumes with the same onion**.
-- Survives `docker restart`.
-- **Reachable over Tor via its `.onion` with no published ports** (proven box-to-box).
-- Connect QR printed to the logs.
-- **Full feature parity — voice + video calls included.** All six sidecars run (tor,
-  tuwunel, caddy, coturn, livekit-server, lk-jwt-service); coturn comes from apt so it
-  gets its correct libs instead of the host binary's version-pinned DB deps.
-
-## Known limits (Stage 1 → follow-ups)
-
-- **Image is ~1.2 GB.** The current binary is the Tauri GUI (links webkit2gtk), so we run
-  it under Xvfb and ship webkit/gtk/xvfb (~556 MB) just to satisfy that. **Stage 2** — a
-  headless box runner with no Tauri — drops all of it (down to ~sidecars only).
-- **amd64 only** so far — multi-arch (arm64 for Pi / Apple Silicon) is a buildx pass once
-  the sidecars are sourced as multi-arch.
-
-The Stage-2 headless runner is the same "box without the GUI" piece that also unlocks a
-setup CLI, WSL, and headless Raspberry-Pi installs.
+- Build is **Stage 1**: it reuses the prebuilt Tauri binary + sidecars from your machine
+  (`build.sh`) — fast to iterate. A shipping image would compile both in a multi-stage
+  build.
+- **Image is ~1.2 GB / amd64 only.** The binary is the Tauri GUI (links webkit2gtk), run
+  headless under Xvfb, so the image ships webkit/gtk/xvfb just to satisfy it. **Stage 2** —
+  a headless box runner with no Tauri — drops all of that and unlocks multi-arch (arm64 for
+  a Pi / Apple Silicon), a leaner image, and a native setup CLI.

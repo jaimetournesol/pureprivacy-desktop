@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# pp-box — one command to run and manage a PurePrivacy box in Docker.
+#
+# A box is reached only through its .onion (outbound Tor), so there are NO ports to
+# publish. Its whole identity — onion key, admin account, secrets.json, pairings — lives
+# in one named volume (pureprivacy-data). Lose that volume and the box is gone for good,
+# so `pp-box backup` exists; use it.
+#
+#   ./pp-box init            create your .env (admin user/pass + a fresh secrets key)
+#   ./pp-box build           build the image from the staged binary + sidecars
+#   ./pp-box up              start the box (detached); mints its onion on first run
+#   ./pp-box qr              print the phone-connect QR (scan it in the app)
+#   ./pp-box status          running? onion, health, uptime
+#   ./pp-box logs            follow the logs (Ctrl-C to stop watching)
+#   ./pp-box restart         restart the box
+#   ./pp-box down            stop the box (identity is kept in the volume)
+#   ./pp-box update          rebuild the image + recreate the box (keeps identity)
+#   ./pp-box backup [dir]    tar the volume (onion key + secrets + pairings) — DO THIS
+#   ./pp-box restore <file>  restore a backup into the volume (box must be down)
+#   ./pp-box shell           open a shell inside the container
+#   ./pp-box destroy         remove the box AND its volume (irreversible; asks first)
+#
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE"                                   # so `docker compose` uses this dir's file + .env
+VOLUME="pureprivacy-data"                    # matches docker-compose.yml
+IMAGE="${IMAGE:-pureprivacy-box:dev}"
+DC() { docker compose "$@"; }
+
+die() { echo "error: $*" >&2; exit 1; }
+have_env() { [ -f "$HERE/.env" ] || die "no .env yet — run: ./pp-box init"; }
+# Both helpers are failure-tolerant (return "" not an error) so a not-yet-minted onion or a
+# missing key never trips `set -e` in a status/qr call.
+envval() { local v; v="$(grep -E "^$1=" "$HERE/.env" 2>/dev/null | head -1 || true)"; printf '%s' "${v#*=}"; }
+onion() {
+  local j; j="$(docker exec pureprivacy-box sh -c 'cat /data/box.json 2>/dev/null' 2>/dev/null || true)"
+  printf '%s' "$j" | sed -n 's/.*"onion"[^"]*"\([a-z2-7]*\.onion\)".*/\1/p' | head -1
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  init)
+    if [ -f "$HERE/.env" ] && [ "${1:-}" != "--force" ]; then
+      die ".env already exists (use: ./pp-box init --force to overwrite — this rotates the secrets key!)"
+    fi
+    read -rp "Phone login username [jaime]: " u; u="${u:-jaime}"
+    read -rp "Box name [mybox]: " b; b="${b:-mybox}"
+    read -rsp "Box admin password (what the phone signs in with): " p; echo
+    [ -n "$p" ] || die "a password is required"
+    key="$(openssl rand -base64 32)"
+    umask 077
+    cat > "$HERE/.env" <<EOF
+# PurePrivacy box config — read automatically by docker compose. KEEP THIS PRIVATE.
+# PP_SECRETS_KEY decrypts secrets.json; it must stay the SAME across restarts. If you
+# ever lose it you cannot decrypt the box's secrets — back it up with the volume.
+PP_USER=$u
+PP_BOX=$b
+PP_PASS=$p
+PP_SECRETS_KEY=$key
+EOF
+    echo "✓ wrote .env (chmod 600). Next: ./pp-box build && ./pp-box up"
+    ;;
+
+  build)
+    ./build.sh
+    ;;
+
+  up|start)
+    have_env
+    DC up -d
+    echo "✓ box starting. Watch it mint its onion + print the QR:  ./pp-box logs"
+    echo "  once it's up:  ./pp-box qr"
+    ;;
+
+  qr)
+    have_env
+    o="$(onion)"; u="$(envval PP_USER)"
+    [ -n "$o" ] || die "no onion yet — the box is still minting it (give it a minute), or it isn't running (./pp-box up)"
+    echo "Scan this in the PurePrivacy phone app to connect:"
+    echo "  @${u}:${o}"
+    docker exec pureprivacy-box qrencode -t ANSIUTF8 "pureprivacy:@${u}:${o}" 2>/dev/null \
+      || echo "  (install qrencode to render — payload above works by hand)"
+    ;;
+
+  status)
+    if ! docker ps --format '{{.Names}}' | grep -qx pureprivacy-box; then
+      echo "● box: not running   (start it: ./pp-box up)"; exit 0
+    fi
+    up="$(docker ps --filter name=pureprivacy-box --format '{{.Status}}')"
+    o="$(onion)"; u="$(envval PP_USER)"
+    echo "● box: running   ($up)"
+    echo "  user:  @${u}:${o:-<minting onion…>}"
+    echo "  volume: $VOLUME   (identity lives here — back it up: ./pp-box backup)"
+    ;;
+
+  logs)   DC logs -f --tail=200 ;;
+  restart) DC restart; echo "✓ restarted" ;;
+  down|stop) DC down; echo "✓ stopped (identity kept in the $VOLUME volume)" ;;
+
+  update)
+    have_env
+    ./build.sh
+    DC up -d --force-recreate
+    echo "✓ rebuilt + recreated on the same volume (same onion, same account)"
+    ;;
+
+  backup)
+    docker volume inspect "$VOLUME" >/dev/null 2>&1 || die "no $VOLUME volume yet (has the box ever run?)"
+    dir="${1:-$HERE/backups}"; mkdir -p "$dir"
+    # A fixed-name-free stamp: caller can pass a dir; we name by the (short) onion + a counter.
+    o="$(onion)"; tag="${o%%.onion}"; tag="${tag:0:12}"; [ -n "$tag" ] || tag="box"
+    n=1; while [ -e "$dir/pp-box-$tag-$n.tgz" ]; do n=$((n+1)); done
+    out="$dir/pp-box-$tag-$n.tgz"
+    docker run --rm -v "$VOLUME":/data:ro -v "$dir":/backup alpine \
+      tar czf "/backup/$(basename "$out")" -C /data . >/dev/null
+    echo "✓ backed up the box identity → $out"
+    echo "  (this holds the onion KEY + secrets + pairings — store it somewhere safe + private)"
+    ;;
+
+  restore)
+    file="${1:-}"; [ -f "$file" ] || die "usage: ./pp-box restore <backup.tgz>"
+    if docker ps --format '{{.Names}}' | grep -qx pureprivacy-box; then
+      die "stop the box first so the restore is clean:  ./pp-box down"
+    fi
+    docker volume create "$VOLUME" >/dev/null
+    dir="$(cd "$(dirname "$file")" && pwd)"; base="$(basename "$file")"
+    read -rp "Restore '$base' INTO $VOLUME (overwrites its current contents)? [y/N] " ans
+    [ "$ans" = "y" ] || { echo "aborted"; exit 0; }
+    docker run --rm -v "$VOLUME":/data -v "$dir":/backup alpine \
+      sh -c 'rm -rf /data/* /data/..?* 2>/dev/null; tar xzf "/backup/'"$base"'" -C /data' >/dev/null
+    echo "✓ restored into $VOLUME. Start it:  ./pp-box up"
+    ;;
+
+  shell)  docker exec -it pureprivacy-box bash 2>/dev/null || docker exec -it pureprivacy-box sh ;;
+
+  destroy)
+    echo "This removes the box AND its $VOLUME volume — the onion key + account are GONE."
+    read -rp "Type the box name to confirm ('$(envval PP_BOX)'): " ans
+    [ "$ans" = "$(envval PP_BOX)" ] && [ -n "$ans" ] || { echo "aborted"; exit 0; }
+    DC down -v 2>/dev/null || true
+    docker volume rm "$VOLUME" 2>/dev/null || true
+    echo "✓ box destroyed. (Your .env is kept — delete it by hand if you want it gone too.)"
+    ;;
+
+  help|-h|--help|"")
+    # print the header comment block (from line 2 to the first non-comment line)
+    awk 'NR>=2 && /^#/ {sub(/^# ?/,""); print; next} NR>=2 {exit}' "$0"
+    ;;
+  *) die "unknown command '$cmd' — run: ./pp-box help" ;;
+esac
