@@ -26,6 +26,46 @@ Your box is your always-on private cloud. What it hosts today, and where it's go
 - **🚧 Files & personal agents (planned)** — the box is built to host apps; the
   phone becomes the launcher for all of them.
 
+## Run your box — two ways
+
+The box is identical either way (same services, same `.onion`, same phone app) — pick the
+front door that fits where it runs.
+
+> **No signed installer yet** — both paths build from source for now (a packaged GUI
+> installer + auto-updater are on the roadmap). Both need the [dev toolchain](#dev-quickstart):
+> Node 24 (via nvm), pnpm, and Docker.
+
+### Option 1 · GUI — desktop app (on your own computer)
+
+A graphical app with a click-through setup wizard (account → recovery kit → done), then a
+dashboard showing your address + QR, box status, and controls.
+
+```bash
+source ~/.nvm/nvm.sh
+pnpm install
+./scripts/fetch-sidecars.sh                 # fetch tuwunel + tor + call sidecars
+pnpm tauri build --no-bundle                # → src-tauri/target/release/pureprivacy
+./src-tauri/target/release/pureprivacy      # launch — the onboarding wizard opens
+```
+
+(For development with hot-reload, use `pnpm tauri dev` instead.)
+
+### Option 2 · Docker — headless, CLI-managed (server / NAS / Raspberry Pi / VPS)
+
+No desktop needed — reached only over its `.onion`, managed entirely from the terminal with
+the **`pp-box`** helper:
+
+```bash
+cd docker
+./pp-box build      # build the image (once)
+./pp-box init       # user/box name + password → generates a secrets key
+./pp-box up         # start it; it mints its onion
+./pp-box qr         # scan the QR in the PurePrivacy phone app
+```
+
+Then `status` / `logs` / `backup` / `restore` / `update` as needed. **Full guide:
+[docker/README.md](docker/README.md).**
+
 ## What the desktop app does
 
 It's a [Tauri 2](https://tauri.app) + Svelte shell that owns the lifecycle (spawn,
