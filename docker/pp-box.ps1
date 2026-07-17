@@ -1,16 +1,16 @@
 #!/usr/bin/env pwsh
-# pp-box.ps1 — run and manage a PurePrivacy box in Docker on Windows (native PowerShell).
+# pp-box.ps1 - run and manage a PurePrivacy box in Docker on Windows (native PowerShell).
 # Mirrors ./pp-box (bash). Needs Docker Desktop. Full guide: docker/README.md.
 #
 #   .\pp-box.ps1 init            create .env (admin user/pass + a fresh secrets key)
-#   .\pp-box.ps1 build           build the image (needs Linux-staged artifacts — see below)
+#   .\pp-box.ps1 build           build the image (needs Linux-staged artifacts - see below)
 #   .\pp-box.ps1 up              start the box (mints its onion on first run)
 #   .\pp-box.ps1 qr              print the phone-connect QR
 #   .\pp-box.ps1 status          running? onion, uptime
 #   .\pp-box.ps1 logs            follow the logs
 #   .\pp-box.ps1 restart | down  restart / stop (identity kept in the volume)
 #   .\pp-box.ps1 update          rebuild + recreate on the same volume
-#   .\pp-box.ps1 backup [dir]    tar the volume (onion key + secrets + pairings) — DO THIS
+#   .\pp-box.ps1 backup [dir]    tar the volume (onion key + secrets + pairings) - DO THIS
 #   .\pp-box.ps1 restore <file>  restore a backup (box must be down)
 #   .\pp-box.ps1 shell | destroy shell in the container / remove box + volume (asks first)
 
@@ -20,7 +20,7 @@ param(
   [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest
 )
 $ErrorActionPreference = 'Stop'
-# PS 7.4+ turns a non-zero native exit into a THROW under Stop — which would break our own
+# PS 7.4+ turns a non-zero native exit into a THROW under Stop - which would break our own
 # `$LASTEXITCODE` checks (docker image/volume inspect exit 1 to mean "absent"). Opt out.
 if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
   $PSNativeCommandUseErrorActionPreference = $false
@@ -31,7 +31,7 @@ $Volume = 'pureprivacy-data'
 $Image  = if ($env:IMAGE) { $env:IMAGE } else { 'pureprivacy-box:dev' }
 
 function Die($m)        { Write-Host "error: $m" -ForegroundColor Red; exit 1 }
-function Have-Env       { if (-not (Test-Path "$Here\.env")) { Die "no .env yet — run: .\pp-box.ps1 init" } }
+function Have-Env       { if (-not (Test-Path "$Here\.env")) { Die "no .env yet - run: .\pp-box.ps1 init" } }
 function Image-Exists   { docker image inspect $Image *> $null; return ($LASTEXITCODE -eq 0) }
 function Box-Running    { return ((docker ps --format '{{.Names}}' 2>$null) -contains 'pureprivacy-box') }
 function Volume-Exists  { docker volume inspect $Volume *> $null; return ($LASTEXITCODE -eq 0) }
@@ -49,7 +49,7 @@ switch ($Command) {
 
   'init' {
     if ((Test-Path "$Here\.env") -and ($Rest -notcontains '--force')) {
-      Die ".env already exists (use: .\pp-box.ps1 init --force to overwrite — this rotates the secrets key!)"
+      Die ".env already exists (use: .\pp-box.ps1 init --force to overwrite - this rotates the secrets key!)"
     }
     $u = Read-Host "Phone login username [jaime]"; if (-not $u) { $u = 'jaime' }
     $b = Read-Host "Box name [mybox]";             if (-not $b) { $b = 'mybox' }
@@ -60,15 +60,15 @@ switch ($Command) {
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $key = [Convert]::ToBase64String($bytes)
     $body = @"
-# PurePrivacy box config — read automatically by docker compose. KEEP THIS PRIVATE.
+# PurePrivacy box config - read automatically by docker compose. KEEP THIS PRIVATE.
 # PP_SECRETS_KEY decrypts secrets.json; it must stay the SAME across restarts. If you lose
-# it you cannot decrypt the box's secrets — back it up together with the volume.
+# it you cannot decrypt the box's secrets - back it up together with the volume.
 PP_USER=$u
 PP_BOX=$b
 PP_PASS=$p
 PP_SECRETS_KEY=$key
 "@
-    # UTF-8 without BOM — a BOM would corrupt the first line for docker compose.
+    # UTF-8 without BOM - a BOM would corrupt the first line for docker compose.
     [System.IO.File]::WriteAllText("$Here\.env", $body, (New-Object System.Text.UTF8Encoding $false))
     if (Image-Exists) { Write-Host "OK wrote .env. Next: .\pp-box.ps1 up" }
     else              { Write-Host "OK wrote .env. Next: .\pp-box.ps1 build   (then: .\pp-box.ps1 up)" }
@@ -106,7 +106,7 @@ Then: .\pp-box.ps1 init ; .\pp-box.ps1 up
   'qr' {
     Have-Env
     $o = Onion; $u = Env-Val 'PP_USER'
-    if (-not $o) { Die "no onion yet — the box is still minting it (give it a minute), or it isn't running (.\pp-box.ps1 up)" }
+    if (-not $o) { Die "no onion yet - the box is still minting it (give it a minute), or it isn't running (.\pp-box.ps1 up)" }
     Write-Host "Scan this in the PurePrivacy phone app to connect:"
     Write-Host "  @${u}:${o}"
     docker exec pureprivacy-box qrencode -t ANSIUTF8 "pureprivacy:@${u}:${o}"
@@ -118,7 +118,7 @@ Then: .\pp-box.ps1 init ; .\pp-box.ps1 up
     $o = Onion; $u = Env-Val 'PP_USER'
     Write-Host "* box: running   ($up)"
     if ($o) { Write-Host "  user:  @${u}:${o}" } else { Write-Host "  user:  @${u}:<minting onion...>" }
-    Write-Host "  volume: $Volume   (identity lives here — back it up: .\pp-box.ps1 backup)"
+    Write-Host "  volume: $Volume   (identity lives here - back it up: .\pp-box.ps1 backup)"
   }
 
   'logs'    { docker compose logs -f --tail=200 }
@@ -136,14 +136,14 @@ Then: .\pp-box.ps1 init ; .\pp-box.ps1 up
     if (-not (Volume-Exists)) { Die "no $Volume volume yet (has the box ever run?)" }
     $dir = if ($Rest -and $Rest[0]) { $Rest[0] } else { "$Here\backups" }
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $dir = (Resolve-Path $dir).Path            # absolute — Docker Desktop needs it for -v
+    $dir = (Resolve-Path $dir).Path            # absolute - Docker Desktop needs it for -v
     $o = Onion; $tag = if ($o) { ($o -replace '\.onion$','').Substring(0, [Math]::Min(12, ($o -replace '\.onion$','').Length)) } else { 'box' }
     $n = 1; while (Test-Path "$dir\pp-box-$tag-$n.tgz") { $n++ }
     $name = "pp-box-$tag-$n.tgz"
     docker run --rm -v "${Volume}:/data:ro" -v "${dir}:/backup" alpine tar czf "/backup/$name" -C /data .
     if ($LASTEXITCODE -ne 0) { Die "backup failed" }
     Write-Host "OK backed up the box identity -> $dir\$name"
-    Write-Host "  (this holds the onion KEY + secrets + pairings — store it somewhere safe + private)"
+    Write-Host "  (this holds the onion KEY + secrets + pairings - store it somewhere safe + private)"
   }
 
   'restore' {
@@ -166,12 +166,12 @@ Then: .\pp-box.ps1 init ; .\pp-box.ps1 up
   }
 
   'destroy' {
-    Write-Host "This removes the box AND its $Volume volume — the onion key + account are GONE."
+    Write-Host "This removes the box AND its $Volume volume - the onion key + account are GONE."
     $ans = Read-Host "Type the box name to confirm ('$(Env-Val 'PP_BOX')')"
     if ($ans -and ($ans -eq (Env-Val 'PP_BOX'))) {
       docker compose down -v 2>$null
       docker volume rm $Volume 2>$null
-      Write-Host "OK box destroyed. (Your .env is kept — delete it by hand if you want it gone too.)"
+      Write-Host "OK box destroyed. (Your .env is kept - delete it by hand if you want it gone too.)"
     } else { Write-Host "aborted" }
   }
 
