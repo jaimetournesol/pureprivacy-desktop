@@ -8,6 +8,10 @@ set -euo pipefail
 : "${PP_PASS:?Set PP_PASS (the box admin password the phone logs in with)}"
 PP_USER="${PP_USER:-jaime}"
 PP_BOX="${PP_BOX:-mybox}"
+
+# The container owns its data dir. Named volumes are already root-owned (no-op); this fixes
+# a bind-mount from a host user — tor refuses a hidden-service dir it doesn't own (exit 1).
+chown -R "$(id -u):$(id -g)" /data 2>/dev/null || true
 # Stable secrets key so secrets.json (AES-GCM) decrypts across restarts. Provide your own
 # in production; the fallback keeps a single container reproducible but is NOT secret.
 PP_SECRETS_KEY="${PP_SECRETS_KEY:-pureprivacy-docker-default-key-change-me=}"
