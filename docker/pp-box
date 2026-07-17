@@ -21,8 +21,9 @@
 #   ./pp-box destroy         remove the box AND its volume (irreversible; asks first)
 #
 set -euo pipefail
+export MSYS_NO_PATHCONV=1                     # Git Bash (Windows): don't rewrite container -v paths
 HERE="$(cd "$(dirname "$0")" && pwd)"
-cd "$HERE"                                   # so `docker compose` uses this dir's file + .env
+cd "$HERE"                                    # so `docker compose` uses this dir's file + .env
 VOLUME="pureprivacy-data"                    # matches docker-compose.yml
 IMAGE="${IMAGE:-pureprivacy-box:dev}"
 DC() { docker compose "$@"; }

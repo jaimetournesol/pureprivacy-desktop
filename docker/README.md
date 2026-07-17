@@ -42,6 +42,29 @@ That's it — scan the QR and your phone is connected, all over Tor.
 | `./pp-box shell` | Open a shell inside the container. |
 | `./pp-box destroy` | Remove the box **and** its volume (asks you to type the box name). |
 
+## Windows
+
+Runs on **Docker Desktop for Windows** — pick either front end (same commands, same box):
+
+- **PowerShell (native):** use `pp-box.ps1`, e.g. `./pp-box.ps1 init`, `./pp-box.ps1 up`,
+  `./pp-box.ps1 qr`. Same subcommands as the table above.
+- **WSL2 / Git Bash:** use the bash `./pp-box` exactly as on Linux. WSL2 is Docker Desktop's
+  default backend (real Linux), so this is the most battle-tested path; Git Bash works too
+  (the script disables MSYS path-mangling for container mounts).
+
+**One caveat — the image.** `build` bundles a **Linux** box binary + sidecars that are staged
+on a Linux host, so it **can't build on native Windows**. Get the image once, then `up`/`qr`
+work natively from PowerShell:
+
+```powershell
+# on a Linux box (or in WSL2):  cd docker && ./pp-box build && docker save pureprivacy-box:dev -o pp-box.tar
+docker load -i pp-box.tar      # ← on Windows
+.\pp-box.ps1 init ; .\pp-box.ps1 up ; .\pp-box.ps1 qr
+```
+
+(Or build it directly inside WSL2 and run from there.) A self-contained image you can
+`docker build` / `docker pull` on any OS is the Stage-2 follow-up.
+
 ## Back up your box — it's the whole identity
 
 An `.onion` address is derived from a secret key that exists **only** in the
