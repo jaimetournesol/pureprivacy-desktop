@@ -107,9 +107,12 @@ Then: .\pp-box.ps1 init ; .\pp-box.ps1 up
     Have-Env
     $o = Onion; $u = Env-Val 'PP_USER'
     if (-not $o) { Die "no onion yet - the box is still minting it (give it a minute), or it isn't running (.\pp-box.ps1 up)" }
-    $payload = "pureprivacy:@${u}:${o}"
-    Write-Host "Scan this in the PurePrivacy phone app to connect:"
-    Write-Host "  @${u}:${o}"
+    # LOGIN/setup handoff - the phone pre-fills onion + user on its sign-in screen. NOT the
+    # contact form (pureprivacy:@user:onion), which a not-yet-signed-in phone stashes as a
+    # pending contact and bounces back to login.
+    $payload = "pureprivacy://connect?hs=${o}&user=${u}"
+    Write-Host "Scan this in the PurePrivacy phone app to sign in (then type your box password):"
+    Write-Host "  box: @${u}:${o}"
     docker exec pureprivacy-box qrencode -t ANSIUTF8 $payload
     # Terminal QRs don't always camera-scan (line spacing / font). Also write a PNG that
     # reliably does - open connect-qr.png in any image viewer and scan that.

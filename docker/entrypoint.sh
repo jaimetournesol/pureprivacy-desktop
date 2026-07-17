@@ -39,9 +39,13 @@ export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
   if [ -n "$onion" ]; then
     echo "======================================================================"
     echo "  PurePrivacy box is up.  User: @${PP_USER}:${onion}"
-    echo "  Scan this with the PurePrivacy phone app to connect:"
+    echo "  Scan this in the PurePrivacy phone app to sign in (then type your password):"
     echo "======================================================================"
-    qrencode -t ANSIUTF8 "pureprivacy:@${PP_USER}:${onion}" 2>/dev/null || echo "  pureprivacy:@${PP_USER}:${onion}"
+    # A LOGIN/setup handoff (pureprivacy://connect?...) — the app pre-fills onion + user on
+    # its sign-in screen. NOT the contact-pairing form (pureprivacy:@user:onion), which a
+    # not-yet-signed-in phone can't use — it just bounces back to login.
+    qrencode -t ANSIUTF8 "pureprivacy://connect?hs=${onion}&user=${PP_USER}" 2>/dev/null \
+      || echo "  sign in manually with:  box @${PP_USER}:${onion}  + your password"
     echo "======================================================================"
   else
     echo "[entrypoint] box.json/onion not seen yet — check logs above for setup progress."
