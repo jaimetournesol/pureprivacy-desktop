@@ -49,15 +49,15 @@ generate it once and keep it.
 - Survives `docker restart`.
 - **Reachable over Tor via its `.onion` with no published ports** (proven box-to-box).
 - Connect QR printed to the logs.
+- **Full feature parity — voice + video calls included.** All six sidecars run (tor,
+  tuwunel, caddy, coturn, livekit-server, lk-jwt-service); coturn comes from apt so it
+  gets its correct libs instead of the host binary's version-pinned DB deps.
 
 ## Known limits (Stage 1 → follow-ups)
 
 - **Image is ~1.2 GB.** The current binary is the Tauri GUI (links webkit2gtk), so we run
   it under Xvfb and ship webkit/gtk/xvfb (~556 MB) just to satisfy that. **Stage 2** — a
   headless box runner with no Tauri — drops all of it (down to ~sidecars only).
-- **Voice/calls (coturn) off.** The `turnserver` binary pulls a pile of version-pinned DB
-  client libs it never uses here; chat + federation work fully without it. A lean coturn
-  build (or a maintained coturn image) re-enables calls.
 - **amd64 only** so far — multi-arch (arm64 for Pi / Apple Silicon) is a buildx pass once
   the sidecars are sourced as multi-arch.
 

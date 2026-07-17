@@ -14,20 +14,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libwebkit2gtk-4.1-0 libgtk-3-0 \
       libayatana-appindicator3-1 \
       libevent-2.1-7 \
+      coturn \
       xvfb dbus-x11 \
       ca-certificates fontconfig tzdata \
       qrencode \
     && rm -rf /var/lib/apt/lists/*
-# NOTE: voice/coturn (turnserver) is left out of Stage 1 — its binary pulls a pile of DB
-# client libs (incl. a version-pinned libmysqlclient) it never uses here. The box runs
-# fully (chat + federation) without it; calls are the only thing off until a lean coturn.
+# Voice/video (calls): use apt's coturn — it brings its own correct libs — instead of the
+# host's turnserver binary, which links version-pinned DB client libs (libmysqlclient etc.)
+# it never uses here. The box spawns turnserver from its bin dir, so symlink it (below).
 
 # Sidecars (tor, tuwunel, caddy, coturn, livekit-server, lk-jwt-service) + the box binary
 # are staged next to this Dockerfile by build.sh (kept out of git — large, host-built).
 COPY bin/ /opt/pureprivacy/bin/
 COPY pureprivacy /opt/pureprivacy/pureprivacy
 COPY entrypoint.sh /opt/pureprivacy/entrypoint.sh
-RUN chmod +x /opt/pureprivacy/bin/* /opt/pureprivacy/pureprivacy /opt/pureprivacy/entrypoint.sh
+RUN chmod +x /opt/pureprivacy/pureprivacy /opt/pureprivacy/entrypoint.sh \
+    && chmod +x /opt/pureprivacy/bin/* 2>/dev/null || true
+# The box spawns turnserver from its bin dir — point that at apt's coturn (correct libs).
+RUN ln -sf /usr/bin/turnserver /opt/pureprivacy/bin/turnserver
 
 ENV PUREPRIVACY_BIN_DIR=/opt/pureprivacy/bin \
     PUREPRIVACY_DATA_DIR=/data \

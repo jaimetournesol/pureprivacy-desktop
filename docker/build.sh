@@ -12,7 +12,9 @@ IMG="${IMAGE:-pureprivacy-box:dev}"
 
 rm -rf "$HERE/bin" "$HERE/pureprivacy"
 mkdir -p "$HERE/bin"
-for b in tor tuwunel caddy turnserver livekit-server lk-jwt-service; do
+# turnserver is NOT staged — the image installs coturn via apt (correct libs) and symlinks
+# it into the bin dir, so calls work without shipping the host's DB-linked turnserver.
+for b in tor tuwunel caddy livekit-server lk-jwt-service; do
   if [ -f "$BIN_SRC/$b" ]; then cp "$BIN_SRC/$b" "$HERE/bin/$b"
   else echo "warn: sidecar '$b' missing at $BIN_SRC (box will run without it)"; fi
 done
