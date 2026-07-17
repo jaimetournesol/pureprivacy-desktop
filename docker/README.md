@@ -13,11 +13,14 @@ the admin account, `secrets.json`, and `pairings.json` — lives in **one named 
 Everything goes through the **`pp-box`** helper in this directory:
 
 ```bash
+./pp-box build     # once — build the container image from the host-built binary + sidecars
 ./pp-box init      # asks for a login user/box name + password, generates a secrets key → .env
-./pp-box build     # build the image from the host-built binary + sidecars
 ./pp-box up        # start the box (detached); it mints its onion on first run
 ./pp-box qr        # once it's up, print the QR — scan it in the PurePrivacy phone app
 ```
+
+(`build` and `init` are independent — build makes the image once, init writes your
+config; do them in either order, then `up`.)
 
 That's it — scan the QR and your phone is connected, all over Tor.
 

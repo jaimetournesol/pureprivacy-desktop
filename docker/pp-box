@@ -58,7 +58,12 @@ PP_BOX=$b
 PP_PASS=$p
 PP_SECRETS_KEY=$key
 EOF
-    echo "✓ wrote .env (chmod 600). Next: ./pp-box build && ./pp-box up"
+    # build + init are independent; only tell them to build if the image isn't there yet.
+    if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+      echo "✓ wrote .env (chmod 600). Next: ./pp-box up"
+    else
+      echo "✓ wrote .env (chmod 600). Next: ./pp-box build   (then: ./pp-box up)"
+    fi
     ;;
 
   build)
