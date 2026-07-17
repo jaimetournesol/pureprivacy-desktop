@@ -65,7 +65,7 @@
 </script>
 
 <form class="step" onsubmit={continueSetup}>
-  <p class="eyebrow">Step 1 of 4 &middot; Your account</p>
+  <p class="eyebrow">Step 1 of 3 &middot; Your account</p>
   <h1>A name for you, a name for your box</h1>
 
   <div class="field">

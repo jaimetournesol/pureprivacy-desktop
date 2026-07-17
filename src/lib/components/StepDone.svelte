@@ -10,7 +10,7 @@
 </script>
 
 <div class="step">
-  <p class="eyebrow">Step 4 of 4 &middot; Done</p>
+  <p class="eyebrow">Step 3 of 3 &middot; Done</p>
   <h1>That's everything</h1>
 
   <div class="card summary">
@@ -36,7 +36,8 @@
       </dl>
     {/if}
     <p class="dim note">
-      Your recovery kit is safe, and your phone can join whenever you're ready.
+      Your recovery kit is safe. To put your box in your pocket, open PurePrivacy
+      and tap &ldquo;show QR&rdquo; on your private address — any time you like.
     </p>
   </div>
 

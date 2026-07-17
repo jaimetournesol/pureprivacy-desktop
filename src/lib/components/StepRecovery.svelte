@@ -89,7 +89,7 @@
 <div class="step">
   <div class="head">
     <div>
-      <p class="eyebrow">Step 2 of 4 &middot; Your recovery kit</p>
+      <p class="eyebrow">Step 2 of 3 &middot; Your recovery kit</p>
       <h1>Keep these six words safe</h1>
     </div>
     <span class="chip" class:ready={addressReady}>

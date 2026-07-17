@@ -10,12 +10,12 @@
   import StepWelcome from "$lib/components/StepWelcome.svelte";
   import StepAccount from "$lib/components/StepAccount.svelte";
   import StepRecovery from "$lib/components/StepRecovery.svelte";
-  import StepConnect from "$lib/components/StepConnect.svelte";
   import StepDone from "$lib/components/StepDone.svelte";
   import SetupProgress from "$lib/components/SetupProgress.svelte";
   import MainWindow from "$lib/components/MainWindow.svelte";
 
-  /** 1=Welcome 2=Account 3=Recovery 4=Connect 5=Done */
+  /** 1=Welcome 2=Account 3=Recovery 4=Done. (Phone-connect is not a setup step —
+   *  the QR lives in the main GUI's "Your private address" card, available anytime.) */
   let step = $state(1);
   /** True once the user ran begin_setup in this session (past D2). */
   let setupStartedHere = $state(false);
@@ -75,8 +75,6 @@
         />
       {:else if step === 3}
         <StepRecovery st={$status} onNext={() => (step = 4)} />
-      {:else if step === 4}
-        <StepConnect onNext={() => (step = 5)} />
       {:else}
         <StepDone st={$status} onOpen={() => (openedMain = true)} />
       {/if}
