@@ -641,11 +641,24 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     // allowlist — replacing the old substring-bypassable header_regexp matcher.
     let gh = app.clone();
     tauri::async_runtime::spawn(async move { run_fedauth(gh, gen).await });
+
+    // Box config from the phone (appliance-UX feature B): publish a read-only status
+    // blob the phone's PP Config app reads, and execute the tightly-guarded commands
+    // the phone writes — all over the SAME authenticated account-data channel as
+    // pairing (no new network surface). See run_box_config for the security rules.
+    let bh = app.clone();
+    tauri::async_runtime::spawn(async move { run_box_config(bh, gen).await });
     Ok(())
 }
 
 /// Account-data event type the phone writes scanned-peer onions into.
 const PAIR_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.pairings";
+/// Account-data the box PUBLISHES (read-only for the phone) — PP Config's live view.
+const BOXSTATUS_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.boxstatus";
+/// Account-data the phone WRITES a command into; the box reads + executes it.
+const COMMAND_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.command";
+/// Account-data the box WRITES a command's outcome into; the phone reads it.
+const COMMAND_RESULT_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.command_result";
 
 /// [QW-rust c] A reqwest client with a request timeout, for the box's local
 /// homeserver calls (login / account-data / keepalive). Without it, a hung
@@ -876,6 +889,163 @@ pub(crate) async fn pair_add_onion_to_account_data(
         }
     }
     Err(format!("couldn't record {target} in pairing account-data after retries"))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// GET an account-data blob. `Ok(None)` = absent (404), `Ok(Some)` = present,
+/// `Err(true)` = token rejected (re-login), `Err(false)` = transient.
+async fn get_account_data(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<Option<serde_json::Value>, bool> {
+    let r = client.get(url).bearer_auth(token).send().await.map_err(|_| false)?;
+    if r.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(true);
+    }
+    if r.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !r.status().is_success() {
+        return Err(false);
+    }
+    Ok(Some(r.json().await.map_err(|_| false)?))
+}
+
+/// Validate a phone-issued command blob (feature B, hyper-secure rules):
+/// allowlisted action, non-empty id NOT already handled, and a freshness window
+/// (`expires_ts` in the near future). Returns `(id, action)` only if it may run.
+fn validate_command(
+    cmd: &serde_json::Value,
+    handled: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    let id = cmd.get("id")?.as_str()?.to_string();
+    if id.is_empty() || handled.contains(&id) {
+        return None; // once-only: never run the same id twice
+    }
+    let action = cmd.get("action")?.as_str()?.to_string();
+    if !matches!(action.as_str(), "restart" | "reset") {
+        return None; // allowlist only (a cleared "done" command lands here → ignored)
+    }
+    // Freshness: the command must carry an expiry in the near future. This kills
+    // replay of a stale/old blob (and a "done" tombstone has no expires_ts).
+    let now = now_ms();
+    let expires = cmd.get("expires_ts").and_then(|v| v.as_u64()).unwrap_or(0);
+    if expires <= now || expires > now + 5 * 60 * 1000 {
+        return None;
+    }
+    Some((id, action))
+}
+
+fn execute_command(app: &AppHandle, action: &str) {
+    match action {
+        "restart" => {
+            eprintln!("[pureprivacy] box config: restart requested by the phone");
+            stop_lifecycle(app);
+            start_lifecycle(app, None);
+        }
+        "reset" => {
+            eprintln!("[pureprivacy] box config: FACTORY RESET requested by the phone");
+            let _ = crate::commands::reset_box(app.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Box config from the phone (feature B). Publishes a read-only status blob the
+/// PP Config app reads, and executes tightly-guarded commands the phone writes —
+/// all over the SAME authenticated account-data channel as pairing.
+///
+/// SECURITY: no new network surface (rides the local client API as the admin);
+/// only the admin account's own devices can read/write these keys. The box only
+/// ever READS commands + WRITES status/results — secrets NEVER enter account-data.
+/// Commands are allowlisted, freshness-gated, and once-only (executed id recorded
+/// + the command cleared to a no-op "done" so it can't re-fire).
+async fn run_box_config(app: AppHandle, gen: u64) {
+    let (username, onion, password) = state::read(&app, |i| {
+        (
+            i.username.clone(),
+            i.onion.clone().unwrap_or_default(),
+            i.admin_password.clone(),
+        )
+    });
+    if username.is_empty() || onion.is_empty() || password.is_empty() {
+        return; // can't authenticate (e.g. a box from before passwords were stored)
+    }
+    let base = format!("http://127.0.0.1:{}", HOMESERVER_PORT + off());
+    let user_id = format!("@{username}:{onion}");
+    let enc = user_id.replace('@', "%40").replace(':', "%3A");
+    let ad_url =
+        |ty: &str| format!("{base}/_matrix/client/v3/user/{enc}/account_data/{ty}");
+    let client = box_http_client();
+    let version = env!("CARGO_PKG_VERSION");
+    let mut token: Option<String> = None;
+    let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    loop {
+        if is_stale(&app, gen) {
+            return;
+        }
+        if token.is_none() {
+            token = pair_login(&client, &base, &username, &password).await;
+        }
+        if let Some(t) = token.clone() {
+            // 1) Publish read-only status for PP Config.
+            let (hs, tor, voice, paired, box_name) = state::read(&app, |i| {
+                (i.homeserver, i.tor, i.voice, i.paired_count, i.box_name.clone())
+            });
+            let status = serde_json::json!({
+                "onion": onion,
+                "box_name": box_name,
+                "version": version,
+                "services": { "homeserver": hs, "tor": tor, "voice": voice },
+                "paired_count": paired,
+                "updated_ts": now_ms(),
+            });
+            let _ = client
+                .put(ad_url(BOXSTATUS_ACCOUNT_DATA_TYPE))
+                .bearer_auth(&t)
+                .json(&status)
+                .send()
+                .await;
+
+            // 2) Read + execute a guarded command.
+            match get_account_data(&client, &ad_url(COMMAND_ACCOUNT_DATA_TYPE), &t).await {
+                Ok(Some(cmd)) => {
+                    if let Some((id, action)) = validate_command(&cmd, &handled) {
+                        handled.insert(id.clone());
+                        // Ack first (a destructive action tears the box down), then clear
+                        // the command to a no-op so it can never re-fire, THEN execute.
+                        let _ = client
+                            .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                            .bearer_auth(&t)
+                            .json(&serde_json::json!({ "id": id, "ok": true, "done_ts": now_ms() }))
+                            .send()
+                            .await;
+                        let _ = client
+                            .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
+                            .bearer_auth(&t)
+                            .json(&serde_json::json!({ "id": id, "action": "done" }))
+                            .send()
+                            .await;
+                        execute_command(&app, &action);
+                        // restart bumps the generation / reset wipes the box → this loop
+                        // exits via is_stale on the next tick.
+                    }
+                }
+                Ok(None) => {}
+                Err(true) => token = None, // token rejected → re-login next tick
+                Err(false) => {}           // transient
+            }
+        }
+        sleep(Duration::from_secs(4)).await;
+    }
 }
 
 /// Poll the owner's pairing account data and keep the fed-proxy allowlist in sync.
