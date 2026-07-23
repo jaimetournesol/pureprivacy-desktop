@@ -31,9 +31,12 @@ Your box is your always-on private cloud. What it hosts today, and where it's go
 The box is identical either way (same services, same `.onion`, same phone app) — pick the
 front door that fits where it runs.
 
-> **No signed installer yet** — both paths build from source for now (a packaged GUI
-> installer + auto-updater are on the roadmap). Both need the [dev toolchain](#dev-quickstart):
-> Node 24 (via nvm), pnpm, and Docker.
+> **Docker is the easy path — no build needed:** just
+> `docker pull jaimemelon/pureprivacy-box` and set up in your browser (Option 2). The **GUI
+> desktop app** still builds from source for now (a signed installer + auto-updater are on the
+> roadmap) and needs the [dev toolchain](#dev-quickstart): Node 24 (via nvm) + pnpm.
+>
+> Get the **phone app** from the [pureprivacy-mobile releases](https://github.com/jaimetournesol/pureprivacy-mobile/releases/latest) (latest APK).
 
 Set-up is the same one-page flow both ways: **choose a username + password on a local web
 page → scan the QR with the phone app → the page closes and everything is managed from your
