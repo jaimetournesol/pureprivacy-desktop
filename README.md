@@ -65,10 +65,14 @@ the phone. **Pull the published image** ([`jaimemelon/pureprivacy-box`](https://
 
 ```bash
 docker pull jaimemelon/pureprivacy-box:latest
-docker run -d --name pureprivacy-box --restart unless-stopped -v pureprivacy-data:/data \
+MYVOL=pp-data-$(openssl rand -hex 4)   # your box's data volume — note it down and always reuse it
+docker run -d --name pureprivacy-box --restart unless-stopped -v "$MYVOL":/data \
   -p 127.0.0.1:8470:8470 -e PUREPRIVACY_SETUP_BIND=0.0.0.0 jaimemelon/pureprivacy-box:latest
 # open http://127.0.0.1:8470/ → username + password → scan the QR in the phone app
 ```
+
+That volume holds your box's identity (the onion key) — **keep the name and back it up**; a
+different name means a different, empty box.
 
 Or build + manage it with the **`pp-box`** helper (`cd docker && ./pp-box build && ./pp-box init && ./pp-box up`).
 

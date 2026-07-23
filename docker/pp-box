@@ -24,7 +24,12 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1                     # Git Bash (Windows): don't rewrite container -v paths
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"                                    # so `docker compose` uses this dir's file + .env
-VOLUME="pureprivacy-data"                    # matches docker-compose.yml
+# Per-install volume name. `pp-box init` writes a unique PP_VOLUME into .env so two boxes on
+# one host can't collide. CRITICAL: this volume holds the onion key — it must resolve to the
+# SAME name for the life of the box, or you get a new, empty box. Installs made before
+# PP_VOLUME existed have no such line, so they fall back to the original fixed name.
+VOLUME="$(sed -n 's/^PP_VOLUME=//p' "$HERE/.env" 2>/dev/null | head -1)"
+[ -n "$VOLUME" ] || VOLUME="pureprivacy-data"
 IMAGE="${IMAGE:-pureprivacy-box:dev}"
 DC() { docker compose "$@"; }
 
@@ -57,22 +62,29 @@ case "$cmd" in
     echo "You can set your username + password in the browser after starting the box"
     echo "(recommended). Or bake them in now for a scripted/non-interactive setup."
     read -rsp "Box admin password (leave blank to set it in the browser): " p; echo
+    u=""
     if [ -n "$p" ]; then
-      read -rp "Phone login username [jaime]: " u; u="${u:-jaime}"
-    else
-      u="jaime"   # placeholder only; the real username comes from the browser form
+      # Scripted setup needs an explicit account name — there is no default.
+      while [ -z "$u" ]; do read -rp "Phone login username (required): " u; done
     fi
     key="$(openssl rand -base64 32)"
+    # Unique per-install volume name, generated ONCE here and pinned in .env. Keeps two boxes
+    # on one host from colliding. It must never change afterwards — it holds the onion key.
+    vol="pureprivacy-data-$(openssl rand -hex 4)"
     umask 077
     cat > "$HERE/.env" <<EOF
 # PurePrivacy box config — read automatically by docker compose. KEEP THIS PRIVATE.
 # PP_SECRETS_KEY decrypts secrets.json; it must stay the SAME across restarts. If you
 # ever lose it you cannot decrypt the box's secrets — back it up with the volume.
+# PP_VOLUME is THIS box's data volume (onion key + account + pairings). Never change it:
+# a different name means a different (empty) box. Back this file up with your volume.
 PP_USER=$u
 PP_BOX=$b
 PP_PASS=$p
 PP_SECRETS_KEY=$key
+PP_VOLUME=$vol
 EOF
+    echo "✓ this box's data volume: $vol   (recorded in .env — keep it)"
     # build + init are independent; only tell them to build if the image isn't there yet.
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
       echo "✓ wrote .env (chmod 600). Next: ./pp-box up"

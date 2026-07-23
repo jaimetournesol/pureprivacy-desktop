@@ -27,8 +27,8 @@ if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -Er
 }
 $Here   = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Here                      # so `docker compose` uses this dir's file + .env
-$Volume = 'pureprivacy-data'
 $Image  = if ($env:IMAGE) { $env:IMAGE } else { 'pureprivacy-box:dev' }
+# $Volume is resolved from .env (PP_VOLUME) just below, once Env-Val is defined.
 
 function Die($m)        { Write-Host "error: $m" -ForegroundColor Red; exit 1 }
 function Have-Env       { if (-not (Test-Path "$Here\.env")) { Die "no .env yet - run: .\pp-box.ps1 init" } }
@@ -45,31 +45,53 @@ function Onion {
   if ($j -and ($j -match '"onion"[^"]*"([a-z2-7]+\.onion)"')) { return $Matches[1] } else { return '' }
 }
 
+# Per-install volume name. `init` writes a unique PP_VOLUME into .env so two boxes on one host
+# cannot collide. CRITICAL: this volume holds the onion key, so it must resolve to the SAME
+# name for the life of the box. Installs made before PP_VOLUME existed fall back to the
+# original fixed name, so nothing is orphaned.
+$Volume = Env-Val 'PP_VOLUME'
+if (-not $Volume) { $Volume = 'pureprivacy-data' }
+
 switch ($Command) {
 
   'init' {
     if ((Test-Path "$Here\.env") -and ($Rest -notcontains '--force')) {
       Die ".env already exists (use: .\pp-box.ps1 init --force to overwrite - this rotates the secrets key!)"
     }
-    $u = Read-Host "Phone login username [jaime]"; if (-not $u) { $u = 'jaime' }
     $b = Read-Host "Box name [mybox]";             if (-not $b) { $b = 'mybox' }
-    $sec = Read-Host "Box admin password (what the phone signs in with)" -AsSecureString
+    Write-Host "You can set your username + password in the browser after starting the box"
+    Write-Host "(recommended). Or bake them in now for a scripted/non-interactive setup."
+    $sec = Read-Host "Box admin password (leave blank to set it in the browser)" -AsSecureString
     $p = [System.Net.NetworkCredential]::new('', $sec).Password
-    if (-not $p) { Die "a password is required" }
+    $u = ''
+    if ($p) {
+      # Scripted setup needs an explicit account name - there is no default.
+      while (-not $u) { $u = Read-Host "Phone login username (required)" }
+    }
     $bytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $key = [Convert]::ToBase64String($bytes)
+    # Unique per-install volume name, generated ONCE here and pinned in .env. Two boxes on one
+    # host cannot collide. It must never change afterwards - it holds the onion key.
+    $vbytes = New-Object byte[] 4
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($vbytes)
+    $vol = 'pureprivacy-data-' + ((($vbytes | ForEach-Object { $_.ToString('x2') })) -join '')
+    $Volume = $vol
     $body = @"
 # PurePrivacy box config - read automatically by docker compose. KEEP THIS PRIVATE.
 # PP_SECRETS_KEY decrypts secrets.json; it must stay the SAME across restarts. If you lose
 # it you cannot decrypt the box's secrets - back it up together with the volume.
+# PP_VOLUME is THIS box's data volume (onion key + account + pairings). Never change it:
+# a different name means a different (empty) box. Back this file up with your volume.
 PP_USER=$u
 PP_BOX=$b
 PP_PASS=$p
 PP_SECRETS_KEY=$key
+PP_VOLUME=$vol
 "@
     # UTF-8 without BOM - a BOM would corrupt the first line for docker compose.
     [System.IO.File]::WriteAllText("$Here\.env", $body, (New-Object System.Text.UTF8Encoding $false))
+    Write-Host "OK this box's data volume: $vol   (recorded in .env - keep it)"
     if (Image-Exists) { Write-Host "OK wrote .env. Next: .\pp-box.ps1 up" }
     else              { Write-Host "OK wrote .env. Next: .\pp-box.ps1 build   (then: .\pp-box.ps1 up)" }
   }
@@ -99,8 +121,17 @@ Then: .\pp-box.ps1 init ; .\pp-box.ps1 up
   { $_ -in 'up', 'start' } {
     Have-Env
     docker compose up -d
-    Write-Host "OK box starting. Watch it mint its onion + print the QR:  .\pp-box.ps1 logs"
-    Write-Host "  once it's up:  .\pp-box.ps1 qr"
+    if (-not (Env-Val 'PP_PASS')) {
+      Write-Host "OK box starting. Finish setup in your browser:"
+      Write-Host ""
+      Write-Host "      http://127.0.0.1:8470/"
+      Write-Host ""
+      Write-Host "  Choose a username + password there, then scan the QR with the PurePrivacy"
+      Write-Host "  phone app. The setup page closes itself once your phone signs in."
+    } else {
+      Write-Host "OK box starting. Watch it mint its onion + print the QR:  .\pp-box.ps1 logs"
+      Write-Host "  once it's up:  .\pp-box.ps1 qr"
+    }
   }
 
   'qr' {

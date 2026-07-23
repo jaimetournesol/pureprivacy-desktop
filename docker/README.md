@@ -5,8 +5,15 @@ Windows/macOS via Docker Desktop. One image, everywhere Docker runs.
 
 **No ports to publish.** The box is reached only through its `.onion` (outbound Tor
 rendezvous), so there's nothing to expose or forward. Its whole identity — the onion key,
-the admin account, `secrets.json`, and `pairings.json` — lives in **one named volume**
-(`pureprivacy-data`). Lose that volume and the box is gone for good, so **back it up**.
+the admin account, `secrets.json`, and `pairings.json` — lives in **one named volume**.
+Lose that volume and the box is gone for good, so **back it up**.
+
+> **Your volume name is unique to your install.** `pp-box init` generates one (e.g.
+> `pureprivacy-data-a1b2c3d4`) and records it in `.env` as `PP_VOLUME`, so two boxes on the
+> same host never collide. **It must never change** — pointing the box at a different name
+> gives you a new, empty box. Keep `.env` safe alongside your backups. *(Installs made before
+> this existed have no `PP_VOLUME` and keep using the original `pureprivacy-data` — nothing
+> to do.)*
 
 ## Easiest: pull the published image
 
@@ -14,7 +21,8 @@ No build needed — pull it straight from Docker Hub and finish setup in your br
 
 ```bash
 docker pull jaimemelon/pureprivacy-box:latest
-docker run -d --name pureprivacy-box --restart unless-stopped -v pureprivacy-data:/data \
+MYVOL=pp-data-$(openssl rand -hex 4)      # your box's data volume — note it down, keep it forever
+docker run -d --name pureprivacy-box --restart unless-stopped -v "$MYVOL":/data \
   -p 127.0.0.1:8470:8470 -e PUREPRIVACY_SETUP_BIND=0.0.0.0 \
   jaimemelon/pureprivacy-box:latest
 # then open http://127.0.0.1:8470/ in your browser
@@ -90,9 +98,10 @@ docker load -i pp-box.tar      # ← on Windows
 
 ## Back up your box — it's the whole identity
 
-An `.onion` address is derived from a secret key that exists **only** in the
-`pureprivacy-data` volume. If that volume is deleted, the address can never come back and
-your phone is orphaned on a dead box. So keep a backup:
+An `.onion` address is derived from a secret key that exists **only** in your box's data
+volume (the `PP_VOLUME` name in `.env`). If that volume is deleted — or you point the box at a
+different name — the address can never come back and your phone is orphaned on a dead box. So
+keep a backup (of the volume **and** `.env`):
 
 ```bash
 ./pp-box backup                     # → docker/backups/pp-box-<onion>-N.tgz
@@ -139,16 +148,21 @@ Or one plain `docker run` (identity in the `pureprivacy-data` volume; publish th
 to host loopback only):
 
 ```bash
-docker volume create pureprivacy-data
-docker run -d --name pureprivacy-box --restart unless-stopped -v pureprivacy-data:/data \
+MYVOL=pp-data-$(openssl rand -hex 4)     # pick a name and KEEP it — it holds your box identity
+docker volume create "$MYVOL"
+docker run -d --name pureprivacy-box --restart unless-stopped -v "$MYVOL":/data \
   -p 127.0.0.1:8470:8470 \
   -e PUREPRIVACY_SETUP_BIND=0.0.0.0 \
   pureprivacy-box:dev
 docker logs -f pureprivacy-box     # then open http://127.0.0.1:8470/ in your browser
 ```
 
+⚠️ Write that volume name down. Every later `docker run`, backup, or restore must use the
+**same** one — a different name is a different (empty) box, and the onion key is unrecoverable.
+
 *(Prefer the non-interactive path? Drop the two setup lines and add
-`-e PP_USER=jaime -e PP_PASS='a-strong-password' -e PP_SECRETS_KEY="$(openssl rand -base64 32)"`.)*
+`-e PP_USER=yourname -e PP_PASS='a-strong-password' -e PP_SECRETS_KEY="$(openssl rand -base64 32)"`.
+`PP_USER` has no default — it's required whenever `PP_PASS` is set.)*
 
 ## Notes & known limits (Stage 1)
 

@@ -9,7 +9,9 @@ services:
     container_name: pureprivacy-box
     restart: unless-stopped
     environment:
-      PP_USER: "${PP_USER:-jaime}"        # the account your phone logs in as
+      # Only needed for the scripted path (with PP_PASS). In the default web-setup flow you
+      # choose the username in the browser, so leave this unset.
+      PP_USER: "${PP_USER:-}"
       # Leave PP_PASS unset (default) for the interactive web-setup flow: open the setup
       # page (below) in your browser, choose a username + password, scan the QR. Set PP_PASS
       # to provision non-interactively instead (CI / scripted).
@@ -26,4 +28,8 @@ services:
       - pp-data:/data
 volumes:
   pp-data:
-    name: pureprivacy-data      # stable name so `pp-box backup`/`restore` can find it
+    # Per-install volume name. `pp-box init` generates a unique one into .env (PP_VOLUME) so
+    # two boxes on one host can't collide. It must stay STABLE for the life of the box — this
+    # volume holds the onion key; pointing at a different name = a new, empty box.
+    # Existing installs (no PP_VOLUME in .env) keep the original name, so nothing is orphaned.
+    name: ${PP_VOLUME:-pureprivacy-data}

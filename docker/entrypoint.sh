@@ -11,7 +11,9 @@
 #    print the phone-connect QR to the logs — the original behaviour, unchanged.
 set -euo pipefail
 
-PP_USER="${PP_USER:-jaime}"
+# No baked-in default account name — in the interactive flow the username comes from the
+# web setup form; in the scripted flow the operator must state it explicitly.
+PP_USER="${PP_USER:-}"
 PP_BOX="${PP_BOX:-mybox}"
 # Matches config.rs SETUP_PORT (+ PUREPRIVACY_PORT_OFFSET, which is 0 in the container).
 SETUP_PORT="${PUREPRIVACY_SETUP_PORT:-8470}"
@@ -19,6 +21,14 @@ SETUP_PORT="${PUREPRIVACY_SETUP_PORT:-8470}"
 # INTERACTIVE unless an admin password is baked in via env.
 INTERACTIVE=1
 [ -n "${PP_PASS:-}" ] && INTERACTIVE=0
+
+# Scripted provisioning needs an explicit username (there is no default).
+if [ "$INTERACTIVE" = "0" ] && [ -z "$PP_USER" ]; then
+  echo "[entrypoint] PP_PASS is set but PP_USER is not." >&2
+  echo "[entrypoint] Set PP_USER to the account name your phone signs in with," >&2
+  echo "[entrypoint] or leave PP_PASS unset to choose both in the browser setup page." >&2
+  exit 1
+fi
 
 # The container owns its data dir. Named volumes are already root-owned (no-op); this fixes
 # a bind-mount from a host user — tor refuses a hidden-service dir it doesn't own (exit 1).
