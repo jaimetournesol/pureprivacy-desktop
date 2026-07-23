@@ -88,6 +88,7 @@ fn handle(req: tiny_http::Request, app: &AppHandle, phone: &Arc<AtomicBool>) {
             respond(req, 200, "application/json", body);
         }
         (Method::Post, "/provision") => provision(req, app),
+        (Method::Post, "/restore") => restore(req, app),
         _ => respond(req, 404, "text/plain", "not found".to_string()),
     }
 }
@@ -141,6 +142,34 @@ fn provision(mut req: tiny_http::Request, app: &AppHandle) {
     } else {
         match commands::begin_setup(app.clone(), box_name, username, password) {
             Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
+            Err(e) => (400, serde_json::json!({"error": e}).to_string()),
+        }
+    };
+    respond(req, code, "application/json", out);
+}
+
+/// Handle POST /restore (feature D): rebuild this box from an encrypted backup instead of
+/// creating a new one. On success the box boots on the SAME .onion with the same admin login.
+fn restore(mut req: tiny_http::Request, app: &AppHandle) {
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let form = parse_form(&body);
+    let envelope = form.get("envelope").cloned().unwrap_or_default();
+    let passphrase = form.get("passphrase").cloned().unwrap_or_default();
+
+    // Same guard as provision: only ever from Fresh, so a restore can't clobber a live box.
+    let phase = state::read(app, |i| i.phase);
+    let (code, out) = if phase != state::Phase::Fresh {
+        (409, serde_json::json!({"error": "Setup is already under way."}).to_string())
+    } else {
+        match crate::backup::restore(app, envelope.trim(), &passphrase) {
+            Ok(()) => {
+                // Boot it: tor picks the restored onion key back up, and the admin account is
+                // re-created in the fresh homeserver DB from the restored credentials.
+                let pass = state::read(app, |i| i.admin_password.clone());
+                crate::supervisor::start_lifecycle(app, Some(pass));
+                (200, serde_json::json!({"ok": true}).to_string())
+            }
             Err(e) => (400, serde_json::json!({"error": e}).to_string()),
         }
     };

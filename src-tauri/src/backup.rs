@@ -136,6 +136,89 @@ pub fn open(envelope_json: &str, passphrase: &str) -> Result<serde_json::Value, 
     serde_json::from_str(&plain).map_err(|_| "Backup contents are corrupt.".to_string())
 }
 
+/// Restore a backup onto a **fresh** box: writes the onion key back, re-instates the admin
+/// credentials + pairings, and leaves the box ready for `start_lifecycle` to boot it on the
+/// SAME .onion. The homeserver DB is not part of a backup, so rooms/history start empty and
+/// contacts are re-paired — the address and login are what can't be recreated.
+///
+/// Refuses to run on a box that already has an identity: restore is a takeover primitive and
+/// must never silently overwrite a live box.
+pub fn restore(app: &AppHandle, envelope_json: &str, passphrase: &str) -> Result<(), String> {
+    if state::read(app, |i| i.onion.is_some()) {
+        return Err("This box already has an identity — restore onto a fresh box instead.".into());
+    }
+    let p = open(envelope_json, passphrase)?;
+    let s = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let hostname = s("hostname");
+    let hs_secret = B64
+        .decode(s("hs_secret"))
+        .map_err(|_| "This backup's key material is corrupt.".to_string())?;
+    let hs_public = B64
+        .decode(s("hs_public"))
+        .map_err(|_| "This backup's key material is corrupt.".to_string())?;
+    if hostname.is_empty() || hs_secret.is_empty() {
+        return Err("This backup is missing its onion key.".into());
+    }
+
+    let paths = config::ensure_dirs(app)?;
+    std::fs::create_dir_all(&paths.hs_dir)
+        .map_err(|e| format!("couldn't create the hidden-service dir: {e}"))?;
+    let write = |name: &str, bytes: &[u8]| -> Result<(), String> {
+        let path = paths.hs_dir.join(name);
+        std::fs::write(&path, bytes).map_err(|e| format!("couldn't write {name}: {e}"))?;
+        // tor REFUSES to use a hidden-service dir with loose permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    };
+    write("hostname", format!("{hostname}\n").as_bytes())?;
+    write("hs_ed25519_secret_key", &hs_secret)?;
+    write("hs_ed25519_public_key", &hs_public)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&paths.hs_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let phrase: Vec<String> = p
+        .get("phrase")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    // Secrets go back into state and are re-encrypted under THIS box's key by persist(), so the
+    // original machine's PP_SECRETS_KEY is never needed.
+    state::update(app, |i| {
+        i.box_name = s("box_name");
+        i.username = s("username");
+        i.created = s("created");
+        i.onion = Some(hostname.clone());
+        i.phrase = phrase;
+        i.token = s("token");
+        i.turn_secret = s("turn_secret");
+        i.join_token = s("join_token");
+        i.livekit_api_key = s("livekit_api_key");
+        i.livekit_api_secret = s("livekit_api_secret");
+        i.admin_password = s("admin_password");
+    });
+    state::persist(app)?;
+
+    // Re-instate the federation allowlist so previously paired peers can reach us again.
+    for o in p.get("pairings").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        if let Some(o) = o.as_str() {
+            if pairing::is_valid_onion(o) && o != hostname {
+                let _ = pairing::add(&paths.data_root, o);
+            }
+        }
+    }
+    eprintln!("[pureprivacy] restored identity for {hostname}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

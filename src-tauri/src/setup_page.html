@@ -24,6 +24,13 @@
   input{width:100%;padding:13px 14px;background:var(--ink-card);border:1px solid #33301f;
     border-radius:12px;color:var(--paper);font-size:15px;outline:none}
   input:focus{border-color:var(--sun)}
+  textarea{width:100%;padding:13px 14px;background:var(--ink-card);border:1px solid #33301f;
+    border-radius:12px;color:var(--paper);font-size:12.5px;outline:none;resize:vertical;
+    font-family:ui-monospace,Menlo,monospace}
+  textarea:focus{border-color:var(--sun)}
+  .alt{text-align:center;font-size:13px;color:var(--paper-dim);margin-top:18px}
+  .alt a{color:var(--sun);text-decoration:none}
+  .note{font-size:11.5px;color:var(--paper-dim);text-align:center;margin-top:14px;line-height:1.5}
   button{width:100%;margin-top:22px;padding:14px;background:var(--sun);color:#1a1a1a;
     border:0;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer}
   button:disabled{opacity:.5;cursor:default}
@@ -64,6 +71,25 @@
       <button id="go" type="submit">Create my box</button>
       <div class="err" id="formErr"></div>
     </form>
+    <p class="alt">Rebuilding a box you backed up? <a href="#" id="toRestore">Restore from a backup</a></p>
+  </section>
+
+  <!-- RESTORE -->
+  <section id="s-restore" class="hidden">
+    <h1>Restore your box</h1>
+    <p class="sub">Paste the backup you saved from the PurePrivacy app and enter its passphrase.
+      Your box comes back on the <strong>same address</strong>, with the same login.</p>
+    <form id="restoreForm" autocomplete="off">
+      <label for="env">Backup</label>
+      <textarea id="env" rows="5" placeholder="Paste the backup text here" required></textarea>
+      <label for="rp">Backup passphrase</label>
+      <input id="rp" type="password" placeholder="the passphrase you chose" required>
+      <button id="rgo" type="submit">Restore my box</button>
+      <div class="err" id="restoreErr"></div>
+    </form>
+    <p class="alt"><a href="#" id="toForm">Back to creating a new box</a></p>
+    <p class="note">Message history isn't part of a backup — your address, account and contacts
+      list come back; past conversations don't.</p>
   </section>
 
   <!-- PROVISIONING -->
@@ -105,9 +131,35 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const show = (which) => {
-    for (const s of ['form','prov','qr','done','err']) $('s-'+s).classList.toggle('hidden', s !== which);
+    for (const s of ['form','restore','prov','qr','done','err']) $('s-'+s).classList.toggle('hidden', s !== which);
   };
   let submitted = false;
+  // Which pre-provision screen the user picked, so the status poll doesn't yank them off the
+  // restore form back to the create form.
+  let mode = 'form';
+  $('toRestore').addEventListener('click', (e) => { e.preventDefault(); mode = 'restore'; show('restore'); });
+  $('toForm').addEventListener('click', (e) => { e.preventDefault(); mode = 'form'; show('form'); });
+
+  $('restoreForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('restoreErr').textContent = '';
+    const env = $('env').value.trim(), rp = $('rp').value;
+    if (!env) { $('restoreErr').textContent = 'Paste your backup first.'; return; }
+    if (!rp)  { $('restoreErr').textContent = 'Enter the backup passphrase.'; return; }
+    $('rgo').disabled = true;
+    const body = 'envelope=' + encodeURIComponent(env) + '&passphrase=' + encodeURIComponent(rp);
+    try {
+      const r = await fetch('/restore', { method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { $('restoreErr').textContent = j.error || 'Restore failed.'; $('rgo').disabled = false; return; }
+      submitted = true;
+      show('prov');
+    } catch (err) {
+      $('restoreErr').textContent = 'Couldn’t reach the box. Is it still running?';
+      $('rgo').disabled = false;
+    }
+  });
 
   $('form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -157,7 +209,7 @@
         })[s.stage] || 'Working…';
         show('prov');
       } else {
-        show('form');
+        show(mode);   // 'form' or 'restore' — whichever the user is on
       }
     } catch (e) { /* box busy/starting — keep polling */ }
     setTimeout(poll, 1500);
