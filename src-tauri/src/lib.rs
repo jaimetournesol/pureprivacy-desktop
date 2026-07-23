@@ -2,6 +2,7 @@
 //! nothing is pushed via events.
 
 mod account;
+mod backup;
 mod commands;
 mod config;
 mod crypto;

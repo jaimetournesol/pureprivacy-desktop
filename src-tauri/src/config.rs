@@ -286,6 +286,11 @@ fn tuwunel_toml_string(
          database_path = \"{db}\"\n\
          port = {port}\n\
          address = \"127.0.0.1\"\n\
+         # The Backup app (feature F) syncs photos + large files through this homeserver's\n\
+         # media repo, so the ~20 MB default ceiling is far too small. 256 MB covers photos\n\
+         # and short videos while staying sane on a small box (a request is buffered in\n\
+         # memory, so this is deliberately not unbounded).\n\
+         max_request_size = 268435456\n\
          allow_federation = true\n\
          allow_invalid_tls_certificates = true\n\
          trusted_servers = []\n\
