@@ -10,28 +10,36 @@ the admin account, `secrets.json`, and `pairings.json` — lives in **one named 
 
 ## Quick start
 
-Everything goes through the **`pp-box`** helper in this directory:
+Everything goes through the **`pp-box`** helper in this directory. Set-up is now a **one-page
+web form** — no need to bake a password into config:
 
 ```bash
 ./pp-box build     # once — build the container image from the host-built binary + sidecars
-./pp-box init      # asks for a login user/box name + password, generates a secrets key → .env
-./pp-box up        # start the box (detached); it mints its onion on first run
-./pp-box qr        # once it's up, print the QR — scan it in the PurePrivacy phone app
+./pp-box init      # box name + a fresh secrets key → .env (leave the password blank)
+./pp-box up        # start the box; it prints your setup URL
 ```
 
-(`build` and `init` are independent — build makes the image once, init writes your
-config; do them in either order, then `up`.)
+Then open the URL it prints — **http://127.0.0.1:8470/** — in any browser on this machine:
 
-That's it — scan the QR and your phone is connected, all over Tor.
+1. Choose a **username + password** (this is what your phone signs in with — keep it safe).
+2. The box provisions and shows a **QR code**.
+3. **Scan it in the PurePrivacy phone app** → you're signed in, all over Tor.
+
+The setup page is loopback-only (host `127.0.0.1` only, never the LAN) and **shuts itself
+down the moment your phone connects** — setup is one-time.
+
+> Prefer a scripted/non-interactive setup (CI, headless)? Give `init` a password instead and
+> the box provisions straight from it; then `./pp-box qr` prints the connect code to the
+> terminal (the pre-web-setup behaviour, still supported).
 
 ## All commands
 
 | Command | What it does |
 |---|---|
-| `./pp-box init` | Create `.env` — admin user/box name, password, and a fresh `PP_SECRETS_KEY`. |
+| `./pp-box init` | Create `.env` — box name, a fresh `PP_SECRETS_KEY`, and an optional password (blank ⇒ set it in the browser). |
 | `./pp-box build` | Build the `pureprivacy-box:dev` image (stages the binary + sidecars). |
-| `./pp-box up` | Start the box. First run mints the onion + creates the admin account. |
-| `./pp-box qr` | Print the phone-connect QR (and the `@user:onion` payload). |
+| `./pp-box up` | Start the box. First run prints the **web-setup URL** (`http://127.0.0.1:8470/`); a provisioned box just resumes. |
+| `./pp-box qr` | Print the phone-connect QR in the terminal (for the scripted/password-in-`.env` path). |
 | `./pp-box status` | Running? Shows the onion, uptime, and the volume name. |
 | `./pp-box logs` | Follow the logs (watch it mint the onion + boot the sidecars). |
 | `./pp-box restart` | Restart the box. |
@@ -59,7 +67,7 @@ work natively from PowerShell:
 ```powershell
 # on a Linux box (or in WSL2):  cd docker && ./pp-box build && docker save pureprivacy-box:dev -o pp-box.tar
 docker load -i pp-box.tar      # ← on Windows
-.\pp-box.ps1 init ; .\pp-box.ps1 up ; .\pp-box.ps1 qr
+.\pp-box.ps1 init ; .\pp-box.ps1 up      # then open http://127.0.0.1:8470/ in your browser
 ```
 
 (Or build it directly inside WSL2 and run from there.) A self-contained image you can
@@ -100,31 +108,42 @@ git-ignored) and store a copy alongside your backup.
 
 ## Without the CLI (plain docker / compose)
 
-The CLI just wraps these. `docker compose` reads the `.env` that `init` wrote:
+The CLI just wraps these. `docker compose` reads the `.env` that `init` wrote (all vars are
+optional — leave `PP_PASS` unset for the web-setup flow):
 
 ```bash
-docker compose up -d           # start        (needs PP_PASS + PP_SECRETS_KEY in .env)
-docker compose logs -f box     # watch it mint its onion + print the QR
+docker compose up -d           # start; the setup page is published to host 127.0.0.1:8470 only
+docker compose logs -f box     # watch it come up (and, in the scripted path, print the QR)
 docker compose down            # stop
 ```
 
-or one plain `docker run` (identity in the `pureprivacy-data` volume):
+Then open **http://127.0.0.1:8470/** and finish setup in your browser (unless you set
+`PP_PASS`, in which case it provisions from that and prints the QR to the logs).
+
+Or one plain `docker run` (identity in the `pureprivacy-data` volume; publish the setup port
+to host loopback only):
 
 ```bash
 docker volume create pureprivacy-data
 docker run -d --name pureprivacy-box --restart unless-stopped -v pureprivacy-data:/data \
-  -e PP_USER=jaime -e PP_PASS='a-strong-password' -e PP_BOX=mybox \
-  -e PP_SECRETS_KEY="$(openssl rand -base64 32)" \
+  -p 127.0.0.1:8470:8470 \
+  -e PUREPRIVACY_SETUP_BIND=0.0.0.0 \
   pureprivacy-box:dev
-docker logs -f pureprivacy-box
+docker logs -f pureprivacy-box     # then open http://127.0.0.1:8470/ in your browser
 ```
+
+*(Prefer the non-interactive path? Drop the two setup lines and add
+`-e PP_USER=jaime -e PP_PASS='a-strong-password' -e PP_SECRETS_KEY="$(openssl rand -base64 32)"`.)*
 
 ## Notes & known limits (Stage 1)
 
 - Build is **Stage 1**: it reuses the prebuilt Tauri binary + sidecars from your machine
   (`build.sh`) — fast to iterate. A shipping image would compile both in a multi-stage
   build.
-- **Image is ~1.2 GB / amd64 only.** The binary is the Tauri GUI (links webkit2gtk), run
-  headless under Xvfb, so the image ships webkit/gtk/xvfb just to satisfy it. **Stage 2** —
-  a headless box runner with no Tauri — drops all of that and unlocks multi-arch (arm64 for
-  a Pi / Apple Silicon), a leaner image, and a native setup CLI.
+- **Image is ~1.2 GB / amd64.** The binary is the Tauri GUI (links webkit2gtk), run headless
+  under Xvfb, so the image ships webkit/gtk/xvfb just to satisfy it. All the *sidecars* have
+  arm64 builds, so the only blocker to a multi-arch (arm64 for a Pi / Apple Silicon) image is
+  cross-compiling this webkit-linked binary — cleanest to do alongside **Stage 2** (a headless
+  box runner with no Tauri), which also shrinks the image.
+- **Setup page:** the one-page web setup is the only local surface, bound to host `127.0.0.1`
+  only and live **only until your phone signs in**. Everything else is Tor-only over the `.onion`.

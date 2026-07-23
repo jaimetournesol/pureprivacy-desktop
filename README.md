@@ -35,32 +35,37 @@ front door that fits where it runs.
 > installer + auto-updater are on the roadmap). Both need the [dev toolchain](#dev-quickstart):
 > Node 24 (via nvm), pnpm, and Docker.
 
+Set-up is the same one-page flow both ways: **choose a username + password on a local web
+page → scan the QR with the phone app → the page closes and everything is managed from your
+phone.**
+
 ### Option 1 · GUI — desktop app (on your own computer)
 
-A graphical app with a click-through setup wizard (account → recovery kit → done), then a
-dashboard showing your address + QR, box status, and controls.
+On first launch the box **opens a one-page setup in your default browser** (username +
+password → QR). Once your phone connects, the box runs in the background and is managed from
+the phone; the desktop window is just a status shell.
 
 ```bash
 source ~/.nvm/nvm.sh
 pnpm install
 ./scripts/fetch-sidecars.sh                 # fetch tuwunel + tor + call sidecars
 pnpm tauri build --no-bundle                # → src-tauri/target/release/pureprivacy
-./src-tauri/target/release/pureprivacy      # launch — the onboarding wizard opens
+./src-tauri/target/release/pureprivacy      # launch — setup opens in your browser
 ```
 
 (For development with hot-reload, use `pnpm tauri dev` instead.)
 
 ### Option 2 · Docker — headless, CLI-managed (server / NAS / Raspberry Pi / VPS)
 
-No desktop needed — reached only over its `.onion`, managed entirely from the terminal with
-the **`pp-box`** helper:
+No desktop needed — reached only over its `.onion`, set up from a browser and managed from
+the phone. Load the published image or build it, then:
 
 ```bash
 cd docker
-./pp-box build      # build the image (once)
-./pp-box init       # user/box name + password → generates a secrets key
-./pp-box up         # start it; it mints its onion
-./pp-box qr         # scan the QR in the PurePrivacy phone app
+./pp-box build      # build the image (once) — or: docker load -i pureprivacy-box-amd64.tar.gz
+./pp-box init       # box name + secrets key (leave the password blank for web setup)
+./pp-box up         # start it; prints http://127.0.0.1:8470/
+# open that URL in your browser → username + password → scan the QR in the phone app
 ```
 
 Then `status` / `logs` / `backup` / `restore` / `update` as needed. **Full guide:
