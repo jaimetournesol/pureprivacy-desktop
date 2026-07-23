@@ -37,6 +37,15 @@ onion() {
   local j; j="$(docker exec pureprivacy-box sh -c 'cat /data/box.json 2>/dev/null' 2>/dev/null || true)"
   printf '%s' "$j" | sed -n 's/.*"onion"[^"]*"\([a-z2-7]*\.onion\)".*/\1/p' | head -1
 }
+# The box's actual username. In the interactive web-setup flow it's chosen in the browser,
+# so read it from box.json (the source of truth); fall back to the .env default otherwise.
+boxuser() {
+  local j u; j="$(docker exec pureprivacy-box sh -c 'cat /data/box.json 2>/dev/null' 2>/dev/null || true)"
+  u="$(printf '%s' "$j" | sed -n 's/.*"username"[^"]*"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$u" ] && printf '%s' "$u" || envval PP_USER
+}
+# Interactive web setup when no admin password is baked into .env.
+is_interactive() { [ -z "$(envval PP_PASS)" ]; }
 
 cmd="${1:-help}"; shift || true
 case "$cmd" in
@@ -44,10 +53,15 @@ case "$cmd" in
     if [ -f "$HERE/.env" ] && [ "${1:-}" != "--force" ]; then
       die ".env already exists (use: ./pp-box init --force to overwrite — this rotates the secrets key!)"
     fi
-    read -rp "Phone login username [jaime]: " u; u="${u:-jaime}"
     read -rp "Box name [mybox]: " b; b="${b:-mybox}"
-    read -rsp "Box admin password (what the phone signs in with): " p; echo
-    [ -n "$p" ] || die "a password is required"
+    echo "You can set your username + password in the browser after starting the box"
+    echo "(recommended). Or bake them in now for a scripted/non-interactive setup."
+    read -rsp "Box admin password (leave blank to set it in the browser): " p; echo
+    if [ -n "$p" ]; then
+      read -rp "Phone login username [jaime]: " u; u="${u:-jaime}"
+    else
+      u="jaime"   # placeholder only; the real username comes from the browser form
+    fi
     key="$(openssl rand -base64 32)"
     umask 077
     cat > "$HERE/.env" <<EOF
@@ -74,13 +88,22 @@ EOF
   up|start)
     have_env
     DC up -d
-    echo "✓ box starting. Watch it mint its onion + print the QR:  ./pp-box logs"
-    echo "  once it's up:  ./pp-box qr"
+    if is_interactive; then
+      echo "✓ box starting. Finish setup in your browser:"
+      echo ""
+      echo "      http://127.0.0.1:8470/"
+      echo ""
+      echo "  Choose a username + password there, then scan the QR with the PurePrivacy"
+      echo "  phone app. The setup page closes itself once your phone signs in."
+    else
+      echo "✓ box starting. Watch it mint its onion + print the QR:  ./pp-box logs"
+      echo "  once it's up:  ./pp-box qr"
+    fi
     ;;
 
   qr)
     have_env
-    o="$(onion)"; u="$(envval PP_USER)"
+    o="$(onion)"; u="$(boxuser)"
     [ -n "$o" ] || die "no onion yet — the box is still minting it (give it a minute), or it isn't running (./pp-box up)"
     # LOGIN/setup handoff — the phone pre-fills onion + user on its sign-in screen. NOT the
     # contact form (pureprivacy:@user:onion), which a not-yet-signed-in phone stashes as a
@@ -102,7 +125,7 @@ EOF
       echo "● box: not running   (start it: ./pp-box up)"; exit 0
     fi
     up="$(docker ps --filter name=pureprivacy-box --format '{{.Status}}')"
-    o="$(onion)"; u="$(envval PP_USER)"
+    o="$(onion)"; u="$(boxuser)"
     echo "● box: running   ($up)"
     echo "  user:  @${u}:${o:-<minting onion…>}"
     echo "  volume: $VOLUME   (identity lives here — back it up: ./pp-box backup)"

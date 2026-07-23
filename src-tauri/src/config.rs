@@ -80,6 +80,13 @@ pub const CADDY_HS_PORT: u16 = 8455;
 /// allowlist. Not exposed via tor — pure loopback between Caddy and the box.
 pub const FEDAUTH_PORT: u16 = 8460;
 
+/// One-page web setup server (appliance-UX feature A). Serves the first-run
+/// username/password form + login QR to a browser, then shuts down once the
+/// phone signs in. The ONLY non-onion surface, and only until setup completes:
+/// bound to loopback on the GUI, and to the container (0.0.0.0) in Docker where
+/// docker-compose republishes it to the HOST's 127.0.0.1 only. Never mapped by tor.
+pub const SETUP_PORT: u16 = 8470;
+
 /// The highest fixed loopback base port any `PORT + off()` expression adds the
 /// offset to (the top of the coturn TCP relay range). The offset is clamped so
 /// even this port can't overflow a u16 — see `off()`. [QW-rust d]

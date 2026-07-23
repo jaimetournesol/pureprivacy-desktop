@@ -276,6 +276,22 @@ pub fn get_connect_qr(app: AppHandle) -> Result<ConnectQr, String> {
     Ok(ConnectQr { payload, svg })
 }
 
+/// The loopback URL of the one-page web setup server (feature A). The GUI shows
+/// this on the "finish setup in your browser" screen so the user can re-open it.
+#[tauri::command]
+pub fn get_setup_url() -> String {
+    crate::setup_server::setup_url()
+}
+
+/// Open the web setup page in the default browser (the GUI's "open setup" button).
+#[tauri::command]
+pub fn open_setup_page(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(crate::setup_server::setup_url(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Serialize)]
 pub struct JoinInfo {
     /// The box's onion (the new person's homeserver address).

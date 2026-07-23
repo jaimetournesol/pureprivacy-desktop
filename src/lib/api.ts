@@ -93,6 +93,16 @@ export function getConnectQr(): Promise<ConnectQr> {
   return invoke<ConnectQr>("get_connect_qr");
 }
 
+/** The loopback URL of the one-page web setup server (feature A). */
+export function getSetupUrl(): Promise<string> {
+  return invoke<string>("get_setup_url");
+}
+
+/** Open the web setup page in the default browser. */
+export function openSetupPage(): Promise<null> {
+  return invoke<null>("open_setup_page");
+}
+
 export function stopBox(): Promise<null> {
   return invoke<null>("stop_box");
 }
