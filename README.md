@@ -58,15 +58,16 @@ pnpm tauri build --no-bundle                # → src-tauri/target/release/purep
 ### Option 2 · Docker — headless, CLI-managed (server / NAS / Raspberry Pi / VPS)
 
 No desktop needed — reached only over its `.onion`, set up from a browser and managed from
-the phone. Load the published image or build it, then:
+the phone. **Pull the published image** ([`jaimemelon/pureprivacy-box`](https://hub.docker.com/r/jaimemelon/pureprivacy-box)):
 
 ```bash
-cd docker
-./pp-box build      # build the image (once) — or: docker load -i pureprivacy-box-amd64.tar.gz
-./pp-box init       # box name + secrets key (leave the password blank for web setup)
-./pp-box up         # start it; prints http://127.0.0.1:8470/
-# open that URL in your browser → username + password → scan the QR in the phone app
+docker pull jaimemelon/pureprivacy-box:latest
+docker run -d --name pureprivacy-box --restart unless-stopped -v pureprivacy-data:/data \
+  -p 127.0.0.1:8470:8470 -e PUREPRIVACY_SETUP_BIND=0.0.0.0 jaimemelon/pureprivacy-box:latest
+# open http://127.0.0.1:8470/ → username + password → scan the QR in the phone app
 ```
+
+Or build + manage it with the **`pp-box`** helper (`cd docker && ./pp-box build && ./pp-box init && ./pp-box up`).
 
 Then `status` / `logs` / `backup` / `restore` / `update` as needed. **Full guide:
 [docker/README.md](docker/README.md).**

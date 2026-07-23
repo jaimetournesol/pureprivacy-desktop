@@ -8,9 +8,24 @@ rendezvous), so there's nothing to expose or forward. Its whole identity — the
 the admin account, `secrets.json`, and `pairings.json` — lives in **one named volume**
 (`pureprivacy-data`). Lose that volume and the box is gone for good, so **back it up**.
 
-## Quick start
+## Easiest: pull the published image
 
-Everything goes through the **`pp-box`** helper in this directory. Set-up is now a **one-page
+No build needed — pull it straight from Docker Hub and finish setup in your browser:
+
+```bash
+docker pull jaimemelon/pureprivacy-box:latest
+docker run -d --name pureprivacy-box --restart unless-stopped -v pureprivacy-data:/data \
+  -p 127.0.0.1:8470:8470 -e PUREPRIVACY_SETUP_BIND=0.0.0.0 \
+  jaimemelon/pureprivacy-box:latest
+# then open http://127.0.0.1:8470/ in your browser
+```
+
+(Or with compose: set `PP_IMAGE=jaimemelon/pureprivacy-box:latest` and `docker compose up -d`.)
+The rest of this guide covers building the image yourself and the `pp-box` helper.
+
+## Quick start (build it yourself)
+
+Everything goes through the **`pp-box`** helper in this directory. Set-up is a **one-page
 web form** — no need to bake a password into config:
 
 ```bash

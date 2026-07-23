@@ -5,7 +5,7 @@
 # secrets, pairings).
 services:
   box:
-    image: pureprivacy-box:dev          # built by ./build.sh
+    image: ${PP_IMAGE:-pureprivacy-box:dev}   # ./build.sh builds :dev; or PP_IMAGE=jaimemelon/pureprivacy-box:latest to pull from Docker Hub
     container_name: pureprivacy-box
     restart: unless-stopped
     environment:
