@@ -659,6 +659,8 @@ const BOXSTATUS_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.boxstatus";
 const COMMAND_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.command";
 /// Account-data the box WRITES a command's outcome into; the phone reads it.
 const COMMAND_RESULT_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.command_result";
+/// Account-data the box WRITES an encrypted identity backup into (feature D); phone saves it.
+const BACKUP_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.backup";
 
 /// [QW-rust c] A reqwest client with a request timeout, for the box's local
 /// homeserver calls (login / account-data / keepalive). Without it, a hung
@@ -930,7 +932,7 @@ fn validate_command(
         return None; // once-only: never run the same id twice
     }
     let action = cmd.get("action")?.as_str()?.to_string();
-    if !matches!(action.as_str(), "restart" | "reset") {
+    if !matches!(action.as_str(), "restart" | "reset" | "backup") {
         return None; // allowlist only (a cleared "done" command lands here → ignored)
     }
     // Freshness: the command must carry an expiry in the near future. This kills
@@ -1020,23 +1022,71 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                 Ok(Some(cmd)) => {
                     if let Some((id, action)) = validate_command(&cmd, &handled) {
                         handled.insert(id.clone());
-                        // Ack first (a destructive action tears the box down), then clear
-                        // the command to a no-op so it can never re-fire, THEN execute.
-                        let _ = client
-                            .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
-                            .bearer_auth(&t)
-                            .json(&serde_json::json!({ "id": id, "ok": true, "done_ts": now_ms() }))
-                            .send()
-                            .await;
-                        let _ = client
-                            .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
-                            .bearer_auth(&t)
-                            .json(&serde_json::json!({ "id": id, "action": "done" }))
-                            .send()
-                            .await;
-                        execute_command(&app, &action);
-                        // restart bumps the generation / reset wipes the box → this loop
-                        // exits via is_stale on the next tick.
+                        if action == "backup" {
+                            // Feature D. The command carries the user's backup passphrase, so
+                            // take it into memory and CLEAR the command first — the passphrase
+                            // must not sit in account-data while we do the work.
+                            let passphrase = cmd
+                                .get("passphrase")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let _ = client
+                                .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({ "id": id, "action": "done" }))
+                                .send()
+                                .await;
+                            let (ok, err) = match crate::backup::create(&app, &passphrase) {
+                                Ok(envelope) => {
+                                    let put = client
+                                        .put(ad_url(BACKUP_ACCOUNT_DATA_TYPE))
+                                        .bearer_auth(&t)
+                                        .json(&serde_json::json!({
+                                            "id": id,
+                                            "envelope": envelope,
+                                            "created_ts": now_ms(),
+                                        }))
+                                        .send()
+                                        .await;
+                                    match put {
+                                        Ok(r) if r.status().is_success() => (true, None),
+                                        _ => (false, Some("couldn't publish the backup".to_string())),
+                                    }
+                                }
+                                Err(e) => (false, Some(e)),
+                            };
+                            let mut res =
+                                serde_json::json!({ "id": id, "ok": ok, "done_ts": now_ms() });
+                            if let Some(e) = err {
+                                res["error"] = serde_json::json!(e);
+                            }
+                            let _ = client
+                                .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&res)
+                                .send()
+                                .await;
+                            eprintln!("[pureprivacy] box config: identity backup requested (ok={ok})");
+                        } else {
+                            // Ack first (a destructive action tears the box down), then clear
+                            // the command to a no-op so it can never re-fire, THEN execute.
+                            let _ = client
+                                .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({ "id": id, "ok": true, "done_ts": now_ms() }))
+                                .send()
+                                .await;
+                            let _ = client
+                                .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({ "id": id, "action": "done" }))
+                                .send()
+                                .await;
+                            execute_command(&app, &action);
+                            // restart bumps the generation / reset wipes the box → this loop
+                            // exits via is_stale on the next tick.
+                        }
                     }
                 }
                 Ok(None) => {}
