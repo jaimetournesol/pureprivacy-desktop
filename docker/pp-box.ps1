@@ -92,6 +92,18 @@ PP_VOLUME=$vol
     # UTF-8 without BOM - a BOM would corrupt the first line for docker compose.
     [System.IO.File]::WriteAllText("$Here\.env", $body, (New-Object System.Text.UTF8Encoding $false))
     Write-Host "OK this box's data volume: $vol   (recorded in .env - keep it)"
+    # A volume from an earlier install may still be on this host. Be explicit that this new box
+    # will NOT adopt it (a different volume = a different, empty box) and how to reuse it on
+    # purpose - silently pointing elsewhere is how people think they've lost their onion.
+    docker volume inspect pureprivacy-data *> $null
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host ""
+      Write-Host "  NOTE: a 'pureprivacy-data' volume from an earlier install is still on this host."
+      Write-Host "        This box will use '$vol' and leave that one untouched."
+      Write-Host "        If you actually meant to keep using that older box, stop now and set"
+      Write-Host "        PP_VOLUME=pureprivacy-data in .env before running '.\pp-box.ps1 up'."
+      Write-Host ""
+    }
     if (Image-Exists) { Write-Host "OK wrote .env. Next: .\pp-box.ps1 up" }
     else              { Write-Host "OK wrote .env. Next: .\pp-box.ps1 build   (then: .\pp-box.ps1 up)" }
   }

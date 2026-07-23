@@ -85,6 +85,17 @@ PP_SECRETS_KEY=$key
 PP_VOLUME=$vol
 EOF
     echo "✓ this box's data volume: $vol   (recorded in .env — keep it)"
+    # A volume from an earlier install may still be on this host. Be explicit that this new box
+    # will NOT adopt it (a different volume = a different, empty box) and how to reuse it on
+    # purpose — silently pointing elsewhere is how people think they've lost their onion.
+    if docker volume inspect pureprivacy-data >/dev/null 2>&1; then
+      echo
+      echo "  NOTE: a 'pureprivacy-data' volume from an earlier install is still on this host."
+      echo "        This box will use '$vol' and leave that one untouched."
+      echo "        If you actually meant to keep using that older box, stop now and set"
+      echo "        PP_VOLUME=pureprivacy-data in .env before running './pp-box up'."
+      echo
+    fi
     # build + init are independent; only tell them to build if the image isn't there yet.
     if docker image inspect "$IMAGE" >/dev/null 2>&1; then
       echo "✓ wrote .env (chmod 600). Next: ./pp-box up"

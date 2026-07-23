@@ -11,9 +11,20 @@ Lose that volume and the box is gone for good, so **back it up**.
 > **Your volume name is unique to your install.** `pp-box init` generates one (e.g.
 > `pureprivacy-data-a1b2c3d4`) and records it in `.env` as `PP_VOLUME`, so two boxes on the
 > same host never collide. **It must never change** — pointing the box at a different name
-> gives you a new, empty box. Keep `.env` safe alongside your backups. *(Installs made before
-> this existed have no `PP_VOLUME` and keep using the original `pureprivacy-data` — nothing
-> to do.)*
+> gives you a new, empty box. Keep `.env` safe alongside your backups.
+
+### Upgrading, and old leftover volumes
+
+- **Already running a box?** Just update — your `.env` has no `PP_VOLUME`, so the box keeps
+  using the original `pureprivacy-data` volume: same onion, same account, nothing to do.
+- **Fresh install on a host that still has an old volume?** `pp-box init` generates a new
+  volume name, so the leftover `pureprivacy-data` is **ignored and left untouched** — you get a
+  clean box, not a resurrected old one. Delete it yourself (`docker volume rm pureprivacy-data`)
+  once you're sure you don't need it.
+- ⚠️ **Don't `init --force` on a machine whose live box uses `pureprivacy-data`** — that writes a
+  *new* volume name and your real box will look like it vanished (it hasn't; the volume is still
+  there, just unused). `init` warns you if it spots one. To go back, set
+  `PP_VOLUME=pureprivacy-data` in `.env`.
 
 ## Easiest: pull the published image
 
