@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up PurePrivacy</title>
+<style>
+  :root{
+    --ink:#16140F; --ink-soft:#1D1A12; --ink-card:#221F17;
+    --paper:#ECE6D7; --paper-dim:#9A9384; --sun:#F2B705; --sun-dim:#B8860B;
+    --danger:#E06650; --ok:#4CAF7A;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ink);color:var(--paper);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+  .card{width:100%;max-width:460px;background:var(--ink-soft);border:1px solid #2a271d;
+    border-radius:20px;padding:34px 30px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  .logo{width:52px;height:52px;border-radius:14px;background:var(--ink-card);
+    display:flex;align-items:center;justify-content:center;margin:0 auto 16px;font-size:26px}
+  h1{font-size:22px;font-weight:800;text-align:center;margin:0 0 6px}
+  .sub{color:var(--paper-dim);font-size:14px;text-align:center;margin:0 0 24px;line-height:1.5}
+  label{display:block;font-size:13px;color:var(--paper-dim);margin:16px 0 6px}
+  input{width:100%;padding:13px 14px;background:var(--ink-card);border:1px solid #33301f;
+    border-radius:12px;color:var(--paper);font-size:15px;outline:none}
+  input:focus{border-color:var(--sun)}
+  button{width:100%;margin-top:22px;padding:14px;background:var(--sun);color:#1a1a1a;
+    border:0;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .err{color:var(--danger);font-size:13px;margin-top:12px;text-align:center;min-height:18px}
+  .hidden{display:none}
+  .center{text-align:center}
+  .qrbox{background:#fff;border-radius:16px;padding:16px;width:260px;margin:8px auto 0}
+  .qrbox svg{width:100%;height:auto;display:block}
+  .payload{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--paper-dim);
+    word-break:break-all;background:var(--ink-card);border-radius:10px;padding:10px 12px;margin-top:14px}
+  .spinner{width:34px;height:34px;border:3px solid var(--ink-card);border-top-color:var(--sun);
+    border-radius:50%;margin:8px auto 16px;animation:spin 1s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .stage{color:var(--paper-dim);font-size:14px}
+  .tick{font-size:44px;color:var(--ok)}
+  .steps{list-style:none;padding:0;margin:18px 0 0;text-align:left}
+  .steps li{padding:6px 0;color:var(--paper-dim);font-size:13.5px;display:flex;gap:8px}
+  .steps li.done{color:var(--paper)}
+  .steps li .b{color:var(--sun)}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">🌻</div>
+
+  <!-- FORM -->
+  <section id="s-form">
+    <h1>Set up your box</h1>
+    <p class="sub">Pick a username and password. Your phone signs in with these — keep the
+      password safe, there's no way to reset it.</p>
+    <form id="form" autocomplete="off">
+      <label for="u">Username</label>
+      <input id="u" name="username" placeholder="e.g. alex" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+      <label for="p">Password</label>
+      <input id="p" name="password" type="password" placeholder="a strong password" required>
+      <label for="p2">Confirm password</label>
+      <input id="p2" type="password" placeholder="repeat it" required>
+      <button id="go" type="submit">Create my box</button>
+      <div class="err" id="formErr"></div>
+    </form>
+  </section>
+
+  <!-- PROVISIONING -->
+  <section id="s-prov" class="hidden center">
+    <h1>Setting up your box…</h1>
+    <div class="spinner"></div>
+    <p class="stage" id="stage">Starting…</p>
+    <ul class="steps">
+      <li id="st-services"><span class="b">•</span> Starting services</li>
+      <li id="st-onion"><span class="b">•</span> Minting your private .onion address</li>
+      <li id="st-account"><span class="b">•</span> Creating your account</li>
+    </ul>
+  </section>
+
+  <!-- QR -->
+  <section id="s-qr" class="hidden center">
+    <h1>Scan this on your phone</h1>
+    <p class="sub">Open the PurePrivacy app and scan to sign in. This page closes itself once
+      your phone connects.</p>
+    <div class="qrbox" id="qrbox"></div>
+    <div class="payload" id="payload"></div>
+  </section>
+
+  <!-- DONE -->
+  <section id="s-done" class="hidden center">
+    <div class="tick">✓</div>
+    <h1>Your phone is connected</h1>
+    <p class="sub">Setup is complete. You can close this page — everything else is managed from
+      the PurePrivacy app on your phone.</p>
+  </section>
+
+  <!-- ERROR -->
+  <section id="s-err" class="hidden center">
+    <h1>Something needs attention</h1>
+    <p class="sub" id="errMsg"></p>
+  </section>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const show = (which) => {
+    for (const s of ['form','prov','qr','done','err']) $('s-'+s).classList.toggle('hidden', s !== which);
+  };
+  let submitted = false;
+
+  $('form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('formErr').textContent = '';
+    const u = $('u').value.trim(), p = $('p').value, p2 = $('p2').value;
+    if (!u) { $('formErr').textContent = 'Pick a username.'; return; }
+    if (p.length < 8) { $('formErr').textContent = 'Use a password of at least 8 characters.'; return; }
+    if (p !== p2) { $('formErr').textContent = 'The passwords don’t match.'; return; }
+    $('go').disabled = true;
+    const body = 'username=' + encodeURIComponent(u) + '&password=' + encodeURIComponent(p);
+    try {
+      const r = await fetch('/provision', { method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { $('formErr').textContent = j.error || 'Setup couldn’t start.'; $('go').disabled = false; return; }
+      submitted = true;
+      show('prov');
+    } catch (err) {
+      $('formErr').textContent = 'Couldn’t reach the box. Is it still running?';
+      $('go').disabled = false;
+    }
+  });
+
+  let qrDrawn = false;
+  async function poll() {
+    try {
+      const r = await fetch('/status', { cache:'no-store' });
+      const s = await r.json();
+      if (s.phone_connected) { show('done'); return; }        // stop polling once connected
+      if (s.error) { $('errMsg').textContent = s.error; show('err'); }
+      else if (s.qr_svg) {
+        if (!qrDrawn) {
+          $('qrbox').innerHTML = s.qr_svg;
+          $('payload').textContent = s.qr_payload || '';
+          qrDrawn = true;
+        }
+        show('qr');
+      } else if (submitted || s.phase === 'setting_up') {
+        // progress
+        $('st-services').classList.toggle('done', !!s.stage);
+        $('st-onion').classList.toggle('done', s.stage === 'minting_address' || s.stage === 'ready' || !!s.onion);
+        $('st-account').classList.toggle('done', s.stage === 'ready');
+        $('stage').textContent = ({
+          starting_services:'Starting services…',
+          minting_address:'Minting your .onion address…',
+          ready:'Almost there…'
+        })[s.stage] || 'Working…';
+        show('prov');
+      } else {
+        show('form');
+      }
+    } catch (e) { /* box busy/starting — keep polling */ }
+    setTimeout(poll, 1500);
+  }
+  poll();
+</script>
+</body>
+</html>

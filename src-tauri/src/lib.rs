@@ -7,12 +7,14 @@ mod config;
 mod crypto;
 mod fedauth;
 mod pairing;
+mod setup_server;
 mod state;
 mod supervisor;
 mod tray;
 mod words;
 
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -38,28 +40,41 @@ pub fn run() {
             commands::pair_accept,
             commands::pair_list,
             commands::pair_remove,
+            commands::get_setup_url,
+            commands::open_setup_page,
         ])
         .setup(|app| {
             state::load_persisted(app.handle());
             tray::init(app.handle())?;
-            // Opt-in auto-resume: with PUREPRIVACY_AUTOSTART=1, a provisioned box
-            // comes back up on launch (tor + homeserver + sidecars) without a manual
-            // Start click. Used by the multi-box demo launcher; default behaviour
-            // (come up Stopped, user starts it) is unchanged when unset.
-            if std::env::var("PUREPRIVACY_AUTOSTART").ok().as_deref() == Some("1") {
-                if state::read(app.handle(), |i| i.onion.is_some()) {
+            // First-run vs resume (appliance-UX feature A).
+            //  - Provisioned box (has an onion): resume it. Opt-in via AUTOSTART for the
+            //    multi-box launcher; GUI default (come up Stopped, user clicks Start) is
+            //    unchanged when AUTOSTART is unset.
+            //  - Fresh box + env creds (headless/tests/testbed): drive begin_setup from
+            //    env, no web server — the existing demo/testbed path, unchanged.
+            //  - Fresh box, no creds: serve the one-page web setup. The GUI opens it in
+            //    the default browser; Docker (AUTOSTART, no creds) prints the URL from
+            //    the entrypoint. Loopback-only; shuts itself down once the phone signs in.
+            let autostart = std::env::var("PUREPRIVACY_AUTOSTART").ok().as_deref() == Some("1");
+            if state::read(app.handle(), |i| i.onion.is_some()) {
+                if autostart {
                     supervisor::start_lifecycle(app.handle(), None);
-                } else if let (Ok(user), Ok(pass)) = (
-                    std::env::var("PUREPRIVACY_PROVISION_USER"),
-                    std::env::var("PUREPRIVACY_PROVISION_PASS"),
-                ) {
-                    // Headless first-run provisioning (demos/tests): same path as the
-                    // GUI wizard — mint the onion + create the admin account — driven
-                    // by env instead of a click. No-op once the box has an onion.
-                    let box_name = std::env::var("PUREPRIVACY_PROVISION_BOX")
-                        .unwrap_or_else(|_| format!("{user}box"));
-                    if let Err(e) = commands::begin_setup(app.handle().clone(), box_name, user, pass) {
-                        eprintln!("[pureprivacy] headless provision failed: {e}");
+                }
+            } else if let (Ok(user), Ok(pass)) = (
+                std::env::var("PUREPRIVACY_PROVISION_USER"),
+                std::env::var("PUREPRIVACY_PROVISION_PASS"),
+            ) {
+                let box_name = std::env::var("PUREPRIVACY_PROVISION_BOX")
+                    .unwrap_or_else(|_| format!("{user}box"));
+                if let Err(e) = commands::begin_setup(app.handle().clone(), box_name, user, pass) {
+                    eprintln!("[pureprivacy] headless provision failed: {e}");
+                }
+            } else {
+                setup_server::start(app.handle().clone());
+                if !autostart {
+                    let url = setup_server::setup_url();
+                    if let Err(e) = app.handle().opener().open_url(url, None::<&str>) {
+                        eprintln!("[pureprivacy] couldn't open the setup page: {e}");
                     }
                 }
             }
