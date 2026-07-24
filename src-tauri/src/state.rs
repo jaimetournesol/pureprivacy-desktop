@@ -95,6 +95,13 @@ pub struct Inner {
     /// own admin password (single-user appliance) so the owner's phone can sign in.
     /// Empty until `begin_setup`.
     pub admin_password: String,
+    /// True once the admin account has been created on the homeserver. Gates BOTH the
+    /// registration token in tuwunel.toml and the create_admin call: while false (fresh
+    /// box) registration is token-open so the admin can be made; once true every
+    /// subsequent bring-up renders registration OFF and skips create_admin, so the box
+    /// isn't a standing (token-gated) registration server after setup. Persisted in
+    /// box.json (non-secret). (Security review #2, 2026-07-24.)
+    pub admin_created: bool,
 }
 
 impl Default for Inner {
@@ -119,6 +126,7 @@ impl Default for Inner {
             livekit_api_key: String::new(),
             livekit_api_secret: String::new(),
             admin_password: String::new(),
+            admin_created: false,
         }
     }
 }
@@ -184,6 +192,12 @@ struct PersistedBox {
     username: String,
     created: String,
     onion: Option<String>,
+    /// Whether the admin account exists yet (gates registration + create_admin). Defaults
+    /// false for box.json written before this field existed; such a box self-heals on its
+    /// next bring-up (create_admin sees M_USER_IN_USE, sets this true), then registration is
+    /// off from the following start on.
+    #[serde(default)]
+    admin_created: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -352,6 +366,7 @@ pub fn persist(app: &AppHandle) -> Result<(), String> {
                 username: inner.username.clone(),
                 created: inner.created.clone(),
                 onion: inner.onion.clone(),
+                admin_created: inner.admin_created,
             },
             PersistedSecrets {
                 phrase: inner.phrase.clone(),
@@ -421,6 +436,7 @@ pub fn load_persisted(app: &AppHandle) {
         inner.username = boxed.username;
         inner.created = boxed.created;
         inner.onion = boxed.onion;
+        inner.admin_created = boxed.admin_created;
         inner.phrase = secrets.phrase;
         inner.token = secrets.token;
         inner.turn_secret = secrets.turn_secret;

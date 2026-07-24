@@ -383,7 +383,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     // below, before tuwunel ever starts. No turn / registration block until we
     // have the onion + secrets.
     let known_onion = state::read(&app, |inner| inner.onion.clone());
-    let (turn_secret, join_token, username, livekit_api_key, livekit_api_secret) =
+    let (turn_secret, join_token, username, livekit_api_key, livekit_api_secret, admin_created) =
         state::read(&app, |inner| {
             (
                 inner.turn_secret.clone(),
@@ -391,8 +391,15 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
                 inner.username.clone(),
                 inner.livekit_api_key.clone(),
                 inner.livekit_api_secret.clone(),
+                inner.admin_created,
             )
         });
+    // Security review #2: only a NOT-yet-provisioned box (admin absent) renders the
+    // registration token + runs create_admin. Once the admin exists, tuwunel.toml is
+    // rendered with registration OFF (empty join_token) and create_admin is skipped, so the
+    // box stops being a standing token-gated registration server. Login is unaffected
+    // (allow_registration gates /register, not /login).
+    let reg_token: &str = if admin_created { "" } else { &join_token };
     config::render_tuwunel(&app, known_onion.as_deref().unwrap_or("placeholder.onion"), "", "", voice)?;
 
     let bins = bin_dir(&app)?;
@@ -423,7 +430,7 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     // Now we know the server_name; render for real (incl. the turn_uris block
     // when we have a secret, the well_known livekit_url when voice is enabled,
     // and token-gated registration) and start the homeserver.
-    config::render_tuwunel(&app, &onion, &turn_secret, &join_token, voice)?;
+    config::render_tuwunel(&app, &onion, &turn_secret, reg_token, voice)?;
     spawn_supervised(
         app.clone(),
         gen,
@@ -579,14 +586,21 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
         return Ok(());
     }
 
-    // First run: create the admin account now that the homeserver answers.
+    // First run only: create the admin account now that the homeserver answers.
     // tuwunel makes the first registered user an admin; the registration token
     // keeps the box from being open-reg. Without this the box would come up
-    // "running" with no account to log into.
+    // "running" with no account to log into. Once the admin exists we record it
+    // (admin_created) so every later bring-up skips this AND renders registration
+    // off (security review #2) — an already-provisioned box would otherwise hit
+    // M_FORBIDDEN here with registration disabled.
     if let Some(password) = admin_password {
-        if !username.is_empty() && !join_token.is_empty() {
+        if !admin_created && !username.is_empty() && !join_token.is_empty() {
             match crate::account::create_admin(&username, &password, &join_token).await {
-                Ok(()) => eprintln!("[pureprivacy] admin account @{username} ready"),
+                Ok(()) => {
+                    eprintln!("[pureprivacy] admin account @{username} ready");
+                    state::update(&app, |inner| inner.admin_created = true);
+                    let _ = state::persist(&app);
+                }
                 Err(e) => {
                     // [H5] Same teardown as the wait_for_http path: a create_admin
                     // failure must not leave the sidecar loops orphaned holding

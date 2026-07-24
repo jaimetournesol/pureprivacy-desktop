@@ -404,6 +404,12 @@ fn turnserver_conf_string(onion: &str, secret: &str) -> String {
     format!(
         "# PurePrivacy coturn — TCP-only relay over Tor (generated, do not edit).\n\
          listening-port={turn}\n\
+         # Bind the STUN/TURN control listener to loopback ONLY. tor maps onion:3478/5349\n\
+         # here, so nothing legitimate needs a non-loopback address — and without this coturn\n\
+         # listens on ALL interfaces (LAN + public IPv6), reachable off-Tor. Worse, coturn\n\
+         # returns `realm` (= the .onion) in its UNAUTHENTICATED 401 nonce, so a clearnet probe\n\
+         # would tie the box's real IP to its onion identity. (Security review, 2026-07-24.)\n\
+         listening-ip=127.0.0.1\n\
          min-port={min}\n\
          max-port={max}\n\
          # The relay address must be reachable by the CO-LOCATED SFU (loopback), NOT\n\
@@ -470,6 +476,12 @@ fn caddyfile_string(
     // Admin endpoint shifts too, so co-hosted boxes don't clobber each other's
     // running config through the shared default :2019 (see CADDY_ADMIN_PORT).
     let admin_port = CADDY_ADMIN_PORT + off();
+    // Every site binds 127.0.0.1 (below): the box is reached ONLY via tor, which maps
+    // each onion port to the loopback listener. Without an explicit bind Caddy listens
+    // on all interfaces (0.0.0.0 + public IPv6), which would (a) reach these services
+    // off-Tor over the LAN/internet and (b) LEAK the onion↔clearnet link — the fed cert's
+    // SAN is the .onion, so a clearnet TLS probe would tie the box's real IP to its
+    // hidden-service identity. bind 127.0.0.1 keeps it Tor-only. (Security review, 2026-07-24.)
     // Authenticated federation is gated by a loopback validator (fedauth.rs) via
     // forward_auth: it parses the X-Matrix Authorization header and exact-matches
     // the canonical `origin` param against the live pairings allowlist, returning
@@ -487,6 +499,7 @@ fn caddyfile_string(
          \tauto_https off\n\
          }}\n\
          https://:{caddy_port} {{\n\
+         \tbind 127.0.0.1\n\
          \ttls {cert} {key}\n\
          \t@open path /_matrix/key/* /_matrix/federation/v1/version /_matrix/federation/v1/openid/* /.well-known/*\n\
          \thandle @open {{\n\
@@ -512,6 +525,7 @@ fn caddyfile_string(
         let _ = write!(
             s,
             "https://:{wss_port} {{\n\
+             \tbind 127.0.0.1\n\
              \ttls {cert} {key}\n\
              \treverse_proxy http://127.0.0.1:{livekit}\n\
              }}\n",
@@ -528,10 +542,12 @@ fn caddyfile_string(
         let _ = write!(
             s,
             "https://:{jwt_port} {{\n\
+             \tbind 127.0.0.1\n\
              \ttls {cert} {key}\n\
              \treverse_proxy http://127.0.0.1:{lkjwt}\n\
              }}\n\
              https://:{hs_tls_port} {{\n\
+             \tbind 127.0.0.1\n\
              \ttls {cert} {key}\n\
              \treverse_proxy http://127.0.0.1:{hs}\n\
              }}\n",
@@ -780,6 +796,11 @@ mod tests {
         assert!(cf.contains(&format!("admin 127.0.0.1:{}", CADDY_ADMIN_PORT + off())));
         // The old bypassable matcher and its static 403 handler are gone.
         assert!(!cf.contains("@paired header_regexp"));
+        // Security review: the federation site binds loopback (tor-only), not all
+        // interfaces — else the fed cert (SAN = the .onion) would be served on the
+        // clearnet LAN/IPv6 and leak the onion<->IP link. Exactly one site w/o voice.
+        assert!(cf.contains("bind 127.0.0.1"));
+        assert_eq!(cf.matches("bind 127.0.0.1").count(), 1);
 
         // The Caddyfile no longer varies by peers — the validator reads pairings.json
         // live, so allowlist changes need no Caddy reload and deny-by-default (empty
@@ -798,6 +819,8 @@ mod tests {
         assert!(cf.contains(&format!("reverse_proxy http://127.0.0.1:{LIVEKIT_WS_PORT}")));
         // The wss site still keeps the federation site intact below it.
         assert!(cf.contains(&format!("https://:{FEDPROXY_PORT} {{")));
+        // All four voice-mode sites (fed + wss + lk-jwt + client-API) bind loopback.
+        assert_eq!(cf.matches("bind 127.0.0.1").count(), 4);
 
         // voice=false → no wss site at all.
         let without = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false);
@@ -913,6 +936,9 @@ mod tests {
         // relay address is loopback (reachable by the co-located SFU), not the onion.
         assert!(conf.contains("external-ip=127.0.0.1"));
         assert!(conf.contains("relay-ip=127.0.0.1"));
+        // Security review: the STUN/TURN control listener binds loopback only (tor-only),
+        // not all interfaces — else the realm (= the .onion) leaks to clearnet probes.
+        assert!(conf.contains("listening-ip=127.0.0.1"));
         assert!(conf.contains("static-auth-secret=s3cr3t"));
         assert!(conf.contains("no-udp"));
         // Co-located SFU is a loopback peer — must be permitted.
