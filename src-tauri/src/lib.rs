@@ -12,6 +12,7 @@ mod setup_server;
 mod state;
 mod supervisor;
 mod tray;
+mod updater;
 mod words;
 
 use tauri::Manager;
