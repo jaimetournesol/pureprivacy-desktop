@@ -1062,9 +1062,34 @@ async fn execute_update(
             eprintln!("[pureprivacy] update: installing {} (owner-approved)", m.version);
             let path = crate::updater::install_native(m, SOCKS_PORT + off()).await?;
             eprintln!("[pureprivacy] update: installed to {} — restarting", path.display());
-            // Bring the box down cleanly; the freshly-swapped binary runs on next start.
-            stop_lifecycle(app);
-            start_lifecycle(app, None);
+            // Swapping the file is NOT enough: the version is compiled into the RUNNING
+            // process, so without re-executing we'd keep running the old (possibly vulnerable)
+            // build while telling the owner they're patched. Restart the sidecars, then exec
+            // the freshly-installed binary and exit. Deferred a few seconds so the phone gets
+            // its result first — this process is about to disappear.
+            let app2 = app.clone();
+            let ver = m.version.clone();
+            tauri::async_runtime::spawn(async move {
+                sleep(Duration::from_secs(3)).await;
+                stop_lifecycle(&app2);
+                sleep(Duration::from_secs(1)).await;
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                match std::process::Command::new(&path).args(&args).spawn() {
+                    Ok(_) => {
+                        eprintln!("[pureprivacy] update: re-executing into {ver}");
+                        std::process::exit(0);
+                    }
+                    // Couldn't hand over — leave the box running the OLD build rather than
+                    // dead, and say so. pureprivacy.prev holds the previous binary either way.
+                    Err(e) => {
+                        eprintln!(
+                            "[pureprivacy] update: installed but couldn't restart into it ({e}) \
+                             — quit and reopen PurePrivacy to finish"
+                        );
+                        start_lifecycle(&app2, None);
+                    }
+                }
+            });
             Ok(format!("updated to {} — your box is restarting", m.version))
         }
     }
