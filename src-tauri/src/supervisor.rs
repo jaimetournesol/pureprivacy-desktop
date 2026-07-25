@@ -675,6 +675,13 @@ const COMMAND_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.command";
 const COMMAND_RESULT_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.command_result";
 /// Account-data the box WRITES an encrypted identity backup into (feature D); phone saves it.
 const BACKUP_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.backup";
+/// Account-data the box WRITES the update state into (feature H); PP Config renders it and the
+/// owner approves from there. Read-only for the phone — approval comes back as a guarded command.
+const UPDATE_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.update";
+/// Account-data the phone WRITES update preferences into (feature H): `{auto_check: bool}`.
+const UPDATE_PREFS_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.update_prefs";
+/// How often a box with automatic checks on looks for a new release (over Tor).
+const UPDATE_CHECK_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// [QW-rust c] A reqwest client with a request timeout, for the box's local
 /// homeserver calls (login / account-data / keepalive). Without it, a hung
@@ -946,7 +953,10 @@ fn validate_command(
         return None; // once-only: never run the same id twice
     }
     let action = cmd.get("action")?.as_str()?.to_string();
-    if !matches!(action.as_str(), "restart" | "reset" | "backup") {
+    if !matches!(
+        action.as_str(),
+        "restart" | "reset" | "backup" | "update" | "check_update"
+    ) {
         return None; // allowlist only (a cleared "done" command lands here → ignored)
     }
     // Freshness: the command must carry an expiry in the near future. This kills
@@ -957,6 +967,107 @@ fn validate_command(
         return None;
     }
     Some((id, action))
+}
+
+/// Run an update check and publish the result for PP Config (feature H).
+///
+/// Best-effort by design: a Tor hiccup or an unreachable release server leaves the previous
+/// state in place and just records the error — it must never take the box out of Running.
+/// The manifest is signature-verified inside `updater::check`, so anything we publish here is
+/// already trusted; an unsigned/tampered manifest surfaces as `available: false` + an error.
+/// Returns `(verified_manifest, error)`. BOTH being None means "checked fine, already current" —
+/// callers must not conflate a failed check with an up-to-date box (that would tell an owner
+/// they're patched when the check never completed).
+async fn run_update_check(
+    client: &reqwest::Client,
+    update_url: &str,
+    token: &str,
+    manual: bool,
+) -> (Option<crate::updater::Manifest>, Option<String>) {
+    let kind = crate::updater::InstallKind::detect();
+    let (found, error) = match crate::updater::check(SOCKS_PORT + off()).await {
+        Ok(m) => (m, None),
+        Err(e) => {
+            eprintln!("[pureprivacy] update check failed: {e}");
+            (None, Some(e))
+        }
+    };
+    let blob = match (&found, &error) {
+        (Some(m), _) => serde_json::json!({
+            "available": true,
+            "current": crate::updater::current_version(),
+            "latest": m.version,
+            "released": m.released,
+            "notes": m.notes,
+            "kind": kind.as_str(),
+            // Docker boxes can't self-install (no host Docker socket, by design) — hand the
+            // owner the exact command instead. Native boxes get a real in-place install.
+            "self_install": kind == crate::updater::InstallKind::Native
+                && m.native.contains_key(&crate::updater::native_target()),
+            "command": crate::updater::docker_command(m),
+            "checked_ts": now_ms(),
+            "manual": manual,
+        }),
+        (None, Some(e)) => serde_json::json!({
+            "available": false,
+            "current": crate::updater::current_version(),
+            "kind": kind.as_str(),
+            "error": e,
+            "checked_ts": now_ms(),
+            "manual": manual,
+        }),
+        (None, None) => serde_json::json!({
+            "available": false,
+            "current": crate::updater::current_version(),
+            "kind": kind.as_str(),
+            "checked_ts": now_ms(),
+            "manual": manual,
+        }),
+    };
+    let _ = client
+        .put(update_url)
+        .bearer_auth(token)
+        .json(&blob)
+        .send()
+        .await;
+    (found, error)
+}
+
+/// Install an approved update (feature H). `offered` is the manifest the box last verified and
+/// published; the phone's approval must name that exact version, so an approval can't be
+/// replayed against a different release. Returns Ok(message) for the phone.
+async fn execute_update(
+    app: &AppHandle,
+    offered: Option<&crate::updater::Manifest>,
+    target_version: &str,
+) -> Result<String, String> {
+    let m = offered.ok_or("no verified update is available — check for updates first")?;
+    if !target_version.is_empty() && target_version != m.version {
+        return Err(format!(
+            "approval was for {target_version} but the verified update is {} — ignoring",
+            m.version
+        ));
+    }
+    // Re-assert the downgrade guard at install time, not just at check time.
+    if !crate::updater::is_newer(&m.version, crate::updater::current_version()) {
+        return Err("that version isn't newer than what's running".into());
+    }
+    match crate::updater::InstallKind::detect() {
+        crate::updater::InstallKind::Docker => Err(format!(
+            "this box runs in Docker and can't update itself (that would need host Docker \
+             access). Run: {}",
+            crate::updater::docker_command(m)
+        )),
+        crate::updater::InstallKind::Native => {
+            eprintln!("[pureprivacy] update: installing {} (owner-approved)", m.version);
+            let path = crate::updater::install_native(m, SOCKS_PORT + off()).await?;
+            eprintln!("[pureprivacy] update: installed to {} — restarting", path.display());
+            // Bring the box down cleanly; the freshly-swapped binary runs on next start.
+            stop_lifecycle(app);
+            start_lifecycle(app, None);
+            Ok(format!("updated to {} — your box is restarting", m.version))
+        }
+    }
 }
 
 fn execute_command(app: &AppHandle, action: &str) {
@@ -1003,6 +1114,11 @@ async fn run_box_config(app: AppHandle, gen: u64) {
     let version = env!("CARGO_PKG_VERSION");
     let mut token: Option<String> = None;
     let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Feature H: the last signature-VERIFIED manifest we offered the phone. An `update`
+    // approval installs this and nothing else, so the phone can never point the box at an
+    // arbitrary URL — it only ever says "yes" to what the box already verified.
+    let mut offered: Option<crate::updater::Manifest> = None;
+    let mut last_update_check: u64 = 0;
 
     loop {
         if is_stale(&app, gen) {
@@ -1030,6 +1146,21 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                 .json(&status)
                 .send()
                 .await;
+
+            // 1b) Feature H: periodic update check, if the owner left automatic checks on
+            // (default). Manual-only boxes still check when the phone sends `check_update`.
+            // Runs over Tor; failures are recorded in the update blob, never fatal.
+            let auto_check = get_account_data(&client, &ad_url(UPDATE_PREFS_ACCOUNT_DATA_TYPE), &t)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|p| p.get("auto_check").and_then(|v| v.as_bool()))
+                .unwrap_or(true);
+            if auto_check && now_ms().saturating_sub(last_update_check) >= UPDATE_CHECK_INTERVAL_MS
+            {
+                last_update_check = now_ms();
+                offered = run_update_check(&client, &ad_url(UPDATE_ACCOUNT_DATA_TYPE), &t, false).await.0;
+            }
 
             // 2) Read + execute a guarded command.
             match get_account_data(&client, &ad_url(COMMAND_ACCOUNT_DATA_TYPE), &t).await {
@@ -1082,6 +1213,52 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .send()
                                 .await;
                             eprintln!("[pureprivacy] box config: identity backup requested (ok={ok})");
+                        } else if action == "check_update" || action == "update" {
+                            // Feature H. Clear the command first (once-only), then do the work
+                            // and report. Neither action is destructive to data, and `update`
+                            // only ever installs a manifest we already signature-verified.
+                            let _ = client
+                                .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({ "id": id, "action": "done" }))
+                                .send()
+                                .await;
+                            let (ok, msg) = if action == "check_update" {
+                                let (found, err) =
+                                    run_update_check(&client, &ad_url(UPDATE_ACCOUNT_DATA_TYPE), &t, true).await;
+                                offered = found;
+                                match (&offered, err) {
+                                    (Some(m), _) => (true, format!("update {} is available", m.version)),
+                                    // A check that couldn't complete must NOT read as "up to date"
+                                    // — that would tell the owner they're patched when we never
+                                    // actually looked.
+                                    (None, Some(e)) => (false, format!("couldn't check for updates: {e}")),
+                                    (None, None) => (true, "your box is up to date".to_string()),
+                                }
+                            } else {
+                                let target = cmd
+                                    .get("target_version")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                match execute_update(&app, offered.as_ref(), target).await {
+                                    Ok(m) => (true, m),
+                                    Err(e) => (false, e),
+                                }
+                            };
+                            let mut res =
+                                serde_json::json!({ "id": id, "ok": ok, "done_ts": now_ms() });
+                            if ok {
+                                res["message"] = serde_json::json!(msg);
+                            } else {
+                                res["error"] = serde_json::json!(msg);
+                            }
+                            let _ = client
+                                .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&res)
+                                .send()
+                                .await;
+                            eprintln!("[pureprivacy] box config: {action} (ok={ok}) — {msg}");
                         } else {
                             // Ack first (a destructive action tears the box down), then clear
                             // the command to a no-op so it can never re-fire, THEN execute.
