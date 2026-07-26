@@ -29,6 +29,10 @@ const MANIFEST_URL: &str =
 const SIGNATURE_URL: &str =
     "https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest/download/update.json.sig";
 
+/// Where a user goes when their platform has no self-installable build in the manifest (e.g. a
+/// Windows box: tuwunel ships linux-gnu only today, so non-Linux builds can't self-update).
+pub const RELEASES_PAGE: &str = "https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest";
+
 /// Refuse absurdly large downloads outright (manifest is ~1 KB; a box binary is tens of MB).
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
@@ -369,6 +373,26 @@ mod tests {
         let cmd = docker_command(&m);
         assert!(cmd.contains("docker pull jaimemelon/pureprivacy-box:0.1.3"));
         assert!(cmd.contains("pp-box update"));
+    }
+
+    /// A NATIVE box whose platform has no build in the release must not be treated as Docker.
+    /// Before this, `self_install == false` was read as "must be Docker", so a Windows box was
+    /// told "your box runs in Docker" and handed a `docker pull` command.
+    #[test]
+    fn native_box_without_a_build_for_its_platform_is_not_docker() {
+        // Manifest carrying ONLY a linux build (exactly what we publish today).
+        let m: Manifest = serde_json::from_str(
+            r#"{"version":"0.1.4","native":{"linux-x86_64":{"url":"u","sha256":"a","size":1}}}"#,
+        )
+        .unwrap();
+        // A platform not in the manifest (stand-in for windows-x86_64 / macos-aarch64).
+        assert!(!m.native.contains_key("windows-x86_64"));
+        // ...so self-install is impossible there, yet the box is still Native, and the owner
+        // must be pointed at a download — never at a docker command.
+        assert!(RELEASES_PAGE.starts_with("https://"));
+        // Our own platform IS covered, so a Linux box self-installs.
+        assert!(m.native.contains_key("linux-x86_64"));
+        assert_eq!(native_target(), format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
     }
 
     #[test]

@@ -81,6 +81,16 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      # Bundle the box's sidecars (tor / tuwunel / caddy / livekit / lk-jwt) INTO the
+      # installer, so a one-click install is a working box instead of a GUI shell that needs
+      # scripts/fetch-sidecars.sh run by hand. Linux only, and not for lack of trying: tuwunel
+      # (the homeserver) and lk-jwt publish linux-gnu builds ONLY — there is no upstream
+      # Windows/macOS binary to ship. The script exits 0 on those platforms, so their
+      # installers still build; they just aren't self-contained boxes yet.
+      - name: Stage bundled sidecars (Linux)
+        if: matrix.name == 'linux-x64'
+        run: ./scripts/stage-sidecars.sh
+
       # ------------------------------------------------------------------
       # TODO(G4/G5): Windows code signing via Azure Trusted Signing — needs
       # the Azure Trusted Signing account (G5). Uncomment this step AND the

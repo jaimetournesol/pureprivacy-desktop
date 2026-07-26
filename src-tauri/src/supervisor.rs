@@ -115,6 +115,16 @@ pub fn bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
             return Ok(PathBuf::from(dir));
         }
     }
+    // Installer builds (.deb/.rpm/.AppImage) ship the sidecars as a bundled resource, so a
+    // one-click install is a WORKING box with no manual fetch-sidecars.sh step. Only trust the
+    // bundle when the homeserver is actually in it — a partial/absent bundle falls through to
+    // the writable app-data dir, which is also where a dev/manual install puts them.
+    if let Ok(res) = app.path().resource_dir() {
+        let bundled = res.join("sidecars");
+        if bundled.join("tuwunel").is_file() {
+            return Ok(bundled);
+        }
+    }
     Ok(state::app_data_dir(app)?.join("bin"))
 }
 
@@ -993,21 +1003,35 @@ async fn run_update_check(
         }
     };
     let blob = match (&found, &error) {
-        (Some(m), _) => serde_json::json!({
-            "available": true,
-            "current": crate::updater::current_version(),
-            "latest": m.version,
-            "released": m.released,
-            "notes": m.notes,
-            "kind": kind.as_str(),
-            // Docker boxes can't self-install (no host Docker socket, by design) — hand the
-            // owner the exact command instead. Native boxes get a real in-place install.
-            "self_install": kind == crate::updater::InstallKind::Native
-                && m.native.contains_key(&crate::updater::native_target()),
-            "command": crate::updater::docker_command(m),
-            "checked_ts": now_ms(),
-            "manual": manual,
-        }),
+        (Some(m), _) => {
+            let is_docker = kind == crate::updater::InstallKind::Docker;
+            // Three distinct outcomes — conflating the last two would tell a Windows user their
+            // box "runs in Docker" and hand them a docker command:
+            //   * native AND this release has a build for our platform -> real self-install
+            //   * docker                                               -> host command to run
+            //   * native but NO build for our platform                 -> download it yourself
+            let self_install = !is_docker
+                && m.native.contains_key(&crate::updater::native_target());
+            serde_json::json!({
+                "available": true,
+                "current": crate::updater::current_version(),
+                "latest": m.version,
+                "released": m.released,
+                "notes": m.notes,
+                "kind": kind.as_str(),
+                "self_install": self_install,
+                // Only a Docker box gets a command; a native box must never be shown one.
+                "command": if is_docker { crate::updater::docker_command(m) } else { String::new() },
+                // Native box with no artifact for its platform (e.g. Windows/macOS, where the
+                // homeserver has no upstream build yet) — send them to the release page.
+                "download_url": if !is_docker && !self_install {
+                    crate::updater::RELEASES_PAGE
+                } else { "" },
+                "target": crate::updater::native_target(),
+                "checked_ts": now_ms(),
+                "manual": manual,
+            })
+        }
         (None, Some(e)) => serde_json::json!({
             "available": false,
             "current": crate::updater::current_version(),
@@ -1058,6 +1082,17 @@ async fn execute_update(
              access). Run: {}",
             crate::updater::docker_command(m)
         )),
+        // Native box with no build for this platform: say so plainly rather than failing deep
+        // inside install_native with a "no build for <target>" that reads like a bug.
+        crate::updater::InstallKind::Native
+            if !m.native.contains_key(&crate::updater::native_target()) =>
+        {
+            Err(format!(
+                "this release has no build for {} — download it from {}",
+                crate::updater::native_target(),
+                crate::updater::RELEASES_PAGE
+            ))
+        }
         crate::updater::InstallKind::Native => {
             eprintln!("[pureprivacy] update: installing {} (owner-approved)", m.version);
             let path = crate::updater::install_native(m, SOCKS_PORT + off()).await?;
