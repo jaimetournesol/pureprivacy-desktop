@@ -1020,13 +1020,25 @@ async fn run_update_check(
                 "notes": m.notes,
                 "kind": kind.as_str(),
                 "self_install": self_install,
-                // Only a Docker box gets a command; a native box must never be shown one.
-                "command": if is_docker { crate::updater::docker_command(m) } else { String::new() },
-                // Native box with no artifact for its platform (e.g. Windows/macOS, where the
-                // homeserver has no upstream build yet) — send them to the release page.
+                // A Docker box gets the update command for its image. A native box on an OS we
+                // don't build for gets the DOCKER MIGRATION command instead — we publish Linux
+                // installers only (tuwunel/lk-jwt are linux-gnu only), so pointing it at a
+                // download page would send the owner somewhere with nothing they can run.
+                "command": if is_docker {
+                    crate::updater::docker_command(m)
+                } else if !self_install {
+                    crate::updater::docker_migrate_command()
+                } else {
+                    String::new()
+                },
+                // Kept for a native box that simply lacks THIS release's artifact, so the phone
+                // can still offer a page; unsupported-OS boxes are diverted to Docker above.
                 "download_url": if !is_docker && !self_install {
                     crate::updater::RELEASES_PAGE
                 } else { "" },
+                // True when this box runs on an OS we don't publish a box for at all — the
+                // phone says "run your box under Docker instead", not "download an update".
+                "unsupported_os": !is_docker && !self_install,
                 "target": crate::updater::native_target(),
                 "checked_ts": now_ms(),
                 "manual": manual,
@@ -1087,10 +1099,12 @@ async fn execute_update(
         crate::updater::InstallKind::Native
             if !m.native.contains_key(&crate::updater::native_target()) =>
         {
+            // We build boxes for Linux only (the homeserver has no other target), so the
+            // honest answer here is "move to Docker", not "go find a download".
             Err(format!(
-                "this release has no build for {} — download it from {}",
+                "PurePrivacy doesn't publish a box for {} — run your box under Docker instead: {}",
                 crate::updater::native_target(),
-                crate::updater::RELEASES_PAGE
+                crate::updater::docker_migrate_command()
             ))
         }
         crate::updater::InstallKind::Native => {

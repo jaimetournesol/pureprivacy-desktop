@@ -26,15 +26,24 @@ Your box is your always-on private cloud. What it hosts today, and where it's go
 - **🚧 Files & personal agents (planned)** — the box is built to host apps; the
   phone becomes the launcher for all of them.
 
-## Run your box — two ways
+## Run your box — installer (Linux) or Docker (anywhere)
 
 The box is identical either way (same services, same `.onion`, same phone app) — pick the
 front door that fits where it runs.
 
-> **Docker is the easy path — no build needed:** just
-> `docker pull jaimemelon/pureprivacy-box` and set up in your browser (Option 2). The **GUI
-> desktop app** still builds from source for now (a signed installer + auto-updater are on the
-> roadmap) and needs the [dev toolchain](#dev-quickstart): Node 24 (via nvm) + pnpm.
+> ### Which one do I want?
+> | Your computer | Run your box with |
+> |---|---|
+> | **Linux** | the **installer** (`.deb` / `.rpm` / `.AppImage`) — everything included, Option 1 |
+> | **Windows** | **Docker** — Option 2 |
+> | **macOS** | **Docker** — Option 2 |
+> | server / NAS / Pi / VPS | **Docker** — Option 2 |
+>
+> **Why no Windows/macOS installer?** A box is the app *plus* its services, and the Matrix
+> homeserver it runs on (tuwunel) publishes **Linux builds only** — there is no Windows or
+> macOS binary to ship. Rather than hand you an installer that can't actually run a box, we
+> publish Linux installers and Docker. Docker on Windows/macOS gives you the identical box,
+> same `.onion`, same phone app.
 >
 > Get the **phone app** from the [pureprivacy-mobile releases](https://github.com/jaimetournesol/pureprivacy-mobile/releases/latest) (latest APK).
 
@@ -42,11 +51,26 @@ Set-up is the same one-page flow both ways: **choose a username + password on a 
 page → scan the QR with the phone app → the page closes and everything is managed from your
 phone.**
 
-### Option 1 · GUI — desktop app (on your own computer)
+### Option 1 · Linux installer — desktop app (Linux only)
 
 On first launch the box **opens a one-page setup in your default browser** (username +
 password → QR). Once your phone connects, the box runs in the background and is managed from
 the phone; the desktop window is just a status shell.
+
+**Install the package** from the [latest release](https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest)
+— it bundles everything the box runs on (Tor, the homeserver, the call services), so there is
+nothing else to fetch:
+
+```bash
+sudo apt install ./PurePrivacy_*_amd64.deb     # or: sudo dnf install ./PurePrivacy-*.rpm
+pureprivacy                                     # launch — setup opens in your browser
+```
+(Or run the `.AppImage` directly, no install needed.)
+
+Once it's running, keep it current from **PP Config → Software update** on your phone: your
+box checks for a signed update over Tor and installs it only when you approve.
+
+<details><summary>Build from source instead (developers)</summary>
 
 ```bash
 source ~/.nvm/nvm.sh
@@ -56,7 +80,9 @@ pnpm tauri build --no-bundle                # → src-tauri/target/release/purep
 ./src-tauri/target/release/pureprivacy      # launch — setup opens in your browser
 ```
 
-(For development with hot-reload, use `pnpm tauri dev` instead.)
+For hot-reload development use `pnpm tauri dev`. To build a *bundled* installer (sidecars
+included) run `./scripts/stage-sidecars.sh` first, then `pnpm tauri build`.
+</details>
 
 ### Option 2 · Docker — headless, CLI-managed (server / NAS / Raspberry Pi / VPS)
 

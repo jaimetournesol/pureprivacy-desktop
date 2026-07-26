@@ -29,9 +29,19 @@ const MANIFEST_URL: &str =
 const SIGNATURE_URL: &str =
     "https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest/download/update.json.sig";
 
-/// Where a user goes when their platform has no self-installable build in the manifest (e.g. a
-/// Windows box: tuwunel ships linux-gnu only today, so non-Linux builds can't self-update).
+/// Where a user goes when their platform has no self-installable build in the manifest.
 pub const RELEASES_PAGE: &str = "https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest";
+
+/// We publish installers for Linux only, because the box's essential sidecars (tuwunel, the
+/// homeserver, and lk-jwt) have linux-gnu builds ONLY. Anywhere else, the supported way to run
+/// a box is Docker — so an unsupported-platform box is diverted there rather than sent to a
+/// releases page that has nothing it can use.
+pub const DOCKER_IMAGE: &str = "jaimemelon/pureprivacy-box:latest";
+
+/// The command that moves a box onto the supported (Docker) path on an OS we don't build for.
+pub fn docker_migrate_command() -> String {
+    format!("docker pull {DOCKER_IMAGE}")
+}
 
 /// Refuse absurdly large downloads outright (manifest is ~1 KB; a box binary is tens of MB).
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
