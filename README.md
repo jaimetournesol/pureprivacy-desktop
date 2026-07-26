@@ -9,9 +9,10 @@ take them back.** You run your own private server, and it hosts your apps. Your 
 lives with you. Everything is end-to-end encrypted and travels **only over Tor** —
 no central platform, no clearnet, no ads, no algorithm, no data broker in the path.
 
-**This desktop app *is* the box.** It runs quietly on your computer (or a Raspberry
-Pi) and keeps your personal server alive — reachable only at its own `.onion`, and
-only by the people you've paired with.
+**This repo *is* the box.** It runs quietly on your computer (or a Raspberry Pi) and
+keeps your personal server alive — reachable only at its own `.onion`, and only by the
+people you've paired with. Run it with **Docker on any OS** (Windows, macOS, Linux,
+NAS, VPS), or as a native desktop app on Linux — [see below](#run-your-box).
 
 ## A platform, not just a messenger
 
@@ -26,32 +27,66 @@ Your box is your always-on private cloud. What it hosts today, and where it's go
 - **🚧 Files & personal agents (planned)** — the box is built to host apps; the
   phone becomes the launcher for all of them.
 
-## Run your box — installer (Linux) or Docker (anywhere)
+## Run your box
 
-The box is identical either way (same services, same `.onion`, same phone app) — pick the
-front door that fits where it runs.
+### 🐳 Docker is the universal install — it works on every operating system
 
-> ### Which one do I want?
-> | Your computer | Run your box with |
+**Windows, macOS, Linux, and any server / NAS / Raspberry Pi / VPS.** One image, one command,
+the same box everywhere. If you're not sure what to use, use Docker.
+
+On **Linux** you can *also* install a native desktop app if you prefer one — that's the only
+extra option, and it's optional.
+
+> | Your computer | How to run your box |
 > |---|---|
-> | **Linux** | the **installer** (`.deb` / `.rpm` / `.AppImage`) — everything included, Option 1 |
-> | **Windows** | **Docker** — Option 2 |
-> | **macOS** | **Docker** — Option 2 |
-> | server / NAS / Pi / VPS | **Docker** — Option 2 |
+> | **Windows** | 🐳 **Docker** |
+> | **macOS** | 🐳 **Docker** |
+> | **Linux** | 🐳 **Docker** — or the native [Linux installer](option-2-linux-installer-optional-native-desktop-app) if you'd rather have a desktop app |
+> | **server / NAS / Pi / VPS** | 🐳 **Docker** |
 >
-> **Why no Windows/macOS installer?** A box is the app *plus* its services, and the Matrix
-> homeserver it runs on (tuwunel) publishes **Linux builds only** — there is no Windows or
-> macOS binary to ship. Rather than hand you an installer that can't actually run a box, we
-> publish Linux installers and Docker. Docker on Windows/macOS gives you the identical box,
-> same `.onion`, same phone app.
->
-> Get the **phone app** from the [pureprivacy-mobile releases](https://github.com/jaimetournesol/pureprivacy-mobile/releases/latest) (latest APK).
+> **Why is Docker the universal one?** A box is the app *plus* the services it runs on, and
+> the Matrix homeserver it uses (tuwunel) publishes **Linux builds only**. Docker carries a
+> complete Linux box wherever it runs, so it behaves identically on every OS — which is why
+> there's no `.exe` or `.dmg`: an installer there could only ship the window, not the box.
 
+The box is identical whichever route you take — same services, same `.onion`, same phone app.
 Set-up is the same one-page flow both ways: **choose a username + password on a local web
 page → scan the QR with the phone app → the page closes and everything is managed from your
 phone.**
 
-### Option 1 · Linux installer — desktop app (Linux only)
+> Get the **phone app** from the [pureprivacy-mobile releases](https://github.com/jaimetournesol/pureprivacy-mobile/releases/latest) (latest APK) — it's the same app wherever your box runs.
+
+### Option 1 · 🐳 Docker — works on every OS (recommended)
+
+Runs anywhere Docker does — **Windows, macOS, Linux, servers, NAS, Raspberry Pi, VPS**. No
+desktop needed: the box is reached only over its `.onion`, set up from a browser and managed
+from the phone.
+
+**Pull the published image** ([`jaimemelon/pureprivacy-box`](https://hub.docker.com/r/jaimemelon/pureprivacy-box)):
+
+```bash
+docker pull jaimemelon/pureprivacy-box:latest
+MYVOL=pp-data-$(openssl rand -hex 4)   # your box's data volume — note it down and always reuse it
+docker run -d --name pureprivacy-box --restart unless-stopped -v "$MYVOL":/data \
+  -p 127.0.0.1:8470:8470 -e PUREPRIVACY_SETUP_BIND=0.0.0.0 jaimemelon/pureprivacy-box:latest
+# open http://127.0.0.1:8470/ → username + password → scan the QR in the phone app
+```
+
+That volume holds your box's identity (the onion key) — **keep the name and back it up**; a
+different name means a different, empty box.
+
+Or build + manage it with the **`pp-box`** helper (`cd docker && ./pp-box build && ./pp-box init && ./pp-box up`).
+
+Then `status` / `logs` / `backup` / `restore` / `update` as needed. **Full guide:
+[docker/README.md](docker/README.md).**
+
+> **Windows / macOS:** install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+> first, then run exactly the commands above — nothing else differs.
+
+### Option 2 · Linux installer — optional native desktop app
+
+**Linux only, and entirely optional** — Docker (Option 1) runs the same box on Linux too.
+Choose this if you want a normal desktop application rather than a container.
 
 On first launch the box **opens a one-page setup in your default browser** (username +
 password → QR). Once your phone connects, the box runs in the background and is managed from
@@ -83,27 +118,6 @@ pnpm tauri build --no-bundle                # → src-tauri/target/release/purep
 For hot-reload development use `pnpm tauri dev`. To build a *bundled* installer (sidecars
 included) run `./scripts/stage-sidecars.sh` first, then `pnpm tauri build`.
 </details>
-
-### Option 2 · Docker — headless, CLI-managed (server / NAS / Raspberry Pi / VPS)
-
-No desktop needed — reached only over its `.onion`, set up from a browser and managed from
-the phone. **Pull the published image** ([`jaimemelon/pureprivacy-box`](https://hub.docker.com/r/jaimemelon/pureprivacy-box)):
-
-```bash
-docker pull jaimemelon/pureprivacy-box:latest
-MYVOL=pp-data-$(openssl rand -hex 4)   # your box's data volume — note it down and always reuse it
-docker run -d --name pureprivacy-box --restart unless-stopped -v "$MYVOL":/data \
-  -p 127.0.0.1:8470:8470 -e PUREPRIVACY_SETUP_BIND=0.0.0.0 jaimemelon/pureprivacy-box:latest
-# open http://127.0.0.1:8470/ → username + password → scan the QR in the phone app
-```
-
-That volume holds your box's identity (the onion key) — **keep the name and back it up**; a
-different name means a different, empty box.
-
-Or build + manage it with the **`pp-box`** helper (`cd docker && ./pp-box build && ./pp-box init && ./pp-box up`).
-
-Then `status` / `logs` / `backup` / `restore` / `update` as needed. **Full guide:
-[docker/README.md](docker/README.md).**
 
 ## What the desktop app does
 
