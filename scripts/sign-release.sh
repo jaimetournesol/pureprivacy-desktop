@@ -80,8 +80,24 @@ else
 fi
 rm -f /tmp/pp-verify.sig
 
+# --- post-quantum half (feature K) ------------------------------------------------------
+# Boxes REQUIRE both signatures, so a release without this one simply won't install. Fail
+# loudly here rather than publishing something every box will refuse.
+PQKEY="${PP_UPDATE_PQ_KEY:-$HOME/Tournesol/_special-project/pureprivacy/pp-update-pq.key}"
+PQPUB="${PP_UPDATE_PQ_PUB:-$HOME/Tournesol/_special-project/pureprivacy/pp-update-pq.pub.hex}"
+PPSIGN="${PP_SIGN_BIN:-$(dirname "$0")/../src-tauri/target/release/pp-sign}"
+[ -x "$PPSIGN" ] || PPSIGN="$(dirname "$0")/../src-tauri/target/debug/pp-sign"
+[ -f "$PQKEY" ] || { echo "post-quantum signing key not found: $PQKEY" >&2; exit 2; }
+[ -x "$PPSIGN" ] || { echo "pp-sign not built (cargo build --bin pp-sign)" >&2; exit 2; }
+"$PPSIGN" sign "$PQKEY" "$OUT/update.json" > "$OUT/update.json.pqsig"
+if "$PPSIGN" verify "$PQPUB" "$OUT/update.json" "$OUT/update.json.pqsig" >/dev/null 2>&1; then
+  echo "✅ post-quantum signature verifies (SLH-DSA-SHA2-128s)"
+else
+  echo "❌ post-quantum signature FAILED to verify — do not publish" >&2; exit 1
+fi
+
 echo
-echo "Wrote $OUT/update.json + $OUT/update.json.sig"
+echo "Wrote $OUT/update.json + $OUT/update.json.sig + $OUT/update.json.pqsig"
 echo "Publish with:"
 echo "  gh release create v$VERSION --repo $REPO --title \"PurePrivacy box $VERSION\" \\"
-echo "    \"$BINARY\" \"$OUT/update.json\" \"$OUT/update.json.sig\""
+echo "    \"$BINARY\" \"$OUT/update.json\" \"$OUT/update.json.sig\" \"$OUT/update.json.pqsig\""

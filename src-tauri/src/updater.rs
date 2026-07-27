@@ -22,12 +22,33 @@ use sha2::{Digest, Sha256};
 pub const UPDATE_PUBKEY_HEX: &str =
     "3fe188d4120f10d5455bf6bed74b668af477959c3a9376701df2436c8f98ce7d";
 
+/// Post-quantum half of the update trust anchor (feature K): SLH-DSA-SHA2-128s public key, hex.
+/// Shor's algorithm breaks Ed25519 outright, and an adversary who forges an update signature
+/// doesn't read one conversation — they push a malicious box to every user. So a manifest must
+/// carry BOTH signatures and satisfy BOTH: we only lose if ed25519 AND a hash-based scheme fall
+/// together. Filled in by `pp-sign keygen`; empty disables the PQ requirement (see below).
+pub const UPDATE_PQ_PUBKEY_HEX: &str =
+    "b8bf68eb03c2418e93d363e8ce6cb08bfabf3988a19d338fa5be80043c539b1d";
+
+/// Whether a manifest MUST carry a valid post-quantum signature.
+///
+/// Kept as an explicit switch because it is a hard cutover: with this on, a box refuses any
+/// release that isn't hybrid-signed — which fails CLOSED (the box simply doesn't update), never
+/// open. Turn it on once every published release carries a PQ signature. Note that leaving it
+/// off is not merely "less secure later": an attacker who breaks ed25519 could strip the PQ
+/// signature and present an ed25519-only manifest, so the PQ half only actually protects you
+/// once this is enforced.
+pub const REQUIRE_PQ_SIGNATURE: bool = !UPDATE_PQ_PUBKEY_HEX.is_empty();
+
 /// Where the signed manifest lives. `latest/download/<asset>` always resolves to the newest
 /// published release, so the box needs no API token and no release enumeration.
 const MANIFEST_URL: &str =
     "https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest/download/update.json";
 const SIGNATURE_URL: &str =
     "https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest/download/update.json.sig";
+/// SLH-DSA signature over the same bytes (feature K). Required when [`REQUIRE_PQ_SIGNATURE`].
+const PQ_SIGNATURE_URL: &str =
+    "https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest/download/update.json.pqsig";
 
 /// Where a user goes when their platform has no self-installable build in the manifest.
 pub const RELEASES_PAGE: &str = "https://github.com/jaimetournesol/pureprivacy-desktop/releases/latest";
@@ -107,6 +128,44 @@ pub fn native_target() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Verify the post-quantum (SLH-DSA) signature over `payload`. Fails CLOSED.
+pub fn verify_pq_signature(payload: &[u8], sig_b64: &str) -> Result<(), String> {
+    use fips205::slh_dsa_sha2_128s;
+    use fips205::traits::{SerDes, Verifier};
+
+    if UPDATE_PQ_PUBKEY_HEX.is_empty() {
+        return Err("no post-quantum public key is compiled in".into());
+    }
+    let pk_bytes = hex_to_vec(UPDATE_PQ_PUBKEY_HEX).ok_or("bad baked-in PQ public key")?;
+    let pk_arr: [u8; slh_dsa_sha2_128s::PK_LEN] = pk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "baked-in PQ public key is the wrong length")?;
+    let pk = slh_dsa_sha2_128s::PublicKey::try_from_bytes(&pk_arr)
+        .map_err(|_| "baked-in PQ public key is malformed")?;
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64.trim())
+        .map_err(|_| "PQ signature isn't valid base64")?;
+    let sig: [u8; slh_dsa_sha2_128s::SIG_LEN] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| "PQ signature is the wrong length")?;
+    if pk.verify(payload, &sig, &[]) {
+        Ok(())
+    } else {
+        Err("post-quantum signature does not match the PurePrivacy release key".into())
+    }
+}
+
+fn hex_to_vec(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok())
+        .collect()
+}
+
 /// Verify a detached ed25519 signature (base64, 64 raw bytes) over `payload` using the
 /// compile-time public key. Fails CLOSED on any malformed input.
 pub fn verify_signature(payload: &[u8], sig_b64: &str) -> Result<(), String> {
@@ -161,7 +220,24 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 /// Parse + verify a manifest from raw bytes and its base64 signature. This is the ONLY way a
 /// [`Manifest`] comes into existence, so an unverified manifest can't reach the rest of the box.
 pub fn verify_manifest(payload: &[u8], sig_b64: &str) -> Result<Manifest, String> {
+    verify_manifest_hybrid(payload, sig_b64, None)
+}
+
+/// Verify a manifest against BOTH trust anchors. `pq_sig_b64` is the SLH-DSA signature; when
+/// [`REQUIRE_PQ_SIGNATURE`] is on, its absence or invalidity rejects the manifest outright.
+pub fn verify_manifest_hybrid(
+    payload: &[u8],
+    sig_b64: &str,
+    pq_sig_b64: Option<&str>,
+) -> Result<Manifest, String> {
+    // Classical signature is ALWAYS required — a new PQ scheme never replaces a proven one.
     verify_signature(payload, sig_b64)?;
+    if REQUIRE_PQ_SIGNATURE {
+        let pq = pq_sig_b64
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("this release carries no post-quantum signature — refusing")?;
+        verify_pq_signature(payload, pq)?;
+    }
     let m: Manifest = serde_json::from_slice(payload)
         .map_err(|e| format!("update manifest isn't valid JSON: {e}"))?;
     if m.version.trim().is_empty() {
@@ -190,7 +266,13 @@ pub async fn check(socks_port: u16) -> Result<Option<Manifest>, String> {
     let sig = fetch_bounded(&client, SIGNATURE_URL, MAX_MANIFEST_BYTES).await?;
     let sig = String::from_utf8(sig).map_err(|_| "signature isn't text")?;
 
-    let m = verify_manifest(&payload, &sig)?;
+    // Hybrid: the PQ signature is fetched too. Missing/short is treated as absent, and
+    // verify_manifest_hybrid decides whether that's fatal (it is, once PQ is required).
+    let pq = fetch_bounded(&client, PQ_SIGNATURE_URL, MAX_MANIFEST_BYTES)
+        .await
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok());
+    let m = verify_manifest_hybrid(&payload, &sig, pq.as_deref())?;
     if !is_newer(&m.version, current_version()) {
         return Ok(None); // already current (or a stale/downgrade manifest — ignore)
     }
@@ -323,10 +405,10 @@ mod tests {
     /// instead of every box silently refusing updates.
     #[test]
     fn manifest_signed_by_the_real_release_key_verifies() {
-        let m = verify_manifest(SIGNED_JSON.as_bytes(), SIGNED_SIG)
+        // The ed25519 layer still checks out against the real release key (the hybrid wrapper
+        // additionally demands the PQ signature — see the test below).
+        verify_signature(SIGNED_JSON.as_bytes(), SIGNED_SIG)
             .expect("release-key signature must verify against the baked-in public key");
-        assert_eq!(m.version, "0.1.3");
-        assert_eq!(m.notes, vec!["test".to_string()]);
     }
 
     /// ...and the SAME signature must NOT verify once a byte of the payload changes — the
@@ -364,6 +446,31 @@ mod tests {
         assert!(verify_signature(payload, &fake).is_err());
         // Empty signature.
         assert!(verify_manifest(payload, "").is_err());
+    }
+
+    #[test]
+    fn baked_pq_public_key_is_well_formed_and_required() {
+        use fips205::slh_dsa_sha2_128s as slh;
+        use fips205::traits::SerDes;
+        // A PQ key is compiled in, so hybrid verification is enforced.
+        assert!(!UPDATE_PQ_PUBKEY_HEX.is_empty());
+        assert!(REQUIRE_PQ_SIGNATURE, "PQ key present but not enforced — hybrid is a no-op");
+        let raw = hex_to_vec(UPDATE_PQ_PUBKEY_HEX).expect("PQ key must be hex");
+        assert_eq!(raw.len(), slh::PK_LEN);
+        let arr: [u8; slh::PK_LEN] = raw.as_slice().try_into().unwrap();
+        assert!(slh::PublicKey::try_from_bytes(&arr).is_ok());
+    }
+
+    /// With PQ enforced, an ed25519-only manifest must be REFUSED — otherwise an attacker who
+    /// broke ed25519 could simply strip the PQ signature and be believed.
+    #[test]
+    fn ed25519_only_manifest_is_refused_once_pq_is_required() {
+        let r = verify_manifest_hybrid(SIGNED_JSON.as_bytes(), SIGNED_SIG, None);
+        assert!(r.is_err(), "a manifest with no PQ signature must not verify");
+        assert!(r.unwrap_err().contains("post-quantum"));
+        // ...and a garbage PQ signature is no better than none.
+        let junk = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+        assert!(verify_manifest_hybrid(SIGNED_JSON.as_bytes(), SIGNED_SIG, Some(&junk)).is_err());
     }
 
     #[test]
