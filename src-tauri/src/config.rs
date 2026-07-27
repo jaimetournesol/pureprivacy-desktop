@@ -74,6 +74,16 @@ pub const CADDY_JWT_PORT: u16 = 8445;
 pub const HS_TLS_ONION_PORT: u16 = 8009;
 /// Caddy loopback listener for the TLS client-API site; tor maps 8009 here.
 pub const CADDY_HS_PORT: u16 = 8455;
+/// Onion port serving the **self-hosted Element Call** web app (feature J). Previously the
+/// phone fetched this bundle from call.element.io — a third party on the CLEARNET — which
+/// contradicted "all connections are to your own box, over Tor". Serving it from the box makes
+/// calls genuinely box-only. TLS for the same reason as 8443/8009: the WebView reaches the box
+/// through Tor's HTTP CONNECT tunnel, which only carries TLS.
+pub const EC_TLS_ONION_PORT: u16 = 8444;
+/// Caddy's loopback listener for the Element Call site; tor maps 8444 here.
+pub const CADDY_EC_PORT: u16 = 8446;
+/// Directory (inside the box's bin dir) holding the unpacked Element Call bundle.
+pub const EC_DIR_NAME: &str = "element-call";
 /// Loopback federation-allowlist validator (review item W3-T1). Caddy
 /// `forward_auth`s authenticated federation requests here; it parses the
 /// X-Matrix Authorization origin and 200/403s it against the live pairings
@@ -236,7 +246,8 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, vo
              HiddenServicePort {media} 127.0.0.1:{media}\n\
              HiddenServicePort {jwt} 127.0.0.1:{jwt_loop}\n\
              HiddenServicePort {jwt_tls} 127.0.0.1:{caddy_jwt}\n\
-             HiddenServicePort {hs_tls} 127.0.0.1:{caddy_hs}",
+             HiddenServicePort {hs_tls} 127.0.0.1:{caddy_hs}\n\
+             HiddenServicePort {ec_tls} 127.0.0.1:{caddy_ec}",
             wss = LIVEKIT_WSS_ONION_PORT,
             caddy_wss = CADDY_WSS_PORT + o,
             media = LIVEKIT_TCP_PORT + o,
@@ -246,6 +257,8 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, vo
             caddy_jwt = CADDY_JWT_PORT + o,
             hs_tls = HS_TLS_ONION_PORT,
             caddy_hs = CADDY_HS_PORT + o,
+            ec_tls = EC_TLS_ONION_PORT,
+            caddy_ec = CADDY_EC_PORT + o,
         );
     }
     torrc
@@ -468,6 +481,8 @@ fn caddyfile_string(
     key: &str,
     _peers: &[String],
     voice: bool,
+    // Path to the unpacked Element Call bundle, if we have one to serve.
+    ec_root: Option<&str>,
 ) -> String {
     // Loopback listeners shift per instance; onion ports (8448/7443) map to these.
     let caddy_port = caddy_port + off();
@@ -558,6 +573,24 @@ fn caddyfile_string(
             lkjwt = LKJWT_PORT + off(),
             hs = HOMESERVER_PORT + off(),
         );
+        // Self-hosted Element Call (feature J): serve the static bundle off the box so a call
+        // pulls NOTHING from the clearnet. Only published when the bundle is actually present,
+        // so a box without it still starts (it just can't do group calls).
+        if let Some(root) = ec_root {
+            let _ = write!(
+                s,
+                "https://:{ec_port} {{\n\
+                 \tbind 127.0.0.1\n\
+                 \ttls {cert} {key}\n\
+                 \troot * {root}\n\
+                 \tfile_server\n\
+                 }}\n",
+                ec_port = CADDY_EC_PORT + off(),
+                cert = cert,
+                key = key,
+                root = root,
+            );
+        }
     }
     s
 }
@@ -565,6 +598,12 @@ fn caddyfile_string(
 /// Render the fed-proxy Caddyfile from the current pairings.
 pub fn render_caddyfile(app: &AppHandle, peers: &[String], voice: bool) -> Result<(), String> {
     let p = paths(app)?;
+    // Serve Element Call from the box when the bundle is present (installer-bundled or fetched).
+    let ec = crate::supervisor::bin_dir(app).ok().map(|d| d.join(EC_DIR_NAME));
+    let ec_root = ec
+        .as_ref()
+        .filter(|d| d.join("index.html").is_file())
+        .map(|d| d.display().to_string());
     let conf = caddyfile_string(
         FEDPROXY_PORT,
         HOMESERVER_PORT,
@@ -572,6 +611,7 @@ pub fn render_caddyfile(app: &AppHandle, peers: &[String], voice: bool) -> Resul
         &p.fed_key.display().to_string(),
         peers,
         voice,
+        ec_root.as_deref(),
     );
     std::fs::write(&p.caddyfile, conf).map_err(|e| format!("couldn't write Caddyfile: {e}"))
 }
@@ -780,7 +820,7 @@ mod tests {
 
     #[test]
     fn caddyfile_gates_federation_via_forward_auth() {
-        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false);
+        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false, None);
         // Open (unauthenticated) federation paths bypass the allowlist.
         assert!(cf.contains("@open path /_matrix/key/*"));
         // openid MUST be open — lk-jwt's cross-box validation hits it with no X-Matrix
@@ -806,15 +846,43 @@ mod tests {
         // live, so allowlist changes need no Caddy reload and deny-by-default (empty
         // allowlist) lives in fedauth.rs. Same config with or without peers.
         let with_peers =
-            caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &["aaa.onion".into()], false);
+            caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &["aaa.onion".into()], false, None);
         assert_eq!(cf, with_peers);
+    }
+
+    /// Feature J: the box serves Element Call itself, so a call makes no clearnet request.
+    /// If this regresses, the phone silently goes back to fetching the bundle from
+    /// call.element.io — contradicting the privacy policy — so it is pinned here.
+    #[test]
+    fn caddyfile_serves_element_call_from_the_box_when_the_bundle_is_present() {
+        let with = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], true, Some("/opt/ec"));
+        assert!(with.contains(&format!("https://:{} {{", CADDY_EC_PORT + off())));
+        assert!(with.contains("root * /opt/ec"));
+        assert!(with.contains("file_server"));
+        // Loopback-only like every other site (security review): tor reaches it, the LAN can't.
+        assert_eq!(with.matches("bind 127.0.0.1").count(), 5);
+
+        // No bundle -> no site, and the box still starts (it just can't do group calls).
+        let without = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], true, None);
+        assert!(!without.contains("file_server"));
+        assert!(!without.contains(&format!("https://:{} {{", CADDY_EC_PORT + off())));
+    }
+
+    #[test]
+    fn torrc_publishes_the_element_call_onion_port_with_voice() {
+        let with = torrc_string(9150, "/d", "/hs", 8118, 8449, true);
+        assert!(with.contains(&format!(
+            "HiddenServicePort {EC_TLS_ONION_PORT} 127.0.0.1:{}", CADDY_EC_PORT
+        )));
+        let without = torrc_string(9150, "/d", "/hs", 8118, 8449, false);
+        assert!(!without.contains(&format!("HiddenServicePort {EC_TLS_ONION_PORT}")));
     }
 
     #[test]
     fn caddyfile_adds_wss_sfu_site_only_when_voice_enabled() {
         // voice=true appends a SECOND site on :7444 reverse-proxying LiveKit's
         // signaling WS (:7880). It is NOT allowlist-gated (JWT-authed).
-        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], true);
+        let cf = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], true, None);
         assert!(cf.contains(&format!("https://:{CADDY_WSS_PORT} {{")));
         assert!(cf.contains(&format!("reverse_proxy http://127.0.0.1:{LIVEKIT_WS_PORT}")));
         // The wss site still keeps the federation site intact below it.
@@ -823,7 +891,7 @@ mod tests {
         assert_eq!(cf.matches("bind 127.0.0.1").count(), 4);
 
         // voice=false → no wss site at all.
-        let without = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false);
+        let without = caddyfile_string(8449, 8118, "/c.pem", "/k.pem", &[], false, None);
         assert!(!without.contains(&format!("https://:{CADDY_WSS_PORT}")));
         assert!(!without.contains(&format!("reverse_proxy http://127.0.0.1:{LIVEKIT_WS_PORT}")));
     }

@@ -214,6 +214,13 @@ the Caddyfile, and hot-reloads Caddy — so the two boxes start federating with 
 manual step. (Pair codes can also be exchanged box-to-box directly; both paths land
 in `pairings.json` → `render_caddyfile`.)
 
+## Licence
+
+PurePrivacy is **AGPL-3.0-or-later** — see [`LICENSE`](LICENSE). The programs a box bundles and
+runs (Element Call, tuwunel, Tor, LiveKit, Caddy, coturn, lk-jwt-service) keep their own
+licences, with a written source offer for the AGPL ones, in
+[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).
+
 ## Docs
 
 - UX design: [`../docs/redesign/2026-06-ux-design.md`](../docs/redesign/2026-06-ux-design.md)

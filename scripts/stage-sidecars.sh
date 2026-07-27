@@ -30,6 +30,33 @@ esac
 # Reuse the proven fetcher, pointed at our staging dir instead of the user's runtime bin dir.
 PUREPRIVACY_BIN_DIR="$OUT" "$HERE/scripts/fetch-sidecars.sh" "$@"
 
+# Self-hosted Element Call (feature J). Serving this from the box is what makes a call
+# box-only; without it the phone would have to fetch the bundle from call.element.io — a
+# third party on the clearnet, which contradicts our own privacy policy.
+EC_VER="${EC_VER:-0.22.0}"
+EC_DIR="$OUT/element-call"
+if [ ! -f "$EC_DIR/index.html" ]; then
+  echo "==> Fetching Element Call $EC_VER (AGPL-3.0) to serve from the box"
+  tmp="$(mktemp -d)"
+  if curl -fsSL -o "$tmp/ec.tar.gz" \
+      "https://github.com/element-hq/element-call/releases/download/v$EC_VER/element-call-$EC_VER.tar.gz"; then
+    mkdir -p "$EC_DIR"
+    tar -xzf "$tmp/ec.tar.gz" -C "$EC_DIR" --strip-components=1 2>/dev/null \
+      || tar -xzf "$tmp/ec.tar.gz" -C "$EC_DIR"
+    [ -f "$EC_DIR/index.html" ] && echo " ok  element-call $EC_VER staged" \
+      || echo "warn: element-call extracted but no index.html — group calls will fall back"
+  else
+    echo "warn: couldn't fetch element-call — group calls will have no bundle to serve"
+  fi
+  rm -rf "$tmp"
+fi
+
+# Ship the licence terms WITH the binaries they cover — required by Apache-2.0 §4 and BSD,
+# and by AGPL for Element Call / lk-jwt (whose source offer lives in THIRD-PARTY-LICENSES.md).
+cp -f "$HERE/THIRD-PARTY-LICENSES.md" "$OUT/" 2>/dev/null || true
+mkdir -p "$OUT/licenses" && cp -f "$HERE/licenses/"*.txt "$OUT/licenses/" 2>/dev/null || true
+cp -f "$HERE/LICENSE" "$OUT/LICENSE-PurePrivacy.txt" 2>/dev/null || true
+
 echo
 echo "staged into $OUT:"
 missing=0
