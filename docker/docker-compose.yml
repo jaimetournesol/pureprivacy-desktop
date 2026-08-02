@@ -26,6 +26,11 @@ services:
       - "127.0.0.1:8470:8470"
     volumes:
       - pp-data:/data
+      # Credential handoff. Mounted on BOTH sides because the box is the writer (it holds
+      # the registration token) and the agent is the reader. Harmless when agents aren't
+      # installed — it's just an empty dir; the box detects the add-on by probing the
+      # agent's loopback port, not by this mount existing.
+      - pp-agent-handoff:/handoff
 
   # ── Agents (optional add-on) ────────────────────────────────────────────────────────
   # A SEPARATE image, behind a compose profile, so a plain box stays a plain box: without

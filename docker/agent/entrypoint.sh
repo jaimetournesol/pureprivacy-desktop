@@ -50,14 +50,39 @@ cd /opt/hermes/webui
 /opt/hermes/venv/bin/python bootstrap.py --foreground &
 pids+=($!)
 
-# The messaging gateway is what makes agents reachable as Matrix users. It stays OFF until
-# at least one profile has Matrix credentials, otherwise it just fails in a loop on a fresh
-# box. The box turns it on once it has provisioned an agent account.
-if [ "${PP_AGENT_GATEWAY:-0}" = "1" ]; then
-  echo "[agent] starting messaging gateway"
-  /opt/hermes/venv/bin/hermes gateway start &
-  pids+=($!)
-fi
+# ── Gateway, gated on the box handing us credentials ────────────────────────────────────
+# The gateway is what makes an agent reachable as a Matrix user. It stays off until the box
+# has provisioned an account and written /handoff/matrix.env — starting it before that just
+# crash-loops on a fresh install. Setup happens from the phone, possibly long after this
+# container started, so watch for the file rather than checking once.
+gateway_watch() {
+  local seen=""
+  while true; do
+    if [ -f /handoff/matrix.env ]; then
+      local now
+      now="$(md5sum /handoff/matrix.env 2>/dev/null | cut -d' ' -f1)"
+      if [ "$now" != "$seen" ]; then
+        seen="$now"
+        # shellcheck disable=SC1091
+        set -a; . /handoff/matrix.env; set +a
+        # Only the owner may talk to the agent. Without this the adapter's default gating
+        # applies, and on a federated box that is not a boundary we want to leave to chance.
+        export MATRIX_ALLOWED_USERS="${PP_OWNER:-}"
+        # E2EE: the box encrypts everything else, and an agent room is no different.
+        export MATRIX_E2EE_MODE="${MATRIX_E2EE_MODE:-optional}"
+        # No proxy: the homeserver is on OUR loopback (shared netns), so a Tor circuit here
+        # would be a pointless round trip out to the network and back to the same host.
+        unset MATRIX_PROXY
+        echo "[agent] credentials received for ${MATRIX_USER_ID:-?} — starting gateway"
+        pkill -f "hermes gateway" 2>/dev/null || true
+        /opt/hermes/venv/bin/hermes gateway start &
+      fi
+    fi
+    sleep 5
+  done
+}
+gateway_watch &
+pids+=($!)
 
 # Exit as soon as EITHER dies, so Docker's restart policy sees the failure instead of the
 # container lingering half-alive with one process gone.

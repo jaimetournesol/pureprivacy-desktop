@@ -965,7 +965,7 @@ fn validate_command(
     let action = cmd.get("action")?.as_str()?.to_string();
     if !matches!(
         action.as_str(),
-        "restart" | "reset" | "backup" | "update" | "check_update"
+        "restart" | "reset" | "backup" | "update" | "check_update" | "agent_setup"
     ) {
         return None; // allowlist only (a cleared "done" command lands here → ignored)
     }
@@ -1221,6 +1221,16 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                 .send()
                 .await;
 
+            // 1a) Re-publish the agent roster. The phone decides "human or AI" from this and
+            // nothing else, so it must not depend on a single write having landed while the
+            // phone happened to be synced. No-op when no agent is provisioned.
+            crate::agent::republish_from_handoff(
+                &client,
+                &ad_url(crate::agent::AGENTS_ACCOUNT_DATA_TYPE),
+                &t,
+            )
+            .await;
+
             // 1b) Feature H: periodic update check, if the owner left automatic checks on
             // (default). Manual-only boxes still check when the phone sends `check_update`.
             // Runs over Tor; failures are recorded in the update blob, never fatal.
@@ -1287,6 +1297,58 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .send()
                                 .await;
                             eprintln!("[pureprivacy] box config: identity backup requested (ok={ok})");
+                        } else if action == "agent_setup" {
+                            // Clear the command first (once-only), then provision. This can
+                            // take a while — registering an account and creating a room —
+                            // so publish an interim `done:false` progress line the phone
+                            // shows while it waits, then the real outcome.
+                            let _ = client
+                                .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({ "id": id, "action": "done" }))
+                                .send()
+                                .await;
+                            let _ = client
+                                .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({
+                                    "id": id, "done": false,
+                                    "message": "Setting up your agent…",
+                                }))
+                                .send()
+                                .await;
+                            let join_token = state::read(&app, |i| i.join_token.clone());
+                            let res = crate::agent::setup(
+                                &client,
+                                &base,
+                                &ad_url(crate::agent::AGENTS_ACCOUNT_DATA_TYPE),
+                                &t,
+                                &onion,
+                                &join_token,
+                                &user_id,
+                            )
+                            .await;
+                            let (ok, msg) = match res {
+                                Ok(m) => (true, m),
+                                Err(e) => (false, e),
+                            };
+                            let mut out = serde_json::json!({
+                                "id": id, "ok": ok, "done": true, "done_ts": now_ms(),
+                            });
+                            // The phone shows `message` on success and `error` on failure,
+                            // so put the box's own wording in whichever it will read.
+                            if ok {
+                                out["message"] = serde_json::json!(msg);
+                            } else {
+                                out["error"] = serde_json::json!(msg);
+                            }
+                            let _ = client
+                                .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&out)
+                                .send()
+                                .await;
+                            eprintln!("[pureprivacy] agent setup requested by the phone (ok={ok}): {msg}");
                         } else if action == "check_update" || action == "update" {
                             // Feature H. Clear the command first (once-only), then do the work
                             // and report. Neither action is destructive to data, and `update`
