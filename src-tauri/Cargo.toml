@@ -60,6 +60,8 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 # Verify the ed25519 signature on an update manifest against the public key baked into this
 # binary (feature H). Pure Rust; the box only ever VERIFIES — it holds no private key.
 ed25519-dalek = "2"
+# Tor v3 client authorisation for the agent WebUI's hidden service (config.rs).
+x25519-dalek = "2"
 # Post-quantum signature for box updates (feature K). SLH-DSA (FIPS-205, formerly SPHINCS+) is
 # HASH-based: it rests on the same assumptions as SHA-256 rather than on lattices, which makes
 # it the conservative choice for a long-lived trust anchor. Signatures are ~7.8 KB — irrelevant

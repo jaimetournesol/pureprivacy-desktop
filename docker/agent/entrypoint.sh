@@ -16,6 +16,15 @@ mkdir -p "$HERMES_HOME" "$HERMES_WORKSPACE" "$HERMES_WEBUI_STATE_DIR"
 # bind loopback, but loopback here is the BOX's loopback, which tor maps onto an onion —
 # so treat it as reachable and always have a password.
 PW_FILE="$HERMES_HOME/webui-password"
+HANDOFF_PW=/handoff/webui-password
+# The OWNER's choice wins. If they set a password from the phone it arrives here, and it
+# must beat both the environment and anything we generated on an earlier boot — otherwise
+# "change my password" would appear to work and quietly not.
+if [ -s "$HANDOFF_PW" ] && ! cmp -s "$HANDOFF_PW" "$PW_FILE"; then
+  HERMES_WEBUI_PASSWORD="$(cat "$HANDOFF_PW")"
+  ( umask 077; printf '%s' "$HERMES_WEBUI_PASSWORD" > "$PW_FILE" )
+  echo "[agent] using the WebUI password set by the owner"
+fi
 if [ -z "${HERMES_WEBUI_PASSWORD:-}" ]; then
   if [ -s "$PW_FILE" ]; then
     HERMES_WEBUI_PASSWORD="$(cat "$PW_FILE")"
@@ -53,10 +62,59 @@ echo "[agent] hermes $(/opt/hermes/venv/bin/hermes --version 2>/dev/null | head 
 echo "[agent] webui → http://${HERMES_WEBUI_HOST}:${HERMES_WEBUI_PORT}/  (box loopback)"
 
 cd /opt/hermes/webui
-# --foreground makes bootstrap EXEC the server in place. Without it, it double-forks a
-# detached child and returns, so PID 1 would see its only job "finish" immediately and the
-# container would restart-loop while the server was in fact running fine.
-/opt/hermes/venv/bin/python bootstrap.py --foreground &
+
+# ── WebUI, supervised so a password change can take effect ──────────────────────────────
+# The password is read by the server at startup, so changing it means restarting the server.
+# The owner changes it from their phone, long after this container booted, and asking them
+# to recreate a container to change a password would be absurd — so watch the handoff file
+# and bounce the server when it changes.
+#
+# A restart must stay distinguishable from a CRASH: an unconditional restart loop would hide
+# a genuinely broken server behind an endless respawn, and Docker's restart policy would
+# never see the failure. The watcher therefore leaves a marker before it kills, and only a
+# marked exit is treated as intentional.
+RESTART_FLAG=/tmp/webui-restart
+webui_loop() {
+  while true; do
+    HERMES_WEBUI_PASSWORD="$(cat "$PW_FILE")"
+    export HERMES_WEBUI_PASSWORD
+    # --foreground makes bootstrap EXEC the server in place. Without it, it double-forks a
+    # detached child and returns, so we'd see our only job "finish" immediately and treat a
+    # perfectly healthy server as dead.
+    /opt/hermes/venv/bin/python bootstrap.py --foreground &
+    local child=$!
+    echo "$child" > /tmp/webui.pid
+    wait "$child" || true
+    if [ -f "$RESTART_FLAG" ]; then
+      rm -f "$RESTART_FLAG"
+      echo "[agent] webui restarting on the new password"
+      continue
+    fi
+    echo "[agent] webui exited unexpectedly" >&2
+    return 1   # a real failure: fall through so the container exits and Docker restarts it
+  done
+}
+webui_loop &
+pids+=($!)
+
+password_watch() {
+  local seen
+  seen="$(md5sum "$PW_FILE" 2>/dev/null | cut -d' ' -f1)"
+  while true; do
+    sleep 5
+    [ -s "$HANDOFF_PW" ] || continue
+    cmp -s "$HANDOFF_PW" "$PW_FILE" && continue
+    ( umask 077; cp "$HANDOFF_PW" "$PW_FILE" )
+    local now
+    now="$(md5sum "$PW_FILE" 2>/dev/null | cut -d' ' -f1)"
+    [ "$now" = "$seen" ] && continue
+    seen="$now"
+    echo "[agent] WebUI password changed by the owner — restarting the webui"
+    touch "$RESTART_FLAG"
+    kill "$(cat /tmp/webui.pid 2>/dev/null)" 2>/dev/null || true
+  done
+}
+password_watch &
 pids+=($!)
 
 # ── Gateway, gated on the box handing us credentials ────────────────────────────────────

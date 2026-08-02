@@ -1298,6 +1298,16 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .await;
                             eprintln!("[pureprivacy] box config: identity backup requested (ok={ok})");
                         } else if action == "agent_setup" {
+                            // The owner may choose the WebUI password rather than live with
+                            // the one the container generated. It rides the command, exactly
+                            // as the backup passphrase does — read it into memory here so the
+                            // clear below takes it straight back out of account data.
+                            let webui_password = cmd
+                                .get("passphrase")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
                             // Clear the command first (once-only), then provision. This can
                             // take a while — registering an account and creating a room —
                             // so publish an interim `done:false` progress line the phone
@@ -1317,6 +1327,20 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 }))
                                 .send()
                                 .await;
+                            // Apply the owner's password BEFORE provisioning, so the roster we
+                            // publish at the end already carries the password the WebUI will
+                            // actually be using. The agent container watches this file and
+                            // brings its WebUI back up on the new secret.
+                            if !webui_password.is_empty() {
+                                match crate::agent::set_webui_password(&webui_password) {
+                                    Ok(()) => eprintln!(
+                                        "[pureprivacy] agent WebUI password set by the owner"
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[pureprivacy] couldn't set the agent WebUI password: {e}"
+                                    ),
+                                }
+                            }
                             let join_token = state::read(&app, |i| i.join_token.clone());
                             let res = crate::agent::setup(
                                 &client,
@@ -1328,10 +1352,16 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 &user_id,
                             )
                             .await;
-                            let (ok, msg) = match res {
+                            let (ok, mut msg) = match res {
                                 Ok(m) => (true, m),
                                 Err(e) => (false, e),
                             };
+                            // On a box that already has agents, `setup` short-circuits with
+                            // "agents are already set up" — true, but not what the owner just
+                            // did. Report the password change they actually asked for.
+                            if ok && !webui_password.is_empty() {
+                                msg = "Agent password updated.".to_string();
+                            }
                             let mut out = serde_json::json!({
                                 "id": id, "ok": ok, "done": true, "done_ts": now_ms(),
                             });

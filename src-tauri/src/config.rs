@@ -152,10 +152,20 @@ pub struct Paths {
     /// admin surface has an address that is never handed to a peer, and it's the only shape
     /// that lets tor v3 client authorisation be added later — that's per-service, so
     /// enabling it on the main onion would demand a key from every federating peer and
-    /// break federation outright.
+    /// break federation outright — which is exactly what [`ensure_agent_client_auth`] does
+    /// here, safely, because this service is shared with nobody.
     pub agent_hs_dir: PathBuf,
     pub agent_hostname_file: PathBuf,
     pub tuwunel_data: PathBuf,
+}
+
+impl Paths {
+    /// The phone's half of the agent onion's client-authorisation keypair. Deliberately
+    /// beside the hidden-service dir, not inside it — tor parses everything it finds in a
+    /// `HiddenServiceDir`, and this is ours, not tor's.
+    pub fn agent_client_auth_key(&self) -> PathBuf {
+        self.tor_data.join("agent-client-auth.key")
+    }
 }
 
 pub fn paths(app: &AppHandle) -> Result<Paths, String> {
@@ -215,7 +225,80 @@ pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
     set_0700(&p.tor_data);
     set_0700(&p.hs_dir);
     set_0700(&p.agent_hs_dir);
+    ensure_agent_client_auth(&p)?;
     Ok(p)
+}
+
+/// Base32 (RFC 4648, uppercase, unpadded) — the encoding tor uses for v3 client-auth keys.
+/// Hand-rolled rather than pulling a crate for 30 lines used in exactly one place.
+fn base32(data: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &b in data {
+        acc = (acc << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(A[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(A[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+/// Tor v3 client authorisation for the agent WebUI's hidden service.
+///
+/// This is the cryptographic gate in front of an admin surface that can run shell commands.
+/// Without the matching private key a client cannot even FETCH the service's descriptor —
+/// the service is invisible, and the refusal happens in the Tor layer, before any HTTP
+/// request reaches the WebUI. Password alone would put the entire gate behind a form served
+/// to anyone who knows the address.
+///
+/// Why this is safe to do unconditionally, and why it must be the *agent* service only:
+/// v3 client auth is per-SERVICE, not per-port. The box's main onion carries federation, so
+/// enabling it there would demand a key from every peer box and break federation outright.
+/// `hs-agent` is shared with nobody, so locking it costs nothing.
+///
+/// Generated HERE, at directory-creation time, rather than during agent setup — tor reads
+/// `authorized_clients/` when it starts the service, so a key written afterwards wouldn't
+/// take effect until a restart. Doing it before tor ever launches means the gate is up from
+/// the first boot, and the private key is simply waiting for the owner's phone to collect it.
+///
+/// Generated once and kept: regenerating on each boot would silently lock out the phone
+/// that already holds the old key.
+fn ensure_agent_client_auth(p: &Paths) -> Result<(), String> {
+    let priv_file = p.agent_client_auth_key();
+    let clients_dir = p.agent_hs_dir.join("authorized_clients");
+    let pub_file = clients_dir.join("phone.auth");
+    if priv_file.exists() && pub_file.exists() {
+        return Ok(());
+    }
+    // x25519 secret: 32 random bytes, clamped as the curve requires.
+    use rand::RngCore;
+    let mut sk = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut sk);
+    sk[0] &= 248;
+    sk[31] &= 127;
+    sk[31] |= 64;
+    let pk = x25519_dalek::x25519(sk, x25519_dalek::X25519_BASEPOINT_BYTES);
+
+    std::fs::create_dir_all(&clients_dir)
+        .map_err(|e| format!("couldn't create {}: {e}", clients_dir.display()))?;
+    set_0700(&clients_dir);
+    // Public half, for tor: one line, `descriptor:x25519:<base32 pubkey>`.
+    std::fs::write(&pub_file, format!("descriptor:x25519:{}\n", base32(&pk)))
+        .map_err(|e| format!("couldn't write {}: {e}", pub_file.display()))?;
+    set_0600(&pub_file);
+    // Private half, for the phone. Stored OUTSIDE the hidden-service directory so tor never
+    // tries to parse it as one of its own files.
+    std::fs::write(&priv_file, base32(&sk))
+        .map_err(|e| format!("couldn't write {}: {e}", priv_file.display()))?;
+    set_0600(&priv_file);
+    eprintln!("[pureprivacy] agent WebUI: tor v3 client authorisation enabled");
+    Ok(())
 }
 
 /// Pure builder for torrc — unit-tested; `render_torrc` just adds paths + I/O.

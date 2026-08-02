@@ -189,6 +189,37 @@ async fn create_room(
     v.get("room_id").and_then(|r| r.as_str()).map(String::from)
 }
 
+/// Set the agent WebUI's password to one the owner chose.
+///
+/// Written to the handoff volume, which the agent container watches — it restarts its WebUI
+/// on the new secret rather than requiring the container to be recreated. 0600, and the
+/// caller has already cleared the command that carried it out of account data.
+pub fn set_webui_password(password: &str) -> Result<(), String> {
+    let path = std::path::Path::new(HANDOFF_WEBUI_PASSWORD);
+    let dir = path.parent().ok_or("no handoff directory")?;
+    if !dir.exists() {
+        return Err("the agents add-on isn't installed on this box".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("couldn't write the WebUI password: {e}"))?;
+        f.write_all(password.as_bytes())
+            .map_err(|e| format!("couldn't write the WebUI password: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, password)
+        .map_err(|e| format!("couldn't write the WebUI password: {e}"))?;
+    Ok(())
+}
+
 /// Publish the roster. This is what the phone keys "is this an AI?" off.
 pub async fn publish_registry(
     client: &reqwest::Client,
@@ -231,6 +262,16 @@ pub async fn publish_registry(
     let webui_password = std::fs::read_to_string(HANDOFF_WEBUI_PASSWORD)
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    // The phone's half of the agent onion's client-auth keypair (see
+    // config::ensure_agent_client_auth). Without it the phone cannot fetch the service's
+    // descriptor at all, so this key IS the app's access to Agent settings — it has to
+    // travel with the address it unlocks.
+    let webui_auth_key = std::fs::read_to_string(
+        std::path::Path::new(&std::env::var("PUREPRIVACY_DATA_DIR").unwrap_or("/data".into()))
+            .join("data/tor/agent-client-auth.key"),
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
     let r = client
         .put(url)
         .bearer_auth(owner_token)
@@ -239,6 +280,7 @@ pub async fn publish_registry(
             "webui_onion": webui_onion,
             "webui_port": crate::config::AGENT_WEBUI_ONION_PORT,
             "webui_password": webui_password,
+            "webui_auth_key": webui_auth_key,
             "updated_ts": crate::agent::now_ms(),
         }))
         .send()
