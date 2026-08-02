@@ -145,7 +145,12 @@ gateway_watch() {
         unset MATRIX_PROXY
         echo "[agent] credentials received for ${MATRIX_USER_ID:-?} — starting gateway"
         pkill -f "hermes gateway" 2>/dev/null || true
-        /opt/hermes/venv/bin/hermes gateway start &
+        # `run`, NOT `start`. `start` drives an installed systemd/launchd service, which
+        # doesn't exist in a container — it printed "The gateway runs as the container's main
+        # process. Or run the gateway directly: hermes gateway run" and exited, so the agent
+        # sat there with a Matrix account and no gateway, silently ignoring every message.
+        # `hermes gateway --help` calls `run` the one "recommended for WSL, Docker, Termux".
+        /opt/hermes/venv/bin/hermes gateway run &
       fi
     fi
     sleep 5
