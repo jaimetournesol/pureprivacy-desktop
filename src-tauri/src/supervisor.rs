@@ -1310,12 +1310,24 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .to_string();
                             // Empty = the first-run one-tap setup (or a password change).
                             // Non-empty = "add another agent, called this".
-                            let agent_name = cmd
-                                .get("agent_name")
-                                .and_then(|p| p.as_str())
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
+                            let field = |k: &str| {
+                                cmd.get(k)
+                                    .and_then(|p| p.as_str())
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string()
+                            };
+                            let agent_name = field("agent_name");
+                            // The wizard's answers. The API key rides the command channel
+                            // exactly as the passphrase does, and the clear below takes it
+                            // straight back out of account data.
+                            let spec = crate::agent::AgentSpec {
+                                name: agent_name.clone(),
+                                provider: field("provider"),
+                                api_key: field("api_key"),
+                                base_url: field("base_url"),
+                                model: field("model"),
+                            };
                             // Clear the command first (once-only), then provision. This can
                             // take a while — registering an account and creating a room —
                             // so publish an interim `done:false` progress line the phone
@@ -1362,7 +1374,7 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 &onion,
                                 &join_token,
                                 &user_id,
-                                &agent_name,
+                                &spec,
                             )
                             .await;
                             let (ok, mut msg) = match res {

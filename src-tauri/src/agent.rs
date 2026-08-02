@@ -40,6 +40,23 @@ const DEFAULT_LOCALPART: &str = "hermes-ai";
 /// password. Absent on a box with no agents installed, which is exactly right.
 const HANDOFF_WEBUI_PASSWORD: &str = "/handoff/webui-password";
 
+/// What the owner chose in the Add-agent wizard.
+///
+/// Everything except `name` is optional: an empty [`AgentSpec::provider`] means "same as my
+/// other agents", which clones the default profile — the behaviour before the wizard existed.
+///
+/// `api_key` is secret and deliberately short-lived in memory: it arrives on the guarded
+/// command channel (the box clears the command before provisioning) and goes straight into
+/// the agent's own handoff file at 0600. It is never written to account data.
+#[derive(Default)]
+pub struct AgentSpec {
+    pub name: String,
+    pub provider: String,
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+}
+
 /// One provisioned agent.
 pub struct Provisioned {
     pub user_id: String,
@@ -134,6 +151,7 @@ async fn register(
 /// rather than failing with an io error the owner can't act on.
 fn write_handoff(
     localpart: &str,
+    spec: &AgentSpec,
     onion: &str,
     user_id: &str,
     token: &str,
@@ -158,6 +176,20 @@ fn write_handoff(
          PP_AGENT_LOCALPART={localpart}\n",
         port = crate::config::HOMESERVER_PORT + crate::config::off(),
     );
+    // Only emit what the owner actually chose. An absent key is meaningfully different from
+    // an empty one: absent means "inherit the default profile", empty would mean "this
+    // provider needs no key", and the container branches on exactly that.
+    let mut body = body;
+    for (k, v) in [
+        ("PP_AGENT_PROVIDER", &spec.provider),
+        ("PP_AGENT_MODEL", &spec.model),
+        ("PP_AGENT_BASE_URL", &spec.base_url),
+        ("PP_AGENT_API_KEY", &spec.api_key),
+    ] {
+        if !v.is_empty() {
+            body.push_str(&format!("{k}={v}\n"));
+        }
+    }
 
     let agents_dir = std::path::Path::new(HANDOFF_AGENTS_DIR);
     std::fs::create_dir_all(agents_dir)
@@ -526,7 +558,7 @@ pub async fn setup(
     onion: &str,
     join_token: &str,
     owner: &str,
-    name: &str,
+    spec: &AgentSpec,
 ) -> Result<String, String> {
     if join_token.is_empty() {
         return Err("this box has no registration token, so it can't create an agent".into());
@@ -555,6 +587,7 @@ pub async fn setup(
     // A name = the owner adding another agent. It gets its own account, its own room, and
     // its own Hermes profile, so it can run a different model (or a different subscription)
     // from the first one.
+    let name = spec.name.as_str();
     let (localpart, display) = if name.trim().is_empty() {
         (DEFAULT_LOCALPART.to_string(), "Hermes".to_string())
     } else {
@@ -581,7 +614,7 @@ pub async fn setup(
 
     let password = random_password();
     let (user_id, token, device) = register(client, base, &localpart, &password, join_token).await?;
-    write_handoff(&localpart, onion, &user_id, &token, &device, owner)?;
+    write_handoff(&localpart, spec, onion, &user_id, &token, &device, owner)?;
 
     let room_id = create_room(client, base, owner_token, &user_id, &display).await;
     if room_id.is_none() {

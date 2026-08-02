@@ -153,6 +153,34 @@ provision_profile() {
     fi
   fi
 
+  # The provider the owner picked in the wizard. Absent = "same as my other agents", which
+  # the --clone above already gave them, so we leave config.yaml alone.
+  #
+  # For an OAuth provider (openai-codex, xai-oauth, qwen-oauth) there is no key to write:
+  # Hermes holds its own OAuth session in auth.json and the owner finishes signing in from
+  # Agent settings. We still record the provider so the profile opens on the right one.
+  local prov; prov="$(handoff_get "$env_file" PP_AGENT_PROVIDER)"
+  if [ -n "$prov" ]; then
+    local mdl base key
+    mdl="$(handoff_get "$env_file" PP_AGENT_MODEL)"
+    base="$(handoff_get "$env_file" PP_AGENT_BASE_URL)"
+    key="$(handoff_get "$env_file" PP_AGENT_API_KEY)"
+    echo "[agent] '$lp' configured for provider '$prov'"
+    ( umask 077
+      {
+        echo "model:"
+        echo "  provider: $prov"
+        if [ -n "$mdl" ];  then echo "  default: $mdl"; fi
+        if [ -n "$base" ]; then echo "  base_url: $base"; fi
+        # model.api_key, NOT OPENAI_API_KEY in .env: Hermes host-gates OPENAI_API_KEY to
+        # openai.com, so a key put there is silently dropped for any other endpoint and the
+        # runtime falls through to "no-key-required" → 401. See docs/HANDOFF.
+        if [ -n "$key" ];  then echo "  api_key: $key"; fi
+      } > "$home/config.yaml"
+    )
+    chmod 600 "$home/config.yaml"
+  fi
+
   # Cross-signing, per agent — same two-step as the default profile, because each agent is a
   # separate Matrix identity and cannot borrow another's recovery key.
   local rec_file="$home/matrix-recovery.key" rec_line
