@@ -18,6 +18,7 @@
 #   ./pp-box backup [dir]    tar the volume (onion key + secrets + pairings) — DO THIS
 #   ./pp-box restore <file>  restore a backup into the volume (box must be down)
 #   ./pp-box agents on|off   install / remove the optional agents add-on (separate image)
+#   ./pp-box agents ui       open the Hermes Web UI in a browser on THIS machine (tunnel)
 #   ./pp-box shell           open a shell inside the container
 #   ./pp-box destroy         remove the box AND its volume (irreversible; asks first)
 #
@@ -247,7 +248,98 @@ EOF
           echo "● agents: not installed   (install: ./pp-box agents on)"
         fi
         ;;
-      *) die "usage: ./pp-box agents [on|off|status]" ;;
+      ui)
+        # Open the agents' Hermes Web UI in a browser ON THIS MACHINE.
+        #
+        # The UI binds the BOX container's loopback and is published nowhere — from the
+        # phone it's reached over its own client-authorised onion. On the machine running
+        # the box there's no onion to speak of, so this bridges into that loopback.
+        #
+        # A TUNNEL, not a published port. `docker compose` could expose 8787 permanently,
+        # but that leaves a shell-capable admin UI listening for as long as the box runs,
+        # for everyone with an account on this host. This listens on 127.0.0.1 only, pipes
+        # through `docker exec` (no new container port, nothing on the LAN, nothing on the
+        # docker bridge), and is gone the moment you press Ctrl-C.
+        agents_on || die "agents aren't installed — run './pp-box agents on' first"
+        docker ps --filter name=pureprivacy-agent --filter status=running -q | grep -q . \
+          || die "the agent container isn't running — try './pp-box up'"
+        port="${2:-8787}"
+        pw="$(docker exec pureprivacy-agent cat /handoff/webui-password 2>/dev/null || true)"
+        echo "Agent settings → http://127.0.0.1:${port}/"
+        [ -n "$pw" ] && echo "Password:        $pw" \
+                     || echo "Password:        (none published yet — set one from the Agents app)"
+        echo "Press Ctrl-C to close the tunnel."
+        # python3 rather than socat: socat is on neither the host nor the image, and python3
+        # is on both. Each accepted connection gets its own `docker exec` pipe.
+        python3 - "$port" <<'PY'
+import socket, subprocess, sys, threading
+port = int(sys.argv[1])
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    srv.bind(("127.0.0.1", port))
+except OSError as e:
+    sys.exit(f"couldn't listen on 127.0.0.1:{port} — {e}")
+srv.listen(16)
+
+RELAY = (
+    "import sys,socket,threading\n"
+    "s=socket.create_connection(('127.0.0.1',8787))\n"
+    "def up():\n"
+    "    while True:\n"
+    "        b=sys.stdin.buffer.read1(65536)\n"
+    "        if not b: break\n"
+    "        s.sendall(b)\n"
+    "    s.shutdown(socket.SHUT_WR)\n"
+    "threading.Thread(target=up,daemon=True).start()\n"
+    "while True:\n"
+    "    b=s.recv(65536)\n"
+    "    if not b: break\n"
+    "    sys.stdout.buffer.write(b); sys.stdout.buffer.flush()\n"
+)
+
+def serve(conn):
+    p = subprocess.Popen(
+        ["docker", "exec", "-i", "pureprivacy-agent", "python3", "-c", RELAY],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    def to_container():
+        try:
+            while True:
+                b = conn.recv(65536)
+                if not b: break
+                p.stdin.write(b); p.stdin.flush()
+        except Exception:
+            pass
+        finally:
+            try: p.stdin.close()
+            except Exception: pass
+
+    threading.Thread(target=to_container, daemon=True).start()
+    try:
+        while True:
+            # read1(), NOT read(): read(n) on a buffered pipe blocks until it has ALL n
+            # bytes or hits EOF, so a reply smaller than the buffer never arrives and the
+            # browser just hangs. read1() returns whatever is available now.
+            b = p.stdout.read1(65536)
+            if not b: break
+            conn.sendall(b)
+    except Exception:
+        pass
+    finally:
+        try: conn.close()
+        except Exception: pass
+        try: p.kill()
+        except Exception: pass
+
+try:
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=serve, args=(c,), daemon=True).start()
+except KeyboardInterrupt:
+    print("\n✓ tunnel closed")
+PY
+        ;;
+      *) die "usage: ./pp-box agents [on|off|status|ui [port]]" ;;
     esac
     ;;
 
