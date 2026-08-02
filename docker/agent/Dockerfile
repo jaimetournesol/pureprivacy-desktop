@@ -85,6 +85,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libolm3 git ripgrep ffmpeg curl ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
+# ── sudo ────────────────────────────────────────────────────────────────────────────────
+# The agent already runs as uid 0 INSIDE this container, so it has full authority over its
+# own environment — apt, pip, /usr/local/bin, all of it. What it lacks is the *command*:
+# Hermes assumes sudo exists (84 of its files mention it; it even auto-rewrites bare sudo
+# calls and has a SUDO_PASSWORD setting), so `sudo apt install x` fails with "sudo: not
+# found" even though the privilege was never in question. That's a confusing failure to
+# debug from a chat window.
+#
+# A shim, NOT the real thing. Installing sudo would add a setuid-root binary and a password
+# path to an image whose only user is already root — pure attack surface for zero gain.
+# This drops sudo's own flags and runs the command, which is exactly what real sudo would
+# do here.
+#
+# To be explicit about the boundary: this grants nothing on the HOST. The container has no
+# docker.sock, no host mounts, no added capabilities and is not privileged, and it must stay
+# that way — any of those would make root-in-container mean root-on-your-machine.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    '# sudo shim — we are already uid 0. See docker/agent/Dockerfile for why.' \
+    'while [ $# -gt 0 ]; do' \
+    '  case "$1" in' \
+    '    -u|--user|-g|--group|-p|--prompt|-C|--close-from|-r|--role|-t|--type) shift 2 ;;' \
+    '    --) shift; break ;;' \
+    '    -[!-]*|--*) shift ;;' \
+    '    *) break ;;' \
+    '  esac' \
+    'done' \
+    '[ $# -eq 0 ] && exec /bin/sh -l' \
+    'exec "$@"' \
+    > /usr/local/bin/sudo \
+    && chmod 0755 /usr/local/bin/sudo \
+    && /usr/local/bin/sudo -n true \
+    && [ "$(/usr/local/bin/sudo -u root id -u)" = "0" ] \
+    && echo "sudo shim installed"
+
 COPY --from=build /opt/hermes /opt/hermes
 COPY entrypoint.sh /opt/hermes/entrypoint.sh
 RUN chmod +x /opt/hermes/entrypoint.sh
