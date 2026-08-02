@@ -140,6 +140,35 @@ gateway_watch() {
         # the one plaintext exception. "optional" would silently fall back to cleartext when
         # a room isn't encrypted, which is the failure mode you'd never notice.
         export MATRIX_E2EE_MODE="${MATRIX_E2EE_MODE:-required}"
+        # ── Cross-signing identity ──────────────────────────────────────────────────────
+        # Without this the agent's device is never signed by its own identity, so every
+        # client shows it as unverified ("not verified by its owner" in Element) and has no
+        # way to tell a genuine agent device from one an attacker registered on the account.
+        #
+        # Hermes will bootstrap cross-signing by itself, but ONLY if it has somewhere to put
+        # the recovery key it generates: with MATRIX_RECOVERY_KEY_OUTPUT_FILE unset it
+        # refuses (deliberately — it will not print a recovery key to a log). So the first
+        # boot points it at a file, and every boot after that feeds the same key back in.
+        #
+        # BOTH halves are required, and the second is the one that's easy to miss. The
+        # bootstrap branch only runs when the account has NO cross-signing keys at all;
+        # once they exist, a NEW device (a fresh access token, a rebuilt container) takes
+        # the other branch, and without MATRIX_RECOVERY_KEY there is nothing to sign it
+        # with — the identity survives but this device sits outside it, silently.
+        #
+        # The key lives in the agent's own volume, 0600, written once by Hermes with
+        # O_EXCL. Losing it is not fatal: delete the file AND the account's cross-signing
+        # keys on the homeserver, and the next boot bootstraps a fresh identity.
+        MATRIX_XSIGN_KEY_FILE="$HERMES_HOME/matrix-recovery.key"
+        if [ -s "$MATRIX_XSIGN_KEY_FILE" ]; then
+          MATRIX_RECOVERY_KEY="$(cat "$MATRIX_XSIGN_KEY_FILE")"
+          export MATRIX_RECOVERY_KEY
+          unset MATRIX_RECOVERY_KEY_OUTPUT_FILE
+        else
+          # Hermes refuses to overwrite this path, so only offer it when it's absent.
+          export MATRIX_RECOVERY_KEY_OUTPUT_FILE="$MATRIX_XSIGN_KEY_FILE"
+          unset MATRIX_RECOVERY_KEY
+        fi
         # No proxy: the homeserver is on OUR loopback (shared netns), so a Tor circuit here
         # would be a pointless round trip out to the network and back to the same host.
         unset MATRIX_PROXY
