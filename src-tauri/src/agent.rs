@@ -26,6 +26,16 @@ pub const AGENTS_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.agents";
 /// account-data: an access token is secret material and account-data is readable by every
 /// device signed into the owner's account.
 const HANDOFF_PATH: &str = "/handoff/matrix.env";
+/// One file per agent, `<localpart>.env`, same shape as [`HANDOFF_PATH`].
+///
+/// The single `matrix.env` above is still written for the FIRST agent, and is still what an
+/// older agent image reads. Keeping both means a box can be rolled back to a pre-multi-agent
+/// image without stranding its original agent — the extra agents simply go quiet until the
+/// newer image is back, rather than the whole add-on breaking.
+const HANDOFF_AGENTS_DIR: &str = "/handoff/agents";
+/// The first agent's localpart. Fixed, because it is also the one that maps to Hermes's
+/// *default* profile; every later agent gets a profile named after its own localpart.
+const DEFAULT_LOCALPART: &str = "hermes-ai";
 /// Written by the agent container (not by us) so the owner's phone can be given the WebUI
 /// password. Absent on a box with no agents installed, which is exactly right.
 const HANDOFF_WEBUI_PASSWORD: &str = "/handoff/webui-password";
@@ -123,42 +133,93 @@ async fn register(
 /// isn't installed, which is a normal state (agents are optional), so say so clearly
 /// rather than failing with an io error the owner can't act on.
 fn write_handoff(
+    localpart: &str,
     onion: &str,
     user_id: &str,
     token: &str,
     device: &str,
     owner: &str,
 ) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
     let dir = std::path::Path::new(HANDOFF_PATH)
         .parent()
         .ok_or("bad handoff path")?;
     if !dir.is_dir() {
         return Err("the agents add-on isn't installed on this box".to_string());
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(HANDOFF_PATH)
-        .map_err(|e| format!("couldn't write the agent handoff: {e}"))?;
     // The homeserver URL is the box's own loopback: the agent shares our network namespace,
     // so it must NOT take a Tor circuit to reach the box sitting next to it.
-    write!(
-        f,
+    let body = format!(
         "MATRIX_HOMESERVER=http://127.0.0.1:{port}\n\
          MATRIX_USER_ID={user_id}\n\
          MATRIX_ACCESS_TOKEN={token}\n\
          MATRIX_DEVICE_ID={device}\n\
          PP_BOX_ONION={onion}\n\
-         PP_OWNER={owner}\n",
+         PP_OWNER={owner}\n\
+         PP_AGENT_LOCALPART={localpart}\n",
         port = crate::config::HOMESERVER_PORT + crate::config::off(),
-    )
-    .map_err(|e| format!("couldn't write the agent handoff: {e}"))?;
+    );
+
+    let agents_dir = std::path::Path::new(HANDOFF_AGENTS_DIR);
+    std::fs::create_dir_all(agents_dir)
+        .map_err(|e| format!("couldn't create the agent handoff directory: {e}"))?;
+    write_0600(&agents_dir.join(format!("{localpart}.env")), &body)?;
+
+    // The first agent also keeps the legacy single-file path — see HANDOFF_AGENTS_DIR.
+    if localpart == DEFAULT_LOCALPART {
+        write_0600(std::path::Path::new(HANDOFF_PATH), &body)?;
+    }
     Ok(())
+}
+
+/// Write secret material with the mode set at creation, never after.
+///
+/// `File::create` then `set_permissions` would leave a window where the file exists at the
+/// umask default — on a shared volume that is a real (if brief) exposure of an access token.
+fn write_0600(path: &std::path::Path, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts
+        .open(path)
+        .map_err(|e| format!("couldn't write the agent handoff: {e}"))?;
+    f.write_all(body.as_bytes())
+        .map_err(|e| format!("couldn't write the agent handoff: {e}"))?;
+    Ok(())
+}
+
+/// Turn a display name the owner typed into a Matrix localpart / Hermes profile name.
+///
+/// Both have to accept it: Matrix localparts are permissive, but a Hermes profile name must
+/// match `^[a-z0-9][a-z0-9_-]{0,63}$`, so that stricter rule is the one we satisfy. Anything
+/// outside `[a-z0-9-]` becomes a hyphen, runs collapse, and the result is trimmed to a
+/// sensible length. Returns None when nothing usable survives (e.g. a name that was all
+/// emoji), so the caller can ask for a different one rather than invent a name.
+fn slugify(name: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut last_dash = true; // leading dashes are not allowed, so start as if we just wrote one
+    for ch in name.trim().chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash && out.len() < 32 {
+            out.push('-');
+            last_dash = true;
+        }
+        if out.len() >= 32 {
+            break;
+        }
+    }
+    let s = out.trim_matches('-').to_string();
+    if s.is_empty() || !s.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(s)
 }
 
 /// Create the owner↔agent room and invite the agent.
@@ -390,36 +451,70 @@ pub async fn republish_from_handoff(
     registry_url: &str,
     owner_token: &str,
 ) {
-    let Ok(body) = std::fs::read_to_string(HANDOFF_PATH) else {
-        return; // no agent provisioned (or the add-on isn't installed) — nothing to say
-    };
-    let mut user_id = String::new();
-    for line in body.lines() {
-        if let Some(v) = line.strip_prefix("MATRIX_USER_ID=") {
-            user_id = v.trim().to_string();
+    // EVERY provisioned agent, not just the first. Republishing from one handoff file would
+    // rewrite the roster down to a single entry on the next supervisor pass — silently
+    // deleting every other agent from the phone's Agents app while their accounts, rooms and
+    // runtimes carried on existing. The roster is the phone's only source of truth for
+    // "which of these are AI", so a partial republish is worse than none.
+    let mut user_ids: Vec<String> = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(HANDOFF_PATH)];
+    if let Ok(rd) = std::fs::read_dir(HANDOFF_AGENTS_DIR) {
+        files.extend(
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "env")),
+        );
+    }
+    for path in files {
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in body.lines() {
+            if let Some(v) = line.strip_prefix("MATRIX_USER_ID=") {
+                let id = v.trim().to_string();
+                // `matrix.env` is a copy of the first agent's file, so it duplicates.
+                if !id.is_empty() && !user_ids.contains(&id) {
+                    user_ids.push(id);
+                }
+            }
         }
     }
-    if user_id.is_empty() {
-        return;
+    if user_ids.is_empty() {
+        return; // no agent provisioned (or the add-on isn't installed) — nothing to say
     }
-    // Keep whatever the current roster says about this agent (room id, group, name) so a
+    // Keep whatever the current roster says about each agent (room id, group, name) so a
     // republish never clobbers detail we already published.
     let existing = read_registry(client, registry_url, owner_token).await;
-    if let Some(known) = existing.iter().find(|a| a.user_id == user_id) {
-        let one = [Provisioned {
-            user_id: known.user_id.clone(),
-            display_name: known.display_name.clone(),
-            room_id: known.room_id.clone(),
-        }];
-        let _ = publish_registry(client, registry_url, owner_token, &one).await;
-    } else {
-        let one = [Provisioned {
-            user_id,
-            display_name: "Hermes".to_string(),
-            room_id: None,
-        }];
-        let _ = publish_registry(client, registry_url, owner_token, &one).await;
-    }
+    let roster: Vec<Provisioned> = user_ids
+        .into_iter()
+        .map(|user_id| match existing.iter().find(|a| a.user_id == user_id) {
+            Some(known) => Provisioned {
+                user_id: known.user_id.clone(),
+                display_name: known.display_name.clone(),
+                room_id: known.room_id.clone(),
+            },
+            // Only reachable for an agent whose roster entry was lost; the localpart is the
+            // best name we have left, and it beats showing nothing.
+            None => {
+                let name = user_id
+                    .trim_start_matches('@')
+                    .split(':')
+                    .next()
+                    .unwrap_or("Agent")
+                    .to_string();
+                Provisioned {
+                    display_name: if name == DEFAULT_LOCALPART {
+                        "Hermes".to_string()
+                    } else {
+                        name
+                    },
+                    user_id,
+                    room_id: None,
+                }
+            }
+        })
+        .collect();
+    let _ = publish_registry(client, registry_url, owner_token, &roster).await;
 }
 
 /// The whole one-tap flow. Returns the message the phone shows.
@@ -431,6 +526,7 @@ pub async fn setup(
     onion: &str,
     join_token: &str,
     owner: &str,
+    name: &str,
 ) -> Result<String, String> {
     if join_token.is_empty() {
         return Err("this box has no registration token, so it can't create an agent".into());
@@ -452,20 +548,42 @@ pub async fn setup(
 
     let mut existing = read_registry(client, registry_url, owner_token).await;
 
-    // A fixed first agent keeps setup idempotent-ish and predictable. `-ai` is a readable
-    // convention, NOT the thing that makes it an agent (the roster is).
-    let localpart = "hermes-ai";
-    let display = "Hermes";
+    // No name = the first-run, one-tap path: a fixed first agent keeps that idempotent and
+    // predictable, and it is the one that maps to Hermes's *default* profile. `-ai` is a
+    // readable convention, NOT the thing that makes it an agent (the roster is).
+    //
+    // A name = the owner adding another agent. It gets its own account, its own room, and
+    // its own Hermes profile, so it can run a different model (or a different subscription)
+    // from the first one.
+    let (localpart, display) = if name.trim().is_empty() {
+        (DEFAULT_LOCALPART.to_string(), "Hermes".to_string())
+    } else {
+        let slug = slugify(name).ok_or_else(|| {
+            "that name has no letters or numbers in it — pick something like \"Codex\"".to_string()
+        })?;
+        // Reserving the default localpart matters: it is the only one wired to the default
+        // profile, so letting a second agent claim it would put two Matrix accounts on one
+        // profile and Hermes would refuse the duplicate credential at gateway startup.
+        if slug == DEFAULT_LOCALPART {
+            return Err("that name is reserved for the first agent — pick another".to_string());
+        }
+        (slug, name.trim().to_string())
+    };
+
     let agent_user = format!("@{localpart}:{onion}");
     if existing.iter().any(|a| a.user_id == agent_user) {
-        return Ok("agents are already set up on this box".to_string());
+        return if localpart == DEFAULT_LOCALPART {
+            Ok("agents are already set up on this box".to_string())
+        } else {
+            Err(format!("you already have an agent called {display}"))
+        };
     }
 
     let password = random_password();
-    let (user_id, token, device) = register(client, base, localpart, &password, join_token).await?;
-    write_handoff(onion, &user_id, &token, &device, owner)?;
+    let (user_id, token, device) = register(client, base, &localpart, &password, join_token).await?;
+    write_handoff(&localpart, onion, &user_id, &token, &device, owner)?;
 
-    let room_id = create_room(client, base, owner_token, &user_id, display).await;
+    let room_id = create_room(client, base, owner_token, &user_id, &display).await;
     if room_id.is_none() {
         // Not fatal: the account and runtime are live, and a room can be created later.
         // Better to report a working-but-incomplete setup than to fail the whole thing.
@@ -474,7 +592,7 @@ pub async fn setup(
 
     existing.push(Provisioned {
         user_id: user_id.clone(),
-        display_name: display.to_string(),
+        display_name: display.clone(),
         room_id,
     });
     publish_registry(client, registry_url, owner_token, &existing).await?;

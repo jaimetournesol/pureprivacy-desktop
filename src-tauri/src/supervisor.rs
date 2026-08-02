@@ -1308,6 +1308,14 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .unwrap_or("")
                                 .trim()
                                 .to_string();
+                            // Empty = the first-run one-tap setup (or a password change).
+                            // Non-empty = "add another agent, called this".
+                            let agent_name = cmd
+                                .get("agent_name")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
                             // Clear the command first (once-only), then provision. This can
                             // take a while — registering an account and creating a room —
                             // so publish an interim `done:false` progress line the phone
@@ -1323,7 +1331,11 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .bearer_auth(&t)
                                 .json(&serde_json::json!({
                                     "id": id, "done": false,
-                                    "message": "Setting up your agent…",
+                                    "message": if agent_name.is_empty() {
+                                        "Setting up your agent…".to_string()
+                                    } else {
+                                        format!("Setting up {agent_name}…")
+                                    },
                                 }))
                                 .send()
                                 .await;
@@ -1350,6 +1362,7 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 &onion,
                                 &join_token,
                                 &user_id,
+                                &agent_name,
                             )
                             .await;
                             let (ok, mut msg) = match res {
@@ -1359,7 +1372,10 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                             // On a box that already has agents, `setup` short-circuits with
                             // "agents are already set up" — true, but not what the owner just
                             // did. Report the password change they actually asked for.
-                            if ok && !webui_password.is_empty() {
+                            //
+                            // Only when no name was given: "add an agent called X" that
+                            // succeeds must report THAT, not a password change it didn't do.
+                            if ok && !webui_password.is_empty() && agent_name.is_empty() {
                                 msg = "Agent password updated.".to_string();
                             }
                             let mut out = serde_json::json!({

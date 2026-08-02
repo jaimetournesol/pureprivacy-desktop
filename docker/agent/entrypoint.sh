@@ -117,17 +117,108 @@ password_watch() {
 password_watch &
 pids+=($!)
 
+# ── Agents beyond the first ─────────────────────────────────────────────────────────────
+# One box can run several agents. Each is a Hermes PROFILE with its own home, config, model,
+# memory and skills — and its own Matrix account, so it shows up as its own contact in the
+# Agents app rather than as a second personality behind one identity.
+#
+# The first agent maps to Hermes's *default* profile and keeps taking its credentials from
+# the process environment (below). Every later agent gets `profiles/<localpart>/`, whose
+# `.env` carries that agent's Matrix credentials — that file IS the profile's secret scope,
+# which is how the multiplexer gives each profile its own identity. Putting them in the
+# process environment instead would hand every profile the first agent's account.
+#
+# Matrix needs no per-profile config.yaml: the gateway enables the platform whenever
+# MATRIX_ACCESS_TOKEN + MATRIX_HOMESERVER resolve in scope (gateway/config.py).
+HERMES_PROFILES_DIR="$HERMES_HOME/profiles"
+
+# Read one KEY=VALUE out of a handoff file. Deliberately NOT `source`: these files come from
+# another container, and sourcing would execute whatever is in them.
+handoff_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+# Give agent $1 (localpart) a profile carrying the credentials in $2 (its handoff file).
+provision_profile() {
+  local lp="$1" env_file="$2"
+  local home="$HERMES_PROFILES_DIR/$lp"
+
+  if [ ! -d "$home" ]; then
+    echo "[agent] new agent '$lp' — creating its Hermes profile"
+    # --clone copies the default profile's config.yaml/.env, so a new agent starts on a
+    # model that already works instead of an onboarding wizard the owner can't reach from
+    # the Agents app. They can point it at a different provider afterwards in Agent settings.
+    if ! /opt/hermes/venv/bin/hermes profile create "$lp" --clone --no-alias \
+         --description "PurePrivacy agent $lp" >/dev/null 2>&1; then
+      echo "[agent] could not create the Hermes profile for '$lp'" >&2
+      return 1
+    fi
+  fi
+
+  # Cross-signing, per agent — same two-step as the default profile, because each agent is a
+  # separate Matrix identity and cannot borrow another's recovery key.
+  local rec_file="$home/matrix-recovery.key" rec_line
+  if [ -s "$rec_file" ]; then
+    rec_line="MATRIX_RECOVERY_KEY=$(cat "$rec_file")"
+  else
+    rec_line="MATRIX_RECOVERY_KEY_OUTPUT_FILE=$rec_file"
+  fi
+
+  # Rewrite only the keys we own, so anything the owner set in Agent settings survives.
+  local tmp="$home/.env.pp-new"
+  ( umask 077
+    if [ -f "$home/.env" ]; then
+      grep -vE '^(MATRIX_HOMESERVER|MATRIX_USER_ID|MATRIX_ACCESS_TOKEN|MATRIX_DEVICE_ID|MATRIX_ALLOWED_USERS|MATRIX_E2EE_MODE|MATRIX_RECOVERY_KEY|MATRIX_RECOVERY_KEY_OUTPUT_FILE)=' \
+        "$home/.env" > "$tmp" 2>/dev/null || true
+    else
+      : > "$tmp"
+    fi
+    {
+      echo "MATRIX_HOMESERVER=$(handoff_get "$env_file" MATRIX_HOMESERVER)"
+      echo "MATRIX_USER_ID=$(handoff_get "$env_file" MATRIX_USER_ID)"
+      echo "MATRIX_ACCESS_TOKEN=$(handoff_get "$env_file" MATRIX_ACCESS_TOKEN)"
+      echo "MATRIX_DEVICE_ID=$(handoff_get "$env_file" MATRIX_DEVICE_ID)"
+      echo "MATRIX_ALLOWED_USERS=$(handoff_get "$env_file" PP_OWNER)"
+      echo "MATRIX_E2EE_MODE=required"
+      echo "$rec_line"
+    } >> "$tmp"
+  )
+  mv "$tmp" "$home/.env"
+  chmod 600 "$home/.env"
+  return 0
+}
+
+# One gateway serves every profile (gateway.multiplex_profiles). Starting a second gateway
+# per profile would double-bind the same platforms — Hermes hard-errors on exactly that.
+enable_multiplexing() {
+  local cfg="$HERMES_HOME/config.yaml"
+  if grep -qE '^\s*multiplex_profiles:\s*true' "$cfg" 2>/dev/null; then return 0; fi
+  echo "[agent] enabling gateway.multiplex_profiles so one gateway serves every agent"
+  /opt/hermes/venv/bin/hermes config set gateway.multiplex_profiles true >/dev/null 2>&1 \
+    || echo "[agent] could not enable multiplex_profiles — extra agents may stay offline" >&2
+}
+
 # ── Gateway, gated on the box handing us credentials ────────────────────────────────────
 # The gateway is what makes an agent reachable as a Matrix user. It stays off until the box
-# has provisioned an account and written /handoff/matrix.env — starting it before that just
+# has provisioned an account and written its handoff file — starting it before that just
 # crash-loops on a fresh install. Setup happens from the phone, possibly long after this
-# container started, so watch for the file rather than checking once.
+# container started, so watch for the files rather than checking once.
 gateway_watch() {
   local seen=""
   while true; do
     if [ -f /handoff/matrix.env ]; then
       local now
-      now="$(md5sum /handoff/matrix.env 2>/dev/null | cut -d' ' -f1)"
+      # Hash EVERY agent's file: adding a second agent must restart the gateway, and the
+      # first agent's file is untouched by that.
+      #
+      # Build the list explicitly rather than globbing straight into `cat`. /handoff/agents
+      # does not exist until a second agent is provisioned, so the glob would stay literal,
+      # `cat` would fail on it, and — with `set -o pipefail` — the failure propagates out of
+      # the pipeline and `set -e` kills this watcher. Which kills the container, on the far
+      # more common path where there is only ever one agent.
+      local files=(/handoff/matrix.env) f
+      for f in /handoff/agents/*.env; do
+        if [ -e "$f" ]; then files+=("$f"); fi
+      done
+      now="$(cat "${files[@]}" | md5sum | cut -d' ' -f1)"
       if [ "$now" != "$seen" ]; then
         seen="$now"
         # shellcheck disable=SC1091
@@ -172,7 +263,21 @@ gateway_watch() {
         # No proxy: the homeserver is on OUR loopback (shared netns), so a Tor circuit here
         # would be a pointless round trip out to the network and back to the same host.
         unset MATRIX_PROXY
-        echo "[agent] credentials received for ${MATRIX_USER_ID:-?} — starting gateway"
+        # Every agent after the first, before the gateway starts — the multiplexer reads the
+        # profile set once at startup, so a profile written afterwards would not be served.
+        local extra=0 lp
+        for f in /handoff/agents/*.env; do
+          [ -e "$f" ] || continue
+          lp="$(basename "$f" .env)"
+          # The first agent IS the default profile, so it takes the env path below.
+          if [ "$lp" = "hermes-ai" ]; then continue; fi
+          if provision_profile "$lp" "$f"; then
+            extra=$((extra + 1))
+          fi
+        done
+        if [ "$extra" -gt 0 ]; then enable_multiplexing; fi
+
+        echo "[agent] credentials received for ${MATRIX_USER_ID:-?} (+${extra} more) — starting gateway"
         pkill -f "hermes gateway" 2>/dev/null || true
         # `run`, NOT `start`. `start` drives an installed systemd/launchd service, which
         # doesn't exist in a container — it printed "The gateway runs as the container's main
