@@ -97,6 +97,13 @@ pub const FEDAUTH_PORT: u16 = 8460;
 /// docker-compose republishes it to the HOST's 127.0.0.1 only. Never mapped by tor.
 pub const SETUP_PORT: u16 = 8470;
 
+/// Loopback port the agent container's Hermes WebUI listens on (it shares the box's network
+/// namespace, so this is the box's own loopback).
+pub const AGENT_WEBUI_PORT: u16 = 8787;
+/// Onion port for the agent WebUI, published on the SEPARATE agent hidden service — never
+/// on the main onion, which every paired peer box knows.
+pub const AGENT_WEBUI_ONION_PORT: u16 = 8788;
+
 /// The highest fixed loopback base port any `PORT + off()` expression adds the
 /// offset to (the top of the coturn TCP relay range). The offset is clamped so
 /// even this port can't overflow a u16 — see `off()`. [QW-rust d]
@@ -137,6 +144,17 @@ pub struct Paths {
     pub tor_data: PathBuf,
     pub hs_dir: PathBuf,
     pub hostname_file: PathBuf,
+    /// SECOND hidden service, for the agent WebUI only.
+    ///
+    /// It gets its own onion rather than a port on the main one because the main onion is
+    /// shared with federation: every paired peer box knows that address, and the WebUI is
+    /// an agent control plane that can execute shell commands. A separate service means the
+    /// admin surface has an address that is never handed to a peer, and it's the only shape
+    /// that lets tor v3 client authorisation be added later — that's per-service, so
+    /// enabling it on the main onion would demand a key from every federating peer and
+    /// break federation outright.
+    pub agent_hs_dir: PathBuf,
+    pub agent_hostname_file: PathBuf,
     pub tuwunel_data: PathBuf,
 }
 
@@ -145,7 +163,10 @@ pub fn paths(app: &AppHandle) -> Result<Paths, String> {
     let config_dir = base.join("config");
     let tor_data = base.join("data").join("tor");
     let hs_dir = tor_data.join("hs");
+    let agent_hs_dir = tor_data.join("hs-agent");
     Ok(Paths {
+        agent_hostname_file: agent_hs_dir.join("hostname"),
+        agent_hs_dir,
         torrc: config_dir.join("torrc"),
         tuwunel_toml: config_dir.join("tuwunel.toml"),
         turnserver_conf: config_dir.join("turnserver.conf"),
@@ -184,7 +205,7 @@ fn set_0600(_path: &std::path::Path) {}
 /// tor refuses to start.
 pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
     let p = paths(app)?;
-    for dir in [&p.config_dir, &p.tor_data, &p.hs_dir, &p.tuwunel_data] {
+    for dir in [&p.config_dir, &p.tor_data, &p.hs_dir, &p.agent_hs_dir, &p.tuwunel_data] {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("couldn't create {}: {e}", dir.display()))?;
     }
@@ -193,13 +214,22 @@ pub fn ensure_dirs(app: &AppHandle) -> Result<Paths, String> {
     set_0700(&p.config_dir);
     set_0700(&p.tor_data);
     set_0700(&p.hs_dir);
+    set_0700(&p.agent_hs_dir);
     Ok(p)
 }
 
 /// Pure builder for torrc — unit-tested; `render_torrc` just adds paths + I/O.
 /// Federation (8448) goes to the Caddy fed-proxy (TLS + allowlist); the client
 /// API (8008) and TURN go straight to their services.
-fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, voice: bool) -> String {
+fn torrc_string(
+    socks: u16,
+    data: &str,
+    hs: &str,
+    hsport: u16,
+    fedproxy: u16,
+    voice: bool,
+    agent_hs: &str,
+) -> String {
     // Loopback bind/map targets shift by off() per instance; the onion-facing
     // ports (8448/8008/80/3478/5349/7443/8082) stay standard so clients see the same
     // ports on every box. off() == 0 in production + tests (env unset).
@@ -261,6 +291,18 @@ fn torrc_string(socks: u16, data: &str, hs: &str, hsport: u16, fedproxy: u16, vo
             caddy_ec = CADDY_EC_PORT + o,
         );
     }
+    // The agent WebUI, on its OWN hidden service (see Paths::agent_hs_dir). Always mapped:
+    // if the agents add-on isn't installed nothing listens on the loopback target, so the
+    // port simply refuses — no surface, no branch to get wrong. Plain HTTP is fine here
+    // because an onion service already authenticates and encrypts end to end; the phone
+    // tunnels raw TCP to it over SOCKS.
+    let _ = write!(
+        torrc,
+        "\nHiddenServiceDir {agent_hs}\n\
+         HiddenServicePort {port} 127.0.0.1:{target}\n",
+        port = AGENT_WEBUI_ONION_PORT,
+        target = AGENT_WEBUI_PORT + o,
+    );
     torrc
 }
 
@@ -273,6 +315,7 @@ pub fn render_torrc(app: &AppHandle, voice: bool) -> Result<(), String> {
         HOMESERVER_PORT,
         FEDPROXY_PORT,
         voice,
+        &p.agent_hs_dir.display().to_string(),
     );
     std::fs::write(&p.torrc, torrc).map_err(|e| format!("couldn't write torrc: {e}"))
 }
@@ -781,10 +824,17 @@ mod tests {
 
     #[test]
     fn torrc_publishes_every_relay_port_plus_the_fixed_ones() {
-        let torrc = torrc_string(9150, "/d", "/d/hs", 8118, 8449, false);
+        let torrc = torrc_string(9150, "/d", "/d/hs", 8118, 8449, false, "/d/hs-agent");
         let lines = torrc.matches("HiddenServicePort").count();
-        // 8448 + 8008 + 80 + 3478 + 5349 fixed, plus one per relay port.
-        assert_eq!(lines, 5 + relay_count());
+        // 8448 + 8008 + 80 + 3478 + 5349 fixed, the agent WebUI, plus one per relay port.
+        assert_eq!(lines, 6 + relay_count());
+        // The agent WebUI is mapped on its OWN hidden service, never on the main onion —
+        // that address is shared with every paired peer box, and this port fronts an agent
+        // control plane that can run shell commands.
+        assert!(torrc.contains("HiddenServiceDir /d/hs-agent"));
+        assert!(torrc.contains(&format!(
+            "HiddenServicePort {AGENT_WEBUI_ONION_PORT} 127.0.0.1:{AGENT_WEBUI_PORT}"
+        )));
         assert!(torrc.contains("SocksPort 9150 NoIsolateClientAddr"));
         // Federation (8448) goes to the fed-proxy; client API (8008 and 80) to tuwunel.
         // Port 80 too: matrix-rust-sdk derives some calls (account data) from the bare
@@ -802,7 +852,7 @@ mod tests {
     fn torrc_maps_group_call_ports_only_when_voice_enabled() {
         // voice=true publishes the wss (7443→caddy 7444), media (7881), and
         // lk-jwt (8082) onion ports on top of the base map.
-        let with = torrc_string(9150, "/d", "/d/hs", 8118, 8449, true);
+        let with = torrc_string(9150, "/d", "/d/hs", 8118, 8449, true, "/d/hs-agent");
         assert!(with.contains(&format!(
             "HiddenServicePort {LIVEKIT_WSS_ONION_PORT} 127.0.0.1:{CADDY_WSS_PORT}"
         )));
@@ -812,7 +862,7 @@ mod tests {
         assert!(with.contains(&format!("HiddenServicePort {LKJWT_PORT} 127.0.0.1:{LKJWT_PORT}")));
 
         // voice=false omits all three.
-        let without = torrc_string(9150, "/d", "/d/hs", 8118, 8449, false);
+        let without = torrc_string(9150, "/d", "/d/hs", 8118, 8449, false, "/d/hs-agent");
         assert!(!without.contains(&format!("127.0.0.1:{CADDY_WSS_PORT}")));
         assert!(!without.contains(&format!("HiddenServicePort {LIVEKIT_TCP_PORT}")));
         assert!(!without.contains(&format!("HiddenServicePort {LKJWT_PORT}")));
@@ -870,11 +920,11 @@ mod tests {
 
     #[test]
     fn torrc_publishes_the_element_call_onion_port_with_voice() {
-        let with = torrc_string(9150, "/d", "/hs", 8118, 8449, true);
+        let with = torrc_string(9150, "/d", "/hs", 8118, 8449, true, "/d/hs-agent");
         assert!(with.contains(&format!(
             "HiddenServicePort {EC_TLS_ONION_PORT} 127.0.0.1:{}", CADDY_EC_PORT
         )));
-        let without = torrc_string(9150, "/d", "/hs", 8118, 8449, false);
+        let without = torrc_string(9150, "/d", "/hs", 8118, 8449, false, "/d/hs-agent");
         assert!(!without.contains(&format!("HiddenServicePort {EC_TLS_ONION_PORT}")));
     }
 

@@ -68,8 +68,11 @@ gateway_watch() {
         # Only the owner may talk to the agent. Without this the adapter's default gating
         # applies, and on a federated box that is not a boundary we want to leave to chance.
         export MATRIX_ALLOWED_USERS="${PP_OWNER:-}"
-        # E2EE: the box encrypts everything else, and an agent room is no different.
-        export MATRIX_E2EE_MODE="${MATRIX_E2EE_MODE:-optional}"
+        # E2EE: required, not optional. Everything else on the box is end-to-end encrypted,
+        # and an agent conversation carries exactly the kind of content that shouldn't be
+        # the one plaintext exception. "optional" would silently fall back to cleartext when
+        # a room isn't encrypted, which is the failure mode you'd never notice.
+        export MATRIX_E2EE_MODE="${MATRIX_E2EE_MODE:-required}"
         # No proxy: the homeserver is on OUR loopback (shared netns), so a Tor circuit here
         # would be a pointless round trip out to the network and back to the same host.
         unset MATRIX_PROXY

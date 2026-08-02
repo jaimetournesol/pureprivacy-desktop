@@ -205,10 +205,26 @@ pub async fn publish_registry(
             })
         })
         .collect();
+    // The agent WebUI's own onion, so the phone's Agent settings app knows where to tunnel.
+    // Published here rather than in boxstatus because this is the agent-shaped key the
+    // phone already reads, and it's empty/absent on a box with no agents.
+    // In the container PUREPRIVACY_DATA_DIR=/data, so the agent hidden service's hostname
+    // lands here. Empty until tor has minted it (first boot after this port was added).
+    let webui_onion = std::fs::read_to_string(
+        std::path::Path::new(&std::env::var("PUREPRIVACY_DATA_DIR").unwrap_or("/data".into()))
+            .join("data/tor/hs-agent/hostname"),
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
     let r = client
         .put(url)
         .bearer_auth(owner_token)
-        .json(&json!({ "agents": list, "updated_ts": crate::agent::now_ms() }))
+        .json(&json!({
+            "agents": list,
+            "webui_onion": webui_onion,
+            "webui_port": crate::config::AGENT_WEBUI_ONION_PORT,
+            "updated_ts": crate::agent::now_ms(),
+        }))
         .send()
         .await
         .map_err(|e| format!("couldn't publish the agent roster: {e}"))?;
