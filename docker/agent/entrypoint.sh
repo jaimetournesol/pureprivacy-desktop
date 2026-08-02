@@ -27,6 +27,15 @@ if [ -z "${HERMES_WEBUI_PASSWORD:-}" ]; then
 fi
 export HERMES_WEBUI_PASSWORD
 
+# A generated password nobody can read is the same as a locked door with no key: the owner
+# would reach the WebUI over its onion and have nothing to type. So mirror it into the
+# handoff volume, which is exactly the box↔agent channel the Matrix credentials already use
+# (0600, private named volume, never published). The box hands it to the OWNER'S phone only,
+# and the phone fills it in for them.
+if [ -d /handoff ]; then
+  ( umask 077; printf '%s' "$HERMES_WEBUI_PASSWORD" > /handoff/webui-password ) || true
+fi
+
 # ── Reachability of the box ─────────────────────────────────────────────────────────────
 # Not fatal: the agent is still useful (and configurable) before the homeserver answers,
 # and the box may still be minting its onion on a first run. Say so rather than crash-loop.

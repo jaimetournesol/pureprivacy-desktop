@@ -26,6 +26,9 @@ pub const AGENTS_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.agents";
 /// account-data: an access token is secret material and account-data is readable by every
 /// device signed into the owner's account.
 const HANDOFF_PATH: &str = "/handoff/matrix.env";
+/// Written by the agent container (not by us) so the owner's phone can be given the WebUI
+/// password. Absent on a box with no agents installed, which is exactly right.
+const HANDOFF_WEBUI_PASSWORD: &str = "/handoff/webui-password";
 
 /// One provisioned agent.
 pub struct Provisioned {
@@ -216,6 +219,18 @@ pub async fn publish_registry(
     )
     .map(|s| s.trim().to_string())
     .unwrap_or_default();
+    // The WebUI password, generated inside the agent container and mirrored to the handoff
+    // volume for us. Handing it to the phone is what makes the password real rather than
+    // decorative — otherwise the owner meets a login form for a secret they've never seen.
+    //
+    // Trade-off, stated plainly: this puts a secret in the owner's account data, which
+    // tuwunel stores unencrypted. It is not a new exposure — the same box already holds the
+    // password file, the homeserver, and the agent — and reading it needs the owner's own
+    // access token over the onion. What it buys is that the password is a genuine second
+    // gate on a shell-capable UI instead of a value only the container knows.
+    let webui_password = std::fs::read_to_string(HANDOFF_WEBUI_PASSWORD)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     let r = client
         .put(url)
         .bearer_auth(owner_token)
@@ -223,6 +238,7 @@ pub async fn publish_registry(
             "agents": list,
             "webui_onion": webui_onion,
             "webui_port": crate::config::AGENT_WEBUI_ONION_PORT,
+            "webui_password": webui_password,
             "updated_ts": crate::agent::now_ms(),
         }))
         .send()
