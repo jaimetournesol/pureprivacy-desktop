@@ -41,12 +41,21 @@ fi
 
 # ── The agent image (only if asked for) ─────────────────────────────────────────────────
 if [ "$WANT_AGENTS" = "1" ]; then
-  AGENT_IMAGE="${PP_AGENT_IMAGE:-pureprivacy-agent:dev}"
+  # Same shape as the box image above: prefer the published one, build only as a fallback.
+  # This used to default straight to the LOCAL tag `pureprivacy-agent:dev` and build from
+  # source, so the published agent image was never used by the front door — every fresh
+  # install paid a multi-minute build and needed git/pip egress to get there.
+  AGENT_IMAGE="${PP_AGENT_IMAGE:-jaimemelon/pureprivacy-agent:latest}"
+  echo
   if docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1; then
     echo "→ agent image already present ($AGENT_IMAGE)"
   else
-    echo "→ building the agent image — this takes a few minutes the first time"
-    docker build -t "$AGENT_IMAGE" "$HERE/agent"
+    echo "→ getting the agent image ($AGENT_IMAGE)"
+    if ! docker pull "$AGENT_IMAGE"; then
+      echo "  couldn't pull it — building from source instead (a few minutes)"
+      AGENT_IMAGE="pureprivacy-agent:dev"
+      docker build -t "$AGENT_IMAGE" "$HERE/agent"
+    fi
   fi
 fi
 
@@ -65,6 +74,12 @@ if grep -q '^PP_AGENTS=' .env 2>/dev/null; then
   sed -i "s/^PP_AGENTS=.*/PP_AGENTS=$WANT_AGENTS/" .env
 else
   printf 'PP_AGENTS=%s\n' "$WANT_AGENTS" >> .env
+fi
+if [ "$WANT_AGENTS" = "1" ] && ! grep -q '^PP_AGENT_IMAGE=' .env 2>/dev/null; then
+  # Record the image we actually resolved. Without this a source-built fallback would be
+  # ignored: compose now defaults to the PUBLISHED agent image, so a locally built
+  # `pureprivacy-agent:dev` has to be named explicitly to be the one that runs.
+  printf 'PP_AGENT_IMAGE=%s\n' "$AGENT_IMAGE" >> .env
 fi
 if ! grep -q '^PP_IMAGE=' .env 2>/dev/null; then
   printf 'PP_IMAGE=%s\n' "$BOX_IMAGE" >> .env

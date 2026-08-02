@@ -42,7 +42,7 @@ services:
   # deliberately a host action; the phone's one-tap setup then provisions the agent that
   # this service runs.
   agent:
-    image: ${PP_AGENT_IMAGE:-pureprivacy-agent:dev}
+    image: ${PP_AGENT_IMAGE:-jaimemelon/pureprivacy-agent:latest}
     container_name: pureprivacy-agent
     profiles: ["agents"]
     restart: unless-stopped

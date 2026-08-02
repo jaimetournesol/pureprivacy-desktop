@@ -217,11 +217,17 @@ EOF
     case "${1:-status}" in
       on)
         if agents_on; then echo "● agents: already installed"; exit 0; fi
-        if ! docker image inspect "${PP_AGENT_IMAGE:-pureprivacy-agent:dev}" >/dev/null 2>&1; then
-          echo "No agent image yet. Build it first:"
-          echo "    (cd agent && docker build -t pureprivacy-agent:dev .)"
-          echo "…then run this again."
-          exit 1
+        # Pull, don't lecture. This used to check for a LOCAL tag and tell the owner to run
+        # a docker build — so the published agent image was never used by any normal path.
+        ai="${PP_AGENT_IMAGE:-jaimemelon/pureprivacy-agent:latest}"
+        if ! docker image inspect "$ai" >/dev/null 2>&1; then
+          echo "→ getting the agent image ($ai)"
+          if ! docker pull "$ai"; then
+            echo "Couldn't pull the agent image. Build it from source instead:"
+            echo "    (cd agent && docker build -t pureprivacy-agent:dev .)"
+            echo "    then add PP_AGENT_IMAGE=pureprivacy-agent:dev to .env"
+            exit 1
+          fi
         fi
         if grep -q '^PP_AGENTS=' "$HERE/.env"; then
           sed -i 's/^PP_AGENTS=.*/PP_AGENTS=1/' "$HERE/.env"
