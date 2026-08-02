@@ -181,6 +181,22 @@ async fn create_room(
             "is_direct": true,
             "name": name,
             "invite": [agent_user],
+            // Encryption ON at creation, not bolted on later.
+            //
+            // Without this the room is plaintext, and everything downstream that promises
+            // otherwise quietly fails instead: the phone refuses to send ("refusing to send
+            // into a non-encrypted room" — correctly), and the agent, which we start with
+            // MATRIX_E2EE_MODE=required, won't work there either. The result is a chat that
+            // looks fine and silently swallows every message.
+            //
+            // It must be in initial_state: `m.room.encryption` can only be turned on, never
+            // off, so setting it at creation is both safe and the only way to guarantee no
+            // plaintext event ever exists in the room's history.
+            "initial_state": [{
+                "type": "m.room.encryption",
+                "state_key": "",
+                "content": { "algorithm": "m.megolm.v1.aes-sha2" },
+            }],
         }))
         .send()
         .await
