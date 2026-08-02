@@ -40,6 +40,25 @@ RUN git init webui && cd webui \
     && git fetch --depth 1 origin "$HERMES_WEBUI_REF" \
     && git checkout FETCH_HEAD
 
+# ── Patch: don't probe the endpoint on every keystroke ───────────────────────────────────
+# Upstream's base-URL field runs `oninput="...;_scheduleOnboardingProbe()"`, which fires a
+# probe 400ms after each keystroke. The probe calls _setOnboardingProbeState(), which calls
+# _renderOnboardingBody() — and that REBUILDS the <input> you are typing into. The element
+# is destroyed and replaced, so focus is lost; on Android the keyboard closes with it, which
+# makes the field effectively untypable on a phone (and fires connection attempts the user
+# never asked for).
+#
+# We keep both deliberate triggers: onblur (you've finished typing) and the explicit "Test
+# connection" button. Only the per-keystroke probe goes.
+#
+# `grep -q` first so a future HERMES_WEBUI_REF bump FAILS THE BUILD rather than silently
+# shipping without the patch — a sed that matches nothing exits 0 and would look fine.
+RUN cd webui/static \
+    && grep -q 'this.value;_scheduleOnboardingProbe()' onboarding.js \
+    && sed -i 's/this\.value;_scheduleOnboardingProbe()/this.value/' onboarding.js \
+    && ! grep -q 'this.value;_scheduleOnboardingProbe()' onboarding.js \
+    && echo "patched: base-URL field no longer probes on every keystroke"
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # The venv lives OUTSIDE the agent's own checkout on purpose: hermes-agent's README warns
