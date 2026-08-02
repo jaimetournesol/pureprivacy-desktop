@@ -157,6 +157,7 @@ fn write_handoff(
     token: &str,
     device: &str,
     owner: &str,
+    room: Option<&str>,
 ) -> Result<(), String> {
     let dir = std::path::Path::new(HANDOFF_PATH)
         .parent()
@@ -189,6 +190,12 @@ fn write_handoff(
         if !v.is_empty() {
             body.push_str(&format!("{k}={v}\n"));
         }
+    }
+    // The agent's own room, so the container can set it as the Hermes home channel. Without
+    // it every new agent opens with "No home channel is set for Matrix" — a question the
+    // owner shouldn't have to answer, since we just created the one room it has.
+    if let Some(room) = room.filter(|r| !r.is_empty()) {
+        body.push_str(&format!("PP_AGENT_ROOM={room}\n"));
     }
 
     let agents_dir = std::path::Path::new(HANDOFF_AGENTS_DIR);
@@ -614,14 +621,26 @@ pub async fn setup(
 
     let password = random_password();
     let (user_id, token, device) = register(client, base, &localpart, &password, join_token).await?;
-    write_handoff(&localpart, spec, onion, &user_id, &token, &device, owner)?;
-
+    // Room BEFORE handoff: the handoff carries the room id so the container can set it as
+    // the agent's home channel. The container starts provisioning the moment the handoff
+    // file lands, so writing it first would race — and the room is one API call away.
     let room_id = create_room(client, base, owner_token, &user_id, &display).await;
     if room_id.is_none() {
         // Not fatal: the account and runtime are live, and a room can be created later.
         // Better to report a working-but-incomplete setup than to fail the whole thing.
         eprintln!("[pureprivacy] agent: account created but the room wasn't — will retry later");
     }
+
+    write_handoff(
+        &localpart,
+        spec,
+        onion,
+        &user_id,
+        &token,
+        &device,
+        owner,
+        room_id.as_deref(),
+    )?;
 
     existing.push(Provisioned {
         user_id: user_id.clone(),

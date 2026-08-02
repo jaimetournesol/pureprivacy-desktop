@@ -132,6 +132,17 @@ address gains an attacker nothing. This is only possible because it's a separate
 client auth is per-service, and enabling it on the main onion would break federation.
 There is a password on top of that, which you choose.
 
+**The agent has a real toolchain.** It can compile things, build from source and run node —
+gcc/g++/make/cmake, the usual `-dev` headers, node + npm, plus `jq`, `sqlite3`, `psql`,
+`rsync`, `ssh`, `shellcheck`, `pdftotext`, ImageMagick, `ps`/`free`, `fd`, `bat`. That is
+about 1.2 GB of the image; build with `--build-arg PP_DEV_TOOLS=0` for a lean box that only
+relays chat.
+
+One rule when working in there: **`python` and `pip` are the agent's own runtime**
+(`/opt/hermes/venv`, first on `PATH`), so installing into them can take the agent down
+mid-conversation. Run `mkvenv <name>` instead — it creates a scratch venv under the
+workspace volume (so it survives container recreates) with its own `pip`.
+
 Two things worth knowing before you rely on it:
 
 - **`pp-box backup` does not cover the agents' volume.** It tars the box's own identity.

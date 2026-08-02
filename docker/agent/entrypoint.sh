@@ -166,18 +166,64 @@ provision_profile() {
     base="$(handoff_get "$env_file" PP_AGENT_BASE_URL)"
     key="$(handoff_get "$env_file" PP_AGENT_API_KEY)"
     echo "[agent] '$lp' configured for provider '$prov'"
-    ( umask 077
-      {
-        echo "model:"
-        echo "  provider: $prov"
-        if [ -n "$mdl" ];  then echo "  default: $mdl"; fi
-        if [ -n "$base" ]; then echo "  base_url: $base"; fi
-        # model.api_key, NOT OPENAI_API_KEY in .env: Hermes host-gates OPENAI_API_KEY to
-        # openai.com, so a key put there is silently dropped for any other endpoint and the
-        # runtime falls through to "no-key-required" → 401. See docs/HANDOFF.
-        if [ -n "$key" ];  then echo "  api_key: $key"; fi
-      } > "$home/config.yaml"
-    )
+    # MERGE the model block — do not rewrite the file.
+    #
+    # This runs on EVERY boot, and config.yaml is where Hermes persists things the owner
+    # sets from inside the agent: `/sethome` writes the home channel here (canonically),
+    # and Agent settings writes tool/gateway config here too. A `> config.yaml` would throw
+    # all of that away at the next container restart, silently and repeatedly.
+    #
+    # model.api_key, NOT OPENAI_API_KEY in .env: Hermes host-gates OPENAI_API_KEY to
+    # openai.com, so a key put there is silently dropped for any other endpoint and the
+    # runtime falls through to "no-key-required" → 401. See docs/HANDOFF.
+    if ! /opt/hermes/venv/bin/python - "$home/config.yaml" "$prov" "$mdl" "$base" "$key" <<'PY'
+import os, sys
+
+path, prov, mdl, base, key = sys.argv[1:6]
+
+# Round-trip through ruamel so the cloned config's comments and key order survive. A
+# profile's config.yaml is the file Hermes ships its own documentation in — the fallback
+# parser keeps this working if ruamel ever goes away, at the cost of those comments.
+try:
+    from ruamel.yaml import YAML
+
+    _yaml = YAML()
+    _yaml.preserve_quotes = True
+    load, dump = _yaml.load, (lambda data, fh: _yaml.dump(data, fh))
+except ImportError:
+    import yaml
+
+    load = yaml.safe_load
+    dump = lambda data, fh: yaml.safe_dump(data, fh, sort_keys=False)
+
+try:
+    with open(path) as fh:
+        cfg = load(fh) or {}
+except FileNotFoundError:
+    cfg = {}
+if not isinstance(cfg, dict):
+    cfg = {}
+
+# Replace the model block wholesale, keep everything else. Picking a provider in the wizard
+# is a complete statement about the model, and --clone copied the PREVIOUS agent's block:
+# merging key-by-key would leave that agent's base_url or api_key behind, silently pointing
+# the new agent at the wrong endpoint. Everything outside `model:` is the owner's and stays.
+model = {"provider": prov}
+for field, value in (("default", mdl), ("base_url", base), ("api_key", key)):
+    if value:
+        model[field] = value
+cfg["model"] = model
+
+tmp = path + ".pp-new"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as fh:
+    dump(cfg, fh)
+os.replace(tmp, path)
+PY
+    then
+      echo "[agent] could not write config.yaml for '$lp'" >&2
+      return 1
+    fi
     chmod 600 "$home/config.yaml"
   fi
 
@@ -190,12 +236,23 @@ provision_profile() {
     rec_line="MATRIX_RECOVERY_KEY_OUTPUT_FILE=$rec_file"
   fi
 
+  # The agent's own room, so it has a home channel from the start. Without it Hermes opens
+  # every new agent with "📬 No home channel is set for Matrix" — a real prompt (it is where
+  # cron results and cross-platform messages get delivered), but one the owner should never
+  # have to answer: an agent added from the phone has exactly one room, and the box just
+  # created it. Only strip the key when we have a replacement, so a manual `/sethome`
+  # survives on boxes whose handoff predates this.
+  local room; room="$(handoff_get "$env_file" PP_AGENT_ROOM)"
+  local owned="MATRIX_HOMESERVER|MATRIX_USER_ID|MATRIX_ACCESS_TOKEN|MATRIX_DEVICE_ID"
+  owned="$owned|MATRIX_ALLOWED_USERS|MATRIX_E2EE_MODE|MATRIX_RECOVERY_KEY"
+  owned="$owned|MATRIX_RECOVERY_KEY_OUTPUT_FILE"
+  if [ -n "$room" ]; then owned="$owned|MATRIX_HOME_ROOM"; fi
+
   # Rewrite only the keys we own, so anything the owner set in Agent settings survives.
   local tmp="$home/.env.pp-new"
   ( umask 077
     if [ -f "$home/.env" ]; then
-      grep -vE '^(MATRIX_HOMESERVER|MATRIX_USER_ID|MATRIX_ACCESS_TOKEN|MATRIX_DEVICE_ID|MATRIX_ALLOWED_USERS|MATRIX_E2EE_MODE|MATRIX_RECOVERY_KEY|MATRIX_RECOVERY_KEY_OUTPUT_FILE)=' \
-        "$home/.env" > "$tmp" 2>/dev/null || true
+      grep -vE "^($owned)=" "$home/.env" > "$tmp" 2>/dev/null || true
     else
       : > "$tmp"
     fi
@@ -207,6 +264,7 @@ provision_profile() {
       echo "MATRIX_ALLOWED_USERS=$(handoff_get "$env_file" PP_OWNER)"
       echo "MATRIX_E2EE_MODE=required"
       echo "$rec_line"
+      if [ -n "$room" ]; then echo "MATRIX_HOME_ROOM=$room"; fi
     } >> "$tmp"
   )
   mv "$tmp" "$home/.env"
@@ -259,6 +317,12 @@ gateway_watch() {
         # the one plaintext exception. "optional" would silently fall back to cleartext when
         # a room isn't encrypted, which is the failure mode you'd never notice.
         export MATRIX_E2EE_MODE="${MATRIX_E2EE_MODE:-required}"
+        # The first agent's own room, as its Hermes home channel — the destination for cron
+        # results and cross-platform messages. Without it Hermes opens the conversation with
+        # "📬 No home channel is set for Matrix" and asks the owner to run /sethome, which
+        # they should never have to: the box created the one room this agent has. Same
+        # reasoning as the secondary-profile path in provision_profile.
+        if [ -n "${PP_AGENT_ROOM:-}" ]; then export MATRIX_HOME_ROOM="$PP_AGENT_ROOM"; fi
         # ── Cross-signing identity ──────────────────────────────────────────────────────
         # Without this the agent's device is never signed by its own identity, so every
         # client shows it as unverified ("not verified by its owner" in Element) and has no

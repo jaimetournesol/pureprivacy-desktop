@@ -59,6 +59,28 @@ RUN cd webui/static \
     && ! grep -q 'this.value;_scheduleOnboardingProbe()' onboarding.js \
     && echo "patched: base-URL field no longer probes on every keystroke"
 
+# ── Patch: give every PROFILE its own Matrix crypto store ────────────────────────────────
+# Upstream resolves the Matrix store path into module constants at import time, so all
+# profiles served by `gateway.multiplex_profiles` share the FIRST profile's olm account.
+# A box runs one agent per profile, each its own Matrix account — so agent #2 loads agent
+# #1's device keys, fails /keys/query for its own mxid, and _connect() returns False with
+# nothing logged at ERROR. The agent exists, has a room, shows up in the app, and never
+# answers. Rationale and the exact upstream lines are in the patch script's docstring.
+#
+# The script is fail-loud by design: it exits non-zero (failing the build) if the lines it
+# replaces are not found exactly once, so a HERMES_AGENT_REF bump cannot silently ship
+# unpatched. If upstream fixes this, delete the patch file and this COPY/RUN pair.
+# The second patch is the same defect one layer down: upstream made MATRIX_RECOVERY_KEY
+# scope-aware (their #69090) but missed MATRIX_RECOVERY_KEY_OUTPUT_FILE, so a secondary
+# agent is told "not configured" and never bootstraps cross-signing — leaving its device
+# unsigned, which is what wedges a phone's send queue.
+COPY patches/ /opt/hermes/patches/
+RUN ADAPTER=/opt/hermes/agent/plugins/platforms/matrix/adapter.py \
+    && python3 /opt/hermes/patches/matrix-per-profile-store.py "$ADAPTER" \
+    && python3 /opt/hermes/patches/matrix-per-profile-recovery-output.py "$ADAPTER" \
+    && grep -q 'class _PerProfilePath:' "$ADAPTER" \
+    && grep -q 'def _scoped_recovery_key_output_file' "$ADAPTER"
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # The venv lives OUTSIDE the agent's own checkout on purpose: hermes-agent's README warns
@@ -84,6 +106,71 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libolm3 git ripgrep ffmpeg curl ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# ── Toolchain ───────────────────────────────────────────────────────────────────────────
+# The base above is what the AGENT RUNTIME needs. This block is what the agent needs to do
+# actual work: compile something, build a dependency from source, inspect a database, poke
+# at a PDF, run a node script. Without it the agent hits "gcc: not found" mid-task and has
+# no way out — `sudo apt install` works (see the shim) but is lost on the next container
+# recreate, so the agent silently re-does it forever.
+#
+# Costs roughly +700 MB. That is a deliberate trade against the size argument at the top of
+# this file: a box that only relays chat does not need it, a box you actually work from
+# does. Build with `--build-arg PP_DEV_TOOLS=0` for the lean image.
+ARG PP_DEV_TOOLS=1
+RUN if [ "$PP_DEV_TOOLS" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends \
+        `# compilers and build systems` \
+        build-essential pkg-config cmake autoconf automake libtool m4 bison flex patch \
+        `# headers the common "pip install X" / "./configure" builds actually ask for` \
+        libssl-dev zlib1g-dev libffi-dev libbz2-dev liblzma-dev libreadline-dev \
+        libsqlite3-dev libxml2-dev libxslt1-dev libjpeg-dev libpng-dev libfreetype6-dev \
+        libyaml-dev libpq-dev libcurl4-openssl-dev libolm-dev \
+        `# node, because a large share of real-world tooling is npm-shaped` \
+        nodejs npm \
+        `# process + network visibility — the agent had no ps, no free, no ss` \
+        procps psmisc htop iproute2 iputils-ping dnsutils netcat-openbsd socat \
+        `# archives and transfer` \
+        unzip zip xz-utils bzip2 p7zip-full wget rsync openssh-client \
+        `# everyday shell` \
+        jq less nano vim-tiny file tree diffutils gnupg moreutils bc time \
+        `# data + documents` \
+        sqlite3 postgresql-client poppler-utils imagemagick \
+        `# writing shell without a linter is how the entrypoint bugs happened` \
+        shellcheck \
+        fd-find bat \
+      && rm -rf /var/lib/apt/lists/* \
+      && ln -sf "$(command -v fdfind)" /usr/local/bin/fd \
+      && ln -sf "$(command -v batcat)" /usr/local/bin/bat \
+      && echo "dev toolchain installed"; \
+    else echo "dev toolchain skipped (PP_DEV_TOOLS=$PP_DEV_TOOLS)"; fi
+
+# ── Don't let the agent pip-install into its own runtime ─────────────────────────────────
+# `python`, `pip` and friends resolve to /opt/hermes/venv (PATH puts it first) — that is
+# HERMES ITSELF. `pip install` there can upgrade a dependency out from under the running
+# agent and take the gateway down mid-conversation, with no obvious cause.
+#
+# So: ship `uv` in the runtime too (the build stage already used it) and give the agent a
+# one-word way to get a scratch environment. `mkvenv` makes one under the workspace volume,
+# where it also survives container recreates. The system interpreter stays reachable at its
+# real path for anything that needs it.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    '# mkvenv [name] — scratch venv under the workspace. NEVER pip-install into' \
+    '# /opt/hermes/venv: that is the running agent. See docker/agent/Dockerfile.' \
+    'set -eu' \
+    'name="${1:-venv}"' \
+    'dir="${HERMES_WORKSPACE:-/data/workspace}/.venvs/$name"' \
+    '# --seed is load-bearing: without pip INSIDE the venv, `pip` after activation falls' \
+    '# through PATH to /opt/hermes/venv/bin/pip and installs into the running agent.' \
+    'uv venv --seed "$dir" --python /usr/local/bin/python3' \
+    'echo "$dir"' \
+    'echo "activate with: . $dir/bin/activate"' \
+    > /usr/local/bin/mkvenv \
+    && chmod 0755 /usr/local/bin/mkvenv \
+    && [ -x /usr/local/bin/uv ] \
+    && echo "mkvenv installed"
 
 # ── sudo ────────────────────────────────────────────────────────────────────────────────
 # The agent already runs as uid 0 INSIDE this container, so it has full authority over its
