@@ -17,6 +17,7 @@
 #   ./pp-box update          rebuild the image + recreate the box (keeps identity)
 #   ./pp-box backup [dir]    tar the volume (onion key + secrets + pairings) — DO THIS
 #   ./pp-box restore <file>  restore a backup into the volume (box must be down)
+#   ./pp-box agents on|off   install / remove the optional agents add-on (separate image)
 #   ./pp-box shell           open a shell inside the container
 #   ./pp-box destroy         remove the box AND its volume (irreversible; asks first)
 #
@@ -28,10 +29,19 @@ cd "$HERE"                                    # so `docker compose` uses this di
 # one host can't collide. CRITICAL: this volume holds the onion key — it must resolve to the
 # SAME name for the life of the box, or you get a new, empty box. Installs made before
 # PP_VOLUME existed have no such line, so they fall back to the original fixed name.
-VOLUME="$(sed -n 's/^PP_VOLUME=//p' "$HERE/.env" 2>/dev/null | head -1)"
+# `|| true`: with `set -o pipefail`, sed exits 2 when .env doesn't exist yet and that
+# status propagates out of the substitution, so `set -e` killed the script before it could
+# even print help. A box that hasn't been init'd is the NORMAL state on a fresh clone.
+VOLUME="$(sed -n 's/^PP_VOLUME=//p' "$HERE/.env" 2>/dev/null | head -1 || true)"
 [ -n "$VOLUME" ] || VOLUME="pureprivacy-data"
 IMAGE="${IMAGE:-pureprivacy-box:dev}"
-DC() { docker compose "$@"; }
+# Agents are an OPTIONAL add-on in a separate image, gated behind a compose profile, so a
+# plain box never pulls or runs them. PP_AGENTS=1 in .env turns the profile on for every
+# compose call — that single switch is what "installed" means.
+agents_on() { [ "$(sed -n 's/^PP_AGENTS=//p' "$HERE/.env" 2>/dev/null | head -1 || true)" = "1" ]; }
+DC() {
+  if agents_on; then docker compose --profile agents "$@"; else docker compose "$@"; fi
+}
 
 die() { echo "error: $*" >&2; exit 1; }
 have_env() { [ -f "$HERE/.env" ] || die "no .env yet — run: ./pp-box init"; }
@@ -67,6 +77,12 @@ case "$cmd" in
       # Scripted setup needs an explicit account name — there is no default.
       while [ -z "$u" ]; do read -rp "Phone login username (required): " u; done
     fi
+    # Optional add-on, chosen here so a plain install stays plain (a separate ~1.8 GB image).
+    echo
+    echo "Agents (optional): run AI agents on your box, in their own container."
+    echo "They appear in a separate 'Agents' app on your phone — never mixed into Messaging."
+    read -rp "Install agents too? [y/N] " wa
+    case "$wa" in y|Y|yes|YES) agents=1 ;; *) agents=0 ;; esac
     key="$(openssl rand -base64 32)"
     # Unique per-install volume name, generated ONCE here and pinned in .env. Keeps two boxes
     # on one host from colliding. It must never change afterwards — it holds the onion key.
@@ -83,6 +99,9 @@ PP_BOX=$b
 PP_PASS=$p
 PP_SECRETS_KEY=$key
 PP_VOLUME=$vol
+# Agents add-on: 1 = the 'agents' compose profile is on for every pp-box command.
+# Change it with:  ./pp-box agents on|off   (never by hand while the box is running).
+PP_AGENTS=$agents
 EOF
     echo "✓ this box's data volume: $vol   (recorded in .env — keep it)"
     # A volume from an earlier install may still be on this host. Be explicit that this new box
@@ -190,6 +209,46 @@ EOF
     docker run --rm -v "$VOLUME":/data -v "$dir":/backup alpine \
       sh -c 'rm -rf /data/* /data/..?* 2>/dev/null; tar xzf "/backup/'"$base"'" -C /data' >/dev/null
     echo "✓ restored into $VOLUME. Start it:  ./pp-box up"
+    ;;
+
+  agents)
+    have_env
+    case "${1:-status}" in
+      on)
+        if agents_on; then echo "● agents: already installed"; exit 0; fi
+        if ! docker image inspect "${PP_AGENT_IMAGE:-pureprivacy-agent:dev}" >/dev/null 2>&1; then
+          echo "No agent image yet. Build it first:"
+          echo "    (cd agent && docker build -t pureprivacy-agent:dev .)"
+          echo "…then run this again."
+          exit 1
+        fi
+        if grep -q '^PP_AGENTS=' "$HERE/.env"; then
+          sed -i 's/^PP_AGENTS=.*/PP_AGENTS=1/' "$HERE/.env"
+        else
+          printf 'PP_AGENTS=1\n' >> "$HERE/.env"
+        fi
+        DC up -d
+        echo "✓ agents installed. Finish setup from the Agents app on your phone."
+        ;;
+      off)
+        # Stop + remove ONLY the agent service. The agent's data volume is left alone, so
+        # turning agents back on keeps its profiles, memories and skills.
+        docker compose --profile agents rm -sf agent >/dev/null 2>&1 || true
+        if grep -q '^PP_AGENTS=' "$HERE/.env"; then
+          sed -i 's/^PP_AGENTS=.*/PP_AGENTS=0/' "$HERE/.env"
+        fi
+        echo "✓ agents removed. Their data volume is kept — './pp-box agents on' restores it."
+        ;;
+      status|"")
+        if agents_on; then
+          st="$(docker ps --filter name=pureprivacy-agent --format '{{.Status}}')"
+          echo "● agents: installed   ${st:-(not running — try ./pp-box up)}"
+        else
+          echo "● agents: not installed   (install: ./pp-box agents on)"
+        fi
+        ;;
+      *) die "usage: ./pp-box agents [on|off|status]" ;;
+    esac
     ;;
 
   shell)  docker exec -it pureprivacy-box bash 2>/dev/null || docker exec -it pureprivacy-box sh ;;

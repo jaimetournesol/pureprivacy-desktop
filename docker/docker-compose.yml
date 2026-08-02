@@ -26,6 +26,36 @@ services:
       - "127.0.0.1:8470:8470"
     volumes:
       - pp-data:/data
+
+  # ── Agents (optional add-on) ────────────────────────────────────────────────────────
+  # A SEPARATE image, behind a compose profile, so a plain box stays a plain box: without
+  # `--profile agents` this service is never created and nothing here is pulled. Choose it
+  # at install time (`pp-box init`) or turn it on later (`pp-box agents on`).
+  #
+  # Why it can only be enabled from the HOST: the box is itself a container, so starting a
+  # sibling would need /var/run/docker.sock — i.e. root on the host. Installing software is
+  # deliberately a host action; the phone's one-tap setup then provisions the agent that
+  # this service runs.
+  agent:
+    image: ${PP_AGENT_IMAGE:-pureprivacy-agent:dev}
+    container_name: pureprivacy-agent
+    profiles: ["agents"]
+    restart: unless-stopped
+    # Share the BOX's network namespace: the agent reaches tuwunel on 127.0.0.1:8118 and
+    # tor's SOCKS on 127.0.0.1:9150 with NO new port exposure, and its WebUI on
+    # 127.0.0.1:8787 lands on the box's loopback where tor can map a client-authorised
+    # onion port onto it. It also stops the agent taking a Tor circuit to reach the box
+    # sitting next to it. Consequence: this service has no ports/networks of its own, and
+    # it dies when the box container is recreated — hence `pp-box update` recreates both.
+    network_mode: "service:box"
+    depends_on:
+      - box
+    volumes:
+      - pp-agent-data:/data
+      # Credential handoff: the box provisions the agent's Matrix account and drops it
+      # here; the agent picks it up and starts its gateway. Secrets never ride account-data.
+      - pp-agent-handoff:/handoff
+
 volumes:
   pp-data:
     # Per-install volume name. `pp-box init` generates a unique one into .env (PP_VOLUME) so
@@ -33,3 +63,10 @@ volumes:
     # volume holds the onion key; pointing at a different name = a new, empty box.
     # Existing installs (no PP_VOLUME in .env) keep the original name, so nothing is orphaned.
     name: ${PP_VOLUME:-pureprivacy-data}
+  pp-agent-data:
+    # The agent's own state: profiles (= the agents themselves), sessions, memories, skills,
+    # and ~/.hermes/.env with the model API keys. SECRET MATERIAL — and note `pp-box backup`
+    # currently tars only the box's volume, so this is NOT yet covered by it.
+    name: ${PP_AGENT_VOLUME:-pureprivacy-agent-data}
+  pp-agent-handoff:
+    name: ${PP_AGENT_HANDOFF_VOLUME:-pureprivacy-agent-handoff}
