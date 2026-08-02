@@ -24,8 +24,13 @@ Your box is your always-on private cloud. What it hosts today, and where it's go
 - **🚧 Social (planned)** — a Tor-only, self-hosted, federated alternative to the
   corporate timeline: post from your box, follow other boxes, and content flows
   box-to-box over Tor — no company, no algorithm, no clearnet.
-- **🚧 Files & personal agents (planned)** — the box is built to host apps; the
-  phone becomes the launcher for all of them.
+- **✅ Agents** — AI agents that run on your own box, reached over Tor like
+  everything else. Each gets its own account and its own end-to-end encrypted
+  chat, and a box can run several. Their control panel rides a *second* onion
+  behind tor v3 client authorisation, because it can run shell commands.
+  Optional add-on: `./pp-box agents on`, or choose it at install.
+- **🚧 Files (planned)** — the box is built to host apps; the phone becomes the
+  launcher for all of them.
 
 ## Run your box
 
@@ -247,4 +252,5 @@ licences, with a written source offer for the AGPL ones, in
 | Messaging + voice/video calls           | ✅ working |
 | Social — Tor-only federated timeline (ActivityPub over onion) | 🚧 planned |
 | File storage / sync                     | 🚧 planned |
-| Personal agents (cross-box agent mesh)  | 🚧 planned |
+| Agents (several per box, own account + E2EE room each) | ✅ working |
+| Cross-box agent mesh                    | 🚧 planned |

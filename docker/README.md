@@ -107,6 +107,39 @@ docker load -i pp-box.tar      # ← on Windows
 (Or build it directly inside WSL2 and run from there.) A self-contained image you can
 `docker build` / `docker pull` on any OS is the Stage-2 follow-up.
 
+## Agents (optional add-on)
+
+AI agents that run on your box, reached over Tor like everything else. Off unless you ask
+for it — `./pp-box agents on`, or choose it when the installer offers.
+
+```
+./pp-box agents on        # install (pulls jaimemelon/pureprivacy-agent)
+./pp-box agents status
+./pp-box agents ui        # open the control panel in a browser on THIS machine
+./pp-box agents off       # remove the container; the data volume is kept
+```
+
+Each agent gets its own Matrix account on your box and its own end-to-end encrypted room,
+and one box can run several — add them with **+** in the phone's Agents app. The box
+provisions the account; the agent container runs the model. They meet at a private
+handoff volume, so access tokens never travel through anything the phone can read.
+
+**Its control panel rides a second onion.** The panel can run shell commands, and your
+box's main onion is known to every paired peer — so it is published on a *separate*
+hidden service protected by **tor v3 client authorisation**: without the key your phone
+holds, the service cannot even be looked up. That gate sits below HTTP, so learning the
+address gains an attacker nothing. This is only possible because it's a separate service —
+client auth is per-service, and enabling it on the main onion would break federation.
+There is a password on top of that, which you choose.
+
+Two things worth knowing before you rely on it:
+
+- **`pp-box backup` does not cover the agents' volume.** It tars the box's own identity.
+  Agent profiles, memories, skills and **model API keys** live in
+  `pureprivacy-agent-data` and need their own backup.
+- **Agents can't be deleted yet.** They can be added from the app; removing one is manual
+  and leaves its Matrix account behind, so that name can't be reused.
+
 ## Back up your box — it's the whole identity
 
 An `.onion` address is derived from a secret key that exists **only** in your box's data
