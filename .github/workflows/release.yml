@@ -10,6 +10,11 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual runs exist so a workflow fix can be PROVEN green without cutting a tag — this
+  # workflow was red on every release since v0.1.8 and nobody could see a fix work short of
+  # releasing. A dispatch run builds everything but skips the draft-release upload (that
+  # step needs a tag to name the release).
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -100,7 +105,14 @@ jobs:
       #   if: matrix.name == 'win-x64'
       #   run: cargo install trusted-signing-cli --locked
 
+      # On a dispatch run there is no tag, so tagName would be a branch name and the draft
+      # release would be created named after it — build only, upload nothing.
+      - name: Build only (manual run — no release)
+        if: github.event_name == 'workflow_dispatch'
+        run: pnpm tauri build --bundles deb appimage
+
       - name: Build and publish draft release
+        if: github.event_name != 'workflow_dispatch'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

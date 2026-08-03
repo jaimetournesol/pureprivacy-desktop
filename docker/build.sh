@@ -18,6 +18,9 @@ for b in tor tuwunel caddy livekit-server lk-jwt-service; do
   if [ -f "$BIN_SRC/$b" ]; then cp "$BIN_SRC/$b" "$HERE/bin/$b"
   else echo "warn: sidecar '$b' missing at $BIN_SRC (box will run without it)"; fi
 done
+# The Expert-Bundle tor has no rpath and needs ITS libs, not whichever libevent the image's
+# base happens to ship. The supervisor sets LD_LIBRARY_PATH to <bin>/tor-libs when present.
+if [ -d "$BIN_SRC/tor-libs" ]; then cp -r "$BIN_SRC/tor-libs" "$HERE/bin/tor-libs"; fi
 cp "$APP_BIN" "$HERE/pureprivacy"
 
 echo "staged $(du -sh "$HERE/bin" | cut -f1) sidecars + $(du -h "$HERE/pureprivacy" | cut -f1) binary"

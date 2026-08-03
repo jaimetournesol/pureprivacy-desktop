@@ -67,6 +67,10 @@ if [[ "$UNINSTALL" == 1 ]]; then
       warn "$BIN_DIR/$bin not present — nothing to do"
     fi
   done
+  if [[ -d "$BIN_DIR/tor-libs" ]]; then
+    rm -rf "$BIN_DIR/tor-libs"
+    ok "removed $BIN_DIR/tor-libs"
+  fi
   rmdir "$BIN_DIR" 2>/dev/null && ok "removed empty dir $BIN_DIR" || true
   exit 0
 fi
@@ -80,8 +84,18 @@ fi
 # verify <path> — true if the binary runs and reports a version
 verify() { "$1" --version >/dev/null 2>&1; }
 
+# tor ships with its own libevent/libssl/libcrypto (the Expert Bundle links them from the
+# system, with NO rpath — checked with readelf). On a host that happens to have them, the
+# bare binary works; on a bare CI runner it dies loading libevent, which read as "failed
+# verify (unknown)", fell back to apt tor 0.4.8.10, and tripped the EOL floor — every
+# Release run since v0.1.8. So the bundle's libs land in $BIN_DIR/tor-libs and every run
+# of tor — here and in the supervisor — points LD_LIBRARY_PATH at them. Harmless when the
+# dir is absent (system-tor path): the loader just falls through to the system libs.
+TOR_LIBS="$BIN_DIR/tor-libs"
+tor_verify() { LD_LIBRARY_PATH="$TOR_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$1" --version >/dev/null 2>&1; }
+
 # tor_ver <path>  → the dotted tor version ("0.4.9.11") or empty.
-tor_ver() { "$1" --version 2>/dev/null | head -n1 | grep -oE '[0-9]+(\.[0-9]+){3}' | head -n1; }
+tor_ver() { LD_LIBRARY_PATH="$TOR_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$1" --version 2>/dev/null | head -n1 | grep -oE '[0-9]+(\.[0-9]+){3}' | head -n1; }
 # ver_ge A B  → success if version A >= version B (dotted numeric, via sort -V).
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
 
@@ -130,7 +144,7 @@ fetch_tuwunel() {
 fetch_tor() {
   local dest="$BIN_DIR/tor"
 
-  if [[ "$FORCE" == 0 && -x "$dest" ]] && verify "$dest"; then
+  if [[ "$FORCE" == 0 && -x "$dest" ]] && tor_verify "$dest"; then
     local cur; cur="$(tor_ver "$dest")"
     if [[ -n "$cur" ]] && ver_ge "$cur" "$TOR_MIN"; then
       ok "tor already present ($cur ≥ $TOR_MIN) — skipping"
@@ -151,12 +165,17 @@ fetch_tor() {
     local url="https://archive.torproject.org/tor-package-archive/torbrowser/${TOR_EB_VER}/tor-expert-bundle-${eb_arch}-${TOR_EB_VER}.tar.gz"
     local tmp; tmp="$(mktemp -d)"
     info "Fetching pinned Tor Expert Bundle ${TOR_EB_VER} (${eb_arch})"
-    if curl -fsSL "$url" -o "$tmp/teb.tgz" && tar -xzf "$tmp/teb.tgz" -C "$tmp" tor/tor 2>/dev/null && [[ -x "$tmp/tor/tor" ]]; then
+    if curl -fsSL "$url" -o "$tmp/teb.tgz" && tar -xzf "$tmp/teb.tgz" -C "$tmp" tor 2>/dev/null && [[ -x "$tmp/tor/tor" ]]; then
       cp "$tmp/tor/tor" "$dest" && chmod 0755 "$dest"
+      # The libs tor was built against travel WITH it (see TOR_LIBS above). Copy only the
+      # shared objects — the bundle's tor/ dir also holds pluggable transports and geoip
+      # data we don't ship.
+      mkdir -p "$TOR_LIBS"
+      cp "$tmp"/tor/*.so* "$TOR_LIBS"/ 2>/dev/null || true
       rm -rf "$tmp"
       local v; v="$(tor_ver "$dest")"
-      if verify "$dest" && [[ -n "$v" ]] && ver_ge "$v" "$TOR_MIN"; then
-        ok "tor installed from Expert Bundle: $v"
+      if tor_verify "$dest" && [[ -n "$v" ]] && ver_ge "$v" "$TOR_MIN"; then
+        ok "tor installed from Expert Bundle: $v (libs in tor-libs/)"
         return 0
       fi
       warn "Expert-Bundle tor failed verify/floor (${v:-unknown}) — trying system tor"
@@ -194,7 +213,10 @@ fetch_tor() {
 
   cp "$sys_tor" "$dest" || { err "failed to copy $sys_tor"; return 1; }
   chmod 0755 "$dest"
-  if ! verify "$dest"; then
+  # A system tor was built against system libs — stale Expert-Bundle libs in tor-libs
+  # would shadow them at runtime. Clear the dir so LD_LIBRARY_PATH points at nothing.
+  rm -rf "$TOR_LIBS"
+  if ! tor_verify "$dest"; then
     err "tor was copied but '$dest --version' failed"
     rm -f "$dest"; return 1
   fi

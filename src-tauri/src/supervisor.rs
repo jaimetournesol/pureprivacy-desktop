@@ -413,13 +413,33 @@ async fn run_real(app: AppHandle, gen: u64, admin_password: Option<String>) -> R
     config::render_tuwunel(&app, known_onion.as_deref().unwrap_or("placeholder.onion"), "", "", voice)?;
 
     let bins = bin_dir(&app)?;
+    // The bundled (Expert Bundle) tor has NO rpath and links libevent/libssl from wherever
+    // the loader finds them. fetch-sidecars.sh ships those libs in <bin>/tor-libs; point
+    // the loader at them or the bundled tor only runs on hosts that happen to have the
+    // right system libs — the failure that broke every CI release build. When the dir is
+    // absent (system tor), pass nothing: shadowing a system tor's libs would be the same
+    // bug in the other direction.
+    let tor_envs: Vec<(String, String)> = {
+        let libs = bins.join("tor-libs");
+        if libs.is_dir() {
+            let mut path = libs.to_string_lossy().into_owned();
+            if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
+                if !existing.is_empty() {
+                    path = format!("{path}:{existing}");
+                }
+            }
+            vec![("LD_LIBRARY_PATH".into(), path)]
+        } else {
+            vec![]
+        }
+    };
     spawn_supervised(
         app.clone(),
         gen,
         "tor",
         bins.join("tor"),
         vec!["-f".into(), paths.torrc.to_string_lossy().into_owned()],
-        vec![],
+        tor_envs,
         Readiness::File(paths.hostname_file.clone()),
     );
 
