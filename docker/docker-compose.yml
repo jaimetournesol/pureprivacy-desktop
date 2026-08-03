@@ -70,8 +70,8 @@ volumes:
     name: ${PP_VOLUME:-pureprivacy-data}
   pp-agent-data:
     # The agent's own state: profiles (= the agents themselves), sessions, memories, skills,
-    # and ~/.hermes/.env with the model API keys. SECRET MATERIAL — and note `pp-box backup`
-    # currently tars only the box's volume, so this is NOT yet covered by it.
+    # and ~/.hermes/.env with the model API keys. SECRET MATERIAL — `pp-box backup` bundles
+    # this volume alongside the box's own, so a restore brings the agents back with it.
     name: ${PP_AGENT_VOLUME:-pureprivacy-agent-data}
   pp-agent-handoff:
     name: ${PP_AGENT_HANDOFF_VOLUME:-pureprivacy-agent-handoff}
