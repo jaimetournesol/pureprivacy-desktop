@@ -109,7 +109,9 @@ jobs:
       # release would be created named after it — build only, upload nothing.
       - name: Build only (manual run — no release)
         if: github.event_name == 'workflow_dispatch'
-        run: pnpm tauri build --bundles deb appimage
+        # --verbose so bundler-tool failures (linuxdeploy et al.) surface their own stderr —
+        # without it tauri reports only "failed to run linuxdeploy" and the cause is invisible.
+        run: pnpm tauri build --bundles deb appimage --verbose
 
       - name: Build and publish draft release
         if: github.event_name != 'workflow_dispatch'
