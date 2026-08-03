@@ -966,7 +966,7 @@ fn validate_command(
     if !matches!(
         action.as_str(),
         "restart" | "reset" | "backup" | "update" | "check_update" | "agent_setup"
-            | "agent_remove" | "agent_auth"
+            | "agent_remove" | "agent_auth" | "agent_session_new" | "agent_session_delete"
     ) {
         return None; // allowlist only (a cleared "done" command lands here → ignored)
     }
@@ -1509,6 +1509,70 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .send()
                                 .await;
                             eprintln!("[pureprivacy] agent remove requested (ok={ok}): {msg}");
+                        } else if action == "agent_session_new"
+                            || action == "agent_session_delete"
+                        {
+                            // Conversations within one agent. Cheap and non-destructive on the
+                            // way in; the delete half leaves and forgets ONE room and cannot
+                            // touch the agent itself, which is what agent_remove is for.
+                            let _ = client
+                                .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({ "id": id, "action": "done" }))
+                                .send()
+                                .await;
+                            let sessions_url =
+                                ad_url(crate::agent::SESSIONS_ACCOUNT_DATA_TYPE);
+                            let res = if action == "agent_session_new" {
+                                crate::agent::session_new(
+                                    &client,
+                                    &base,
+                                    &sessions_url,
+                                    &t,
+                                    cmd.get("agent_user")
+                                        .and_then(|p| p.as_str())
+                                        .unwrap_or("")
+                                        .trim(),
+                                    cmd.get("agent_name")
+                                        .and_then(|p| p.as_str())
+                                        .unwrap_or("")
+                                        .trim(),
+                                )
+                                .await
+                                .map(|_room| "New conversation started.".to_string())
+                            } else {
+                                crate::agent::session_delete(
+                                    &client,
+                                    &base,
+                                    &ad_url(crate::agent::AGENTS_ACCOUNT_DATA_TYPE),
+                                    &sessions_url,
+                                    &t,
+                                    cmd.get("room_id")
+                                        .and_then(|p| p.as_str())
+                                        .unwrap_or("")
+                                        .trim(),
+                                )
+                                .await
+                            };
+                            let (ok, msg) = match res {
+                                Ok(m) => (true, m),
+                                Err(e) => (false, e),
+                            };
+                            let mut out = serde_json::json!({
+                                "id": id, "ok": ok, "done": true, "done_ts": now_ms(),
+                            });
+                            if ok {
+                                out["message"] = serde_json::json!(msg);
+                            } else {
+                                out["error"] = serde_json::json!(msg);
+                            }
+                            let _ = client
+                                .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&out)
+                                .send()
+                                .await;
+                            eprintln!("[pureprivacy] {action} (ok={ok}): {msg}");
                         } else if action == "agent_auth" {
                             // Device-code sign-in (Codex). Unlike every other command here this
                             // one is not over when the box finishes its part: the owner has to

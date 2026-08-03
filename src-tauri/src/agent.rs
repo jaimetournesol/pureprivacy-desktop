@@ -339,6 +339,107 @@ pub fn set_webui_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
+// --- Sessions within an agent ---------------------------------------------------------------
+//
+// A session IS a room. That isn't a workaround for the lack of a session API — it's how the
+// agent runtime already works: its session key is `agent:<profile>:matrix:dm:<room_id>`, so a
+// second room with the same agent is a second conversation with its own history, and the
+// adapter auto-joins an invite from the owner. Nothing on the agent side had to change.
+//
+// The box keeps the list because it is the only party that knows which rooms it created for
+// which agent. Deriving it on the phone would mean guessing from room membership, and a wrong
+// guess here puts an AI in the Messaging list next to real people.
+pub const SESSIONS_ACCOUNT_DATA_TYPE: &str = "ai.tournesol.pureprivacy.agent_sessions";
+
+async fn read_sessions(client: &reqwest::Client, url: &str, token: &str) -> Value {
+    match client.get(url).bearer_auth(token).send().await {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_else(|_| json!({})),
+        _ => json!({}),
+    }
+}
+
+/// Start a new conversation with an agent: a fresh room, which the agent joins by itself.
+///
+/// The agent is invited, not joined for it — `_on_invite` accepts invites from the owner, and
+/// going through the invite is what makes the room a DM in the agent's own `m.direct`.
+pub async fn session_new(
+    client: &reqwest::Client,
+    base: &str,
+    sessions_url: &str,
+    owner_token: &str,
+    agent_user: &str,
+    title: &str,
+) -> Result<String, String> {
+    if agent_user.is_empty() {
+        return Err("no agent given".into());
+    }
+    let title = title.trim();
+    let name = if title.is_empty() { "New conversation" } else { title };
+    let room = create_room(client, base, owner_token, agent_user, name)
+        .await
+        .ok_or("couldn't create the conversation on your box")?;
+
+    let mut all = read_sessions(client, sessions_url, owner_token).await;
+    let list = all
+        .as_object_mut()
+        .ok_or("the session list is corrupt")?
+        .entry(agent_user.to_string())
+        .or_insert_with(|| json!([]));
+    if let Some(arr) = list.as_array_mut() {
+        arr.push(json!({ "room_id": room, "title": name, "created_ts": now_ms() }));
+    }
+    client
+        .put(sessions_url)
+        .bearer_auth(owner_token)
+        .json(&all)
+        .send()
+        .await
+        .map_err(|e| format!("couldn't record the conversation: {e}"))?;
+    Ok(room)
+}
+
+/// Delete one conversation. The agent's OTHER sessions are untouched.
+///
+/// Leaves and forgets the room, then drops it from the list. Order matters: a room dropped
+/// from the list but still joined would be an orphan the phone can no longer name, and it
+/// would surface in Messaging as a chat with an AI — the exact thing the agent split prevents.
+pub async fn session_delete(
+    client: &reqwest::Client,
+    base: &str,
+    registry_url: &str,
+    sessions_url: &str,
+    owner_token: &str,
+    room_id: &str,
+) -> Result<String, String> {
+    if room_id.is_empty() {
+        return Err("no conversation given".into());
+    }
+    let gone = leave_and_forget(client, base, registry_url, owner_token, room_id).await;
+    let mut all = read_sessions(client, sessions_url, owner_token).await;
+    if let Some(map) = all.as_object_mut() {
+        for (_agent, list) in map.iter_mut() {
+            if let Some(arr) = list.as_array_mut() {
+                arr.retain(|s| s.get("room_id").and_then(|r| r.as_str()) != Some(room_id));
+            }
+        }
+    }
+    let _ = client
+        .put(sessions_url)
+        .bearer_auth(owner_token)
+        .json(&all)
+        .send()
+        .await;
+    // The transcript itself lives in the agent container's session store, keyed
+    // `agent:<profile>:matrix:dm:<room_id>`. It is NOT deleted here — see the note in
+    // HANDOFF: the multiplexed gateway holds ONE session store for every profile, so
+    // reaching into it is a bigger change than this command. Say what was actually done.
+    if gone {
+        Ok("Conversation deleted.".into())
+    } else {
+        Err("couldn't delete that conversation on your box".into())
+    }
+}
+
 // --- Device-code sign-in (Codex and friends) ------------------------------------------------
 //
 // Some providers can't be finished with a key typed on a phone: Codex is a device-code OAuth
