@@ -219,9 +219,14 @@ COPY entrypoint.sh /opt/hermes/entrypoint.sh
 # the entrypoint touches that file on every boot — so a lossy writer erodes the owner's
 # settings one restart at a time. See the script's docstring.
 COPY bin/pp-config-set /usr/local/bin/pp-config-set
-RUN chmod +x /opt/hermes/entrypoint.sh /usr/local/bin/pp-config-set \
+# pp-auth-daemon runs a device-code sign-in (Codex et al) for an owner who is holding a PHONE,
+# not a shell: it drives the blocking `hermes auth add` on a pty and publishes the user code
+# to the box over /handoff. See the script's docstring for why a pty is mandatory.
+COPY bin/pp-auth-daemon /usr/local/bin/pp-auth-daemon
+RUN chmod +x /opt/hermes/entrypoint.sh /usr/local/bin/pp-config-set /usr/local/bin/pp-auth-daemon \
     && pp-config-set 2>&1 | grep -q "pp-config-set" \
-    && echo "pp-config-set installed"
+    && python3 -c "import ast,sys; ast.parse(open('/usr/local/bin/pp-auth-daemon').read())" \
+    && echo "pp-config-set + pp-auth-daemon installed"
 
 # Everything stateful lives under /data so ONE volume carries it: config, the agent's
 # profiles (= the agents themselves), sessions, memories, skills, and ~/.hermes/.env which

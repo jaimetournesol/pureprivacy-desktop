@@ -966,7 +966,7 @@ fn validate_command(
     if !matches!(
         action.as_str(),
         "restart" | "reset" | "backup" | "update" | "check_update" | "agent_setup"
-            | "agent_remove"
+            | "agent_remove" | "agent_auth"
     ) {
         return None; // allowlist only (a cleared "done" command lands here → ignored)
     }
@@ -1509,6 +1509,112 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .send()
                                 .await;
                             eprintln!("[pureprivacy] agent remove requested (ok={ok}): {msg}");
+                        } else if action == "agent_auth" {
+                            // Device-code sign-in (Codex). Unlike every other command here this
+                            // one is not over when the box finishes its part: the owner has to
+                            // go and type a code at the provider. So this arm STAYS RESIDENT,
+                            // republishing progress under the same command id until the
+                            // container reaches a verdict — that's what lets the wizard show a
+                            // live code instead of a spinner with nothing behind it.
+                            let provider = cmd
+                                .get("provider")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            let _ = client
+                                .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({ "id": id, "action": "done" }))
+                                .send()
+                                .await;
+                            let started = crate::agent::auth_start(&id, &provider);
+                            if let Err(e) = started {
+                                let _ = client
+                                    .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                    .bearer_auth(&t)
+                                    .json(&serde_json::json!({
+                                        "id": id, "ok": false, "done": true,
+                                        "done_ts": now_ms(), "error": e,
+                                    }))
+                                    .send()
+                                    .await;
+                            } else {
+                                let _ = client
+                                    .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                    .bearer_auth(&t)
+                                    .json(&serde_json::json!({
+                                        "id": id, "done": false,
+                                        "message": "Starting sign-in…",
+                                    }))
+                                    .send()
+                                    .await;
+                                // Bounded: the provider's code expires, and a wizard left
+                                // waiting forever is worse than one told the code went stale.
+                                // Every exit from this loop writes a terminal result.
+                                let deadline = now_ms() + 16 * 60 * 1000;
+                                let mut published_code = String::new();
+                                let mut terminal: Option<(bool, String)> = None;
+                                while now_ms() < deadline {
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    match crate::agent::auth_progress(&id) {
+                                        Some(crate::agent::AuthProgress::Pending {
+                                            verification_uri,
+                                            user_code,
+                                        }) => {
+                                            // Publish once. The phone polls this key; rewriting
+                                            // an unchanged code every 2s is pure sync traffic
+                                            // over Tor for no new information.
+                                            if published_code != user_code {
+                                                published_code = user_code.clone();
+                                                let _ = client
+                                                    .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                                    .bearer_auth(&t)
+                                                    .json(&serde_json::json!({
+                                                        "id": id, "done": false,
+                                                        "message": "Waiting for you to sign in…",
+                                                        "verification_uri": verification_uri,
+                                                        "user_code": user_code,
+                                                    }))
+                                                    .send()
+                                                    .await;
+                                            }
+                                        }
+                                        Some(crate::agent::AuthProgress::Ok(m)) => {
+                                            terminal = Some((true, m));
+                                            break;
+                                        }
+                                        Some(crate::agent::AuthProgress::Failed(e)) => {
+                                            terminal = Some((false, e));
+                                            break;
+                                        }
+                                        // Started but no code yet, or the container hasn't
+                                        // answered at all — keep waiting.
+                                        Some(crate::agent::AuthProgress::Starting) | None => {}
+                                    }
+                                }
+                                let (ok, msg) = terminal.unwrap_or_else(|| {
+                                    // Timed out. Tell the container to stop polling too,
+                                    // otherwise it keeps a dead flow alive in the background.
+                                    let _ = crate::agent::auth_cancel(&id);
+                                    (false, "the sign-in code expired before it was used".into())
+                                });
+                                let mut out = serde_json::json!({
+                                    "id": id, "ok": ok, "done": true, "done_ts": now_ms(),
+                                });
+                                if ok {
+                                    out["message"] = serde_json::json!(msg);
+                                } else {
+                                    out["error"] = serde_json::json!(msg);
+                                }
+                                let _ = client
+                                    .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                    .bearer_auth(&t)
+                                    .json(&out)
+                                    .send()
+                                    .await;
+                                eprintln!("[pureprivacy] agent auth {provider} (ok={ok}): {msg}");
+                            }
                         } else if action == "check_update" || action == "update" {
                             // Feature H. Clear the command first (once-only), then do the work
                             // and report. Neither action is destructive to data, and `update`

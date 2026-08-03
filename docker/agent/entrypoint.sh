@@ -117,6 +117,26 @@ password_watch() {
 password_watch &
 pids+=($!)
 
+# ── Device-code sign-in, driven from the phone ──────────────────────────────────────────
+# `hermes auth add openai-codex --type oauth` prints a code and then BLOCKS until the owner
+# signs in in a browser. The owner is on a phone with no shell here, so this watcher runs that
+# command on a pty and hands the code back over /handoff for the box to relay. It is a watcher,
+# not a one-shot: sign-in happens whenever the owner adds a Codex agent, long after boot.
+#
+# Not fatal if it dies — every other provider is an API key typed on the phone, and a container
+# that refuses to start because an OPTIONAL sign-in helper fell over would take the agents with
+# it. So it is restarted quietly rather than being allowed to fail the container.
+if [ -d /handoff ]; then
+  auth_watch() {
+    while true; do
+      pp-auth-daemon || echo "[agent] auth watcher exited; restarting" >&2
+      sleep 5
+    done
+  }
+  auth_watch &
+  pids+=($!)
+fi
+
 # ── Agents beyond the first ─────────────────────────────────────────────────────────────
 # One box can run several agents. Each is a Hermes PROFILE with its own home, config, model,
 # memory and skills — and its own Matrix account, so it shows up as its own contact in the

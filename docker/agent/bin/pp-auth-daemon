@@ -1,0 +1,229 @@
+#!/opt/hermes/venv/bin/python
+"""Run a Hermes device-code sign-in on behalf of the owner's PHONE.
+
+    pp-auth-daemon            # watch /handoff/auth-request.json forever
+
+Why this exists: `hermes auth add openai-codex --type oauth` is a DEVICE-CODE flow. It prints
+a URL and a short code, then BLOCKS polling OpenAI until the owner signs in in a browser. The
+owner is holding a phone, not a shell on the box, so something on this side has to run that
+blocking command, surface the code, and report the outcome. This is that something.
+
+The box↔agent channel is the /handoff volume — the same private, unpublished, 0600 volume the
+Matrix credentials and the WebUI password already ride (see entrypoint.sh). The box writes a
+request; we answer with a status file it polls and mirrors to the phone over Matrix.
+
+    /handoff/auth-request.json   {"id","provider","action"?}          box  -> agent
+    /handoff/auth-status.json    {"id","state",...}                   agent -> box
+
+`state` walks starting -> pending -> ok|error|cancelled and never goes backwards. `pending`
+carries `verification_uri` + `user_code`: that is the whole point of the exercise, and it is
+written the moment it is scraped rather than at the end, because the code is only useful
+WHILE the child is still blocking on it.
+
+Two things this is careful about:
+
+* **A pty is mandatory.** Hermes prints the code with a plain `print()`, and Python
+  block-buffers stdout when it is a pipe — so run through a pipe and the code does not appear
+  until the process exits, which is exactly too late to use it. `pty.openpty()` makes the
+  child believe it is on a terminal and flush per line.
+* **The exit code is not the verdict.** `script`/pty wrappers report the WRAPPER's status, and
+  a timeout kill can still look like 0. So success is decided by re-reading auth.json and
+  checking the provider actually landed in the credential pool. That is the state the gateway
+  will read later, so it is the only claim worth making to the owner.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pty
+import re
+import select
+import signal
+import sys
+import time
+
+REQUEST = "/handoff/auth-request.json"
+STATUS = "/handoff/auth-status.json"
+HERMES = "/opt/hermes/venv/bin/hermes"
+
+# The device code expires at OpenAI's end (~15 min). Outliving it by a little is fine — the
+# child would just keep polling a dead code — so cap the run and always report an outcome.
+# A pending state that never resolves is the worst thing the phone could be left holding.
+RUN_TIMEOUT_S = 15 * 60
+POLL_S = 2
+
+# Strip the SGR colour Hermes wraps the URL and the code in, or the scrape sees
+# "\x1b[94mhttps://..." and hands the phone a link with escape bytes in it.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+URL_RE = re.compile(r"https?://[^\s]+")
+# e.g. 6SCQ-P1Z5Y. Deliberately not \w+: a bare word would also match "Waiting" and every
+# other prose line the flow prints.
+CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b")
+
+
+def write_status(**fields) -> None:
+    """Publish the current state for the box. Atomic: the box polls this on its own clock and
+    must never read a half-written file and decide the flow failed."""
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(fields, fh)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATUS)
+
+
+def credential_present(hermes_home: str, provider: str) -> bool:
+    """Did the credential actually land? This — not the exit status — is the verdict."""
+    try:
+        with open(os.path.join(hermes_home, "auth.json")) as fh:
+            auth = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if provider in (auth.get("credential_pool") or {}):
+        return True
+    return any(
+        isinstance(p, dict) and p.get("provider") == provider
+        for p in (auth.get("providers") or [])
+    )
+
+
+def run_flow(req_id: str, provider: str, hermes_home: str) -> None:
+    env = dict(os.environ, HERMES_HOME=hermes_home)
+    # Hermes asks argparse-shaped questions on a real terminal; --no-browser is what makes it
+    # print the code instead of trying to open a browser this container does not have.
+    argv = [HERMES, "auth", "add", provider, "--type", "oauth", "--no-browser"]
+
+    pid, fd = pty.fork()
+    if pid == 0:  # child
+        try:
+            os.execve(argv[0], argv, env)
+        finally:
+            os._exit(127)
+
+    started = time.monotonic()
+    buf = ""
+    uri = code = None
+    published = False
+    transcript = []
+    try:
+        while True:
+            if time.monotonic() - started > RUN_TIMEOUT_S:
+                os.kill(pid, signal.SIGKILL)
+                break
+            # Watch for a cancel while we block: the owner can back out of the wizard, and a
+            # forgotten child would sit polling OpenAI until the timeout.
+            if cancel_requested(req_id):
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                write_status(id=req_id, state="cancelled")
+                return
+            r, _, _ = select.select([fd], [], [], POLL_S)
+            if r:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:  # pty closes with the child
+                    chunk = b""
+                if not chunk:
+                    break
+                text = ANSI.sub("", chunk.decode("utf-8", "replace"))
+                transcript.append(text)
+                buf += text
+                if uri is None:
+                    m = URL_RE.search(buf)
+                    if m:
+                        uri = m.group(0).strip().rstrip(".,")
+                if code is None:
+                    m = CODE_RE.search(buf)
+                    if m:
+                        code = m.group(1)
+                if uri and code and not published:
+                    # Publish the instant both are known — the code is only usable while the
+                    # child is still blocking on it.
+                    published = True
+                    write_status(
+                        id=req_id, state="pending", provider=provider,
+                        verification_uri=uri, user_code=code,
+                        expires_ts=int(time.time() * 1000) + RUN_TIMEOUT_S * 1000,
+                    )
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                # Drain whatever the child printed on its way out before deciding.
+                while select.select([fd], [], [], 0)[0]:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    transcript.append(ANSI.sub("", chunk.decode("utf-8", "replace")))
+                break
+    finally:
+        os.close(fd)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    if credential_present(hermes_home, provider):
+        write_status(id=req_id, state="ok", provider=provider,
+                     message=f"Signed in to {provider}.")
+        return
+    # Failed. Hand back the child's last words rather than a generic string — "code expired"
+    # and "network unreachable" need different reactions from the owner.
+    tail = "".join(transcript).strip().splitlines()
+    detail = next((ln.strip() for ln in reversed(tail) if ln.strip()), "")
+    if not code:
+        detail = detail or "the sign-in never produced a code"
+    write_status(id=req_id, state="error", provider=provider,
+                 error=detail or "sign-in did not complete")
+
+
+def cancel_requested(req_id: str) -> bool:
+    req = read_request()
+    return bool(req) and req.get("id") == req_id and req.get("action") == "cancel"
+
+
+def read_request() -> dict | None:
+    try:
+        with open(REQUEST) as fh:
+            req = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return req if isinstance(req, dict) else None
+
+
+def main() -> int:
+    handled: set[str] = set()
+    while True:
+        req = read_request()
+        if req:
+            req_id = str(req.get("id") or "")
+            provider = str(req.get("provider") or "")
+            action = req.get("action")
+            # Allowlist. This spawns a process from a file the box writes; keep the shape of
+            # what can be spawned pinned here rather than trusting the field.
+            if (
+                req_id
+                and req_id not in handled
+                and action != "cancel"
+                and re.fullmatch(r"[a-z0-9][a-z0-9-]{1,40}", provider)
+            ):
+                handled.add(req_id)
+                # HERMES_HOME is left at the container default on purpose: the multiplexed
+                # gateway is only KNOWN to read the shared /data/hermes/auth.json, and a
+                # per-profile auth.json is untested against it (same risk class as the
+                # crypto-store bug). One owner, one OpenAI subscription — shared is also what
+                # the owner means. Revisit only with a test that proves per-profile resolves.
+                hermes_home = os.environ.get("HERMES_HOME", "/data/hermes")
+                write_status(id=req_id, state="starting", provider=provider)
+                print(f"[auth] starting {provider} device-code sign-in for the owner",
+                      flush=True)
+                try:
+                    run_flow(req_id, provider, hermes_home)
+                except Exception as exc:  # never let one bad run kill the watcher
+                    write_status(id=req_id, state="error", provider=provider,
+                                 error=f"sign-in crashed: {exc}")
+                print(f"[auth] {provider} sign-in finished", flush=True)
+        time.sleep(POLL_S)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

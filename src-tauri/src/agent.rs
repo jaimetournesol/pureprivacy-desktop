@@ -339,6 +339,94 @@ pub fn set_webui_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
+// --- Device-code sign-in (Codex and friends) ------------------------------------------------
+//
+// Some providers can't be finished with a key typed on a phone: Codex is a device-code OAuth
+// flow that prints a short user code, waits for the owner to enter it at OpenAI, and only then
+// yields a credential. The blocking half runs INSIDE the agent container (`pp-auth-daemon`,
+// which needs a pty — see its docstring); our job here is only to ask for it and to relay what
+// comes back, so the owner sees the code on the phone they're holding.
+const HANDOFF_AUTH_REQUEST: &str = "/handoff/auth-request.json";
+const HANDOFF_AUTH_STATUS: &str = "/handoff/auth-status.json";
+
+/// What the agent container is currently reporting about a sign-in.
+///
+/// `Pending` is the interesting one: it carries the code the owner has to type, and it exists
+/// precisely because the flow is NOT finished — the phone shows it while the box keeps waiting.
+pub enum AuthProgress {
+    /// Started, but the code hasn't been printed yet.
+    Starting,
+    Pending { verification_uri: String, user_code: String },
+    Ok(String),
+    Failed(String),
+}
+
+/// Ask the agent container to begin a device-code sign-in. Returns immediately — the flow takes
+/// as long as the owner takes to open a browser, so the caller polls [`auth_progress`].
+pub fn auth_start(id: &str, provider: &str) -> Result<(), String> {
+    if !std::path::Path::new("/handoff").exists() {
+        return Err("the agents add-on isn't installed on this box".into());
+    }
+    // The container spawns a process named by this field, so pin its shape here as well as
+    // there. Two independent checks on the same value is the point, not duplication.
+    if provider.is_empty()
+        || provider.len() > 40
+        || !provider
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err("unknown sign-in provider".into());
+    }
+    // Clear any status left by a previous attempt BEFORE asking for a new one, or the first
+    // poll reads the last run's verdict and reports a sign-in that hasn't happened yet.
+    let _ = std::fs::remove_file(HANDOFF_AUTH_STATUS);
+    write_0600(
+        std::path::Path::new(HANDOFF_AUTH_REQUEST),
+        &json!({ "id": id, "provider": provider, "issued_ts": now_ms() }).to_string(),
+    )
+}
+
+/// Ask the container to abandon a sign-in the owner backed out of, so it stops polling OpenAI.
+pub fn auth_cancel(id: &str) -> Result<(), String> {
+    write_0600(
+        std::path::Path::new(HANDOFF_AUTH_REQUEST),
+        &json!({ "id": id, "action": "cancel" }).to_string(),
+    )
+}
+
+/// Read the container's status for `id`. `None` = nothing about THIS request yet.
+///
+/// Matching on the id matters: the status file is a single slot, so without it a stale verdict
+/// from an earlier attempt would be reported as this one's.
+pub fn auth_progress(id: &str) -> Option<AuthProgress> {
+    let raw = std::fs::read_to_string(HANDOFF_AUTH_STATUS).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    if v.get("id").and_then(|i| i.as_str()) != Some(id) {
+        return None;
+    }
+    match v.get("state").and_then(|s| s.as_str()).unwrap_or("") {
+        "starting" => Some(AuthProgress::Starting),
+        "pending" => Some(AuthProgress::Pending {
+            verification_uri: v.get("verification_uri")?.as_str()?.to_string(),
+            user_code: v.get("user_code")?.as_str()?.to_string(),
+        }),
+        "ok" => Some(AuthProgress::Ok(
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Signed in.")
+                .to_string(),
+        )),
+        "cancelled" => Some(AuthProgress::Failed("Sign-in cancelled.".into())),
+        "error" => Some(AuthProgress::Failed(
+            v.get("error")
+                .and_then(|m| m.as_str())
+                .unwrap_or("sign-in didn't complete")
+                .to_string(),
+        )),
+        _ => None,
+    }
+}
+
 /// Publish the roster. This is what the phone keys "is this an AI?" off.
 pub async fn publish_registry(
     client: &reqwest::Client,
