@@ -2369,3 +2369,108 @@ fn spawn_supervised(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    //! The command gate is the box's ONLY remote-command surface: a phone writes a blob
+    //! into account-data and this decides whether it runs. Every rule here is
+    //! load-bearing — a regression is remote command execution (replay) or a dead phone
+    //! app (over-rejection). The gate is pure logic over JSON, so it gets pinned.
+    use super::validate_command;
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    fn fresh_expiry() -> u64 {
+        super::now_ms() + 60_000 // one minute out: comfortably inside the 5-minute window
+    }
+
+    fn cmd(id: &str, action: &str, expires: u64) -> serde_json::Value {
+        json!({ "id": id, "action": action, "expires_ts": expires })
+    }
+
+    #[test]
+    fn a_fresh_allowlisted_command_runs() {
+        let ok = validate_command(&cmd("c1", "restart", fresh_expiry()), &HashSet::new());
+        assert_eq!(ok, Some(("c1".into(), "restart".into())));
+    }
+
+    #[test]
+    fn every_allowlisted_action_is_accepted() {
+        // The allowlist in validate_command and this list must move together; a phone
+        // feature shipping before its action lands here is a silent no-op on the box.
+        for action in [
+            "restart", "reset", "backup", "update", "check_update", "agent_setup",
+            "agent_remove", "agent_auth", "agent_session_new", "agent_session_delete",
+        ] {
+            assert!(
+                validate_command(&cmd("id", action, fresh_expiry()), &HashSet::new()).is_some(),
+                "allowlisted action '{action}' was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_actions_never_run() {
+        for action in ["", "done", "shell", "exec", "restart ", "RESTART", "agent_setup2"] {
+            assert!(
+                validate_command(&cmd("id", action, fresh_expiry()), &HashSet::new()).is_none(),
+                "non-allowlisted action '{action}' was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handled_id_never_runs_twice() {
+        // Once-only execution: the replay defence for a blob an attacker re-writes verbatim.
+        let mut handled = HashSet::new();
+        handled.insert("c1".to_string());
+        assert!(validate_command(&cmd("c1", "restart", fresh_expiry()), &handled).is_none());
+        // ...but a new id still passes with the same action.
+        assert!(validate_command(&cmd("c2", "restart", fresh_expiry()), &handled).is_some());
+    }
+
+    #[test]
+    fn an_empty_id_never_runs() {
+        assert!(validate_command(&cmd("", "restart", fresh_expiry()), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn expired_commands_never_run() {
+        // expires_ts <= now: kills replay of any old blob.
+        let past = super::now_ms().saturating_sub(1);
+        assert!(validate_command(&cmd("c1", "restart", past), &HashSet::new()).is_none());
+        assert!(validate_command(&cmd("c1", "restart", 0), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn far_future_expiries_never_run() {
+        // expires_ts > now + 5min: a blob minted with a year-long expiry would otherwise
+        // be an indefinitely replayable command the moment its id rotates out of `handled`.
+        let too_far = super::now_ms() + 6 * 60 * 1000;
+        assert!(validate_command(&cmd("c1", "restart", too_far), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn a_missing_or_malformed_expiry_never_runs() {
+        // A "done" tombstone has no expires_ts — it must land here, not execute.
+        let no_expiry = json!({ "id": "c1", "action": "restart" });
+        assert!(validate_command(&no_expiry, &HashSet::new()).is_none());
+        let wrong_type = json!({ "id": "c1", "action": "restart", "expires_ts": "soon" });
+        assert!(validate_command(&wrong_type, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn malformed_blobs_never_run() {
+        for blob in [
+            json!({}),
+            json!({ "action": "restart", "expires_ts": fresh_expiry() }), // no id
+            json!({ "id": "c1", "expires_ts": fresh_expiry() }),          // no action
+            json!({ "id": 7, "action": "restart", "expires_ts": fresh_expiry() }), // id not a string
+            json!({ "id": "c1", "action": 7, "expires_ts": fresh_expiry() }), // action not a string
+            json!(null),
+            json!("restart"),
+        ] {
+            assert!(validate_command(&blob, &HashSet::new()).is_none(), "accepted: {blob}");
+        }
+    }
+}
