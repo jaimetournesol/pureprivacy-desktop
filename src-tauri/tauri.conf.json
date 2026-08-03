@@ -34,7 +34,7 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "sidecars/*"
+      "sidecars/**/*"
     ]
   },
   "mainBinaryName": "pureprivacy"
