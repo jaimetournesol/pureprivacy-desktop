@@ -966,6 +966,7 @@ fn validate_command(
     if !matches!(
         action.as_str(),
         "restart" | "reset" | "backup" | "update" | "check_update" | "agent_setup"
+            | "agent_remove"
     ) {
         return None; // allowlist only (a cleared "done" command lands here → ignored)
     }
@@ -1226,10 +1227,60 @@ async fn run_box_config(app: AppHandle, gen: u64) {
             // phone happened to be synced. No-op when no agent is provisioned.
             crate::agent::republish_from_handoff(
                 &client,
+                &base,
                 &ad_url(crate::agent::AGENTS_ACCOUNT_DATA_TYPE),
                 &t,
+                &onion,
+                &user_id,
             )
             .await;
+
+            // OPERATOR TOOL, OFF BY DEFAULT. Set PP_SWEEP_DEAD_ROOMS=1 to have the box clear
+            // rooms that cannot be a live conversation: ones with nobody else in them, and
+            // one-to-ones with an agent that no longer exists. Deliberately NOT automatic —
+            // it leaves rooms on the owner's behalf, and a box should not quietly delete
+            // things from someone's chat list because a heuristic said so. Runs once per
+            // process, after the republish so the roster it checks against is current.
+            if std::env::var("PP_SWEEP_DEAD_ROOMS").ok().as_deref() == Some("1") {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static SWEPT: AtomicBool = AtomicBool::new(false);
+                if !SWEPT.swap(true, Ordering::Relaxed) {
+                    let n = crate::agent::cleanup_dead_rooms(
+                        &client,
+                        &base,
+                        &ad_url(crate::agent::AGENTS_ACCOUNT_DATA_TYPE),
+                        &t,
+                        &onion,
+                        &user_id,
+                    )
+                    .await;
+                    eprintln!("[pureprivacy] agents: dead-room sweep cleared {n} room(s)");
+                }
+            }
+
+            // Clear rooms that cannot be a live conversation — empty ones, and one-to-ones
+            // with a deleted agent. ONCE per box start, not every pass: it walks every room's
+            // member state, and nothing creates a dead room while the box is running (agent
+            // removal cleans up its own). Runs after the republish so the roster it checks
+            // against is current — otherwise a live agent could look unknown and lose its room.
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static SWEPT: AtomicBool = AtomicBool::new(false);
+                if !SWEPT.swap(true, Ordering::Relaxed) {
+                    let n = crate::agent::cleanup_dead_rooms(
+                        &client,
+                        &base,
+                        &ad_url(crate::agent::AGENTS_ACCOUNT_DATA_TYPE),
+                        &t,
+                        &onion,
+                        &user_id,
+                    )
+                    .await;
+                    if n > 0 {
+                        eprintln!("[pureprivacy] agents: cleared {n} dead room(s)");
+                    }
+                }
+            }
 
             // 1b) Feature H: periodic update check, if the owner left automatic checks on
             // (default). Manual-only boxes still check when the phone sends `check_update`.
@@ -1407,6 +1458,57 @@ async fn run_box_config(app: AppHandle, gen: u64) {
                                 .send()
                                 .await;
                             eprintln!("[pureprivacy] agent setup requested by the phone (ok={ok}): {msg}");
+                        } else if action == "agent_remove" {
+                            // Destructive and near-irreversible, so the phone sends the exact
+                            // Matrix id of the row the owner tapped — never a display name.
+                            let target = cmd
+                                .get("agent_user")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            let _ = client
+                                .put(ad_url(COMMAND_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({ "id": id, "action": "done" }))
+                                .send()
+                                .await;
+                            let _ = client
+                                .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&serde_json::json!({
+                                    "id": id, "done": false, "message": "Removing…",
+                                }))
+                                .send()
+                                .await;
+                            let res = crate::agent::remove(
+                                &client,
+                                &base,
+                                &ad_url(crate::agent::AGENTS_ACCOUNT_DATA_TYPE),
+                                &t,
+                                &user_id,
+                                &target,
+                            )
+                            .await;
+                            let (ok, msg) = match res {
+                                Ok(m) => (true, m),
+                                Err(e) => (false, e),
+                            };
+                            let mut out = serde_json::json!({
+                                "id": id, "ok": ok, "done": true, "done_ts": now_ms(),
+                            });
+                            if ok {
+                                out["message"] = serde_json::json!(msg);
+                            } else {
+                                out["error"] = serde_json::json!(msg);
+                            }
+                            let _ = client
+                                .put(ad_url(COMMAND_RESULT_ACCOUNT_DATA_TYPE))
+                                .bearer_auth(&t)
+                                .json(&out)
+                                .send()
+                                .await;
+                            eprintln!("[pureprivacy] agent remove requested (ok={ok}): {msg}");
                         } else if action == "check_update" || action == "update" {
                             // Feature H. Clear the command first (once-only), then do the work
                             // and report. Neither action is destructive to data, and `update`

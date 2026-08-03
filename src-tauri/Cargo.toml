@@ -1,6 +1,6 @@
 [package]
 name = "pureprivacy"
-version = "0.1.8"
+version = "0.1.9"
 description = "PurePrivacy — your own private box"
 authors = ["Tournesol"]
 edition = "2021"

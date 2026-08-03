@@ -136,6 +136,42 @@ HERMES_PROFILES_DIR="$HERMES_HOME/profiles"
 # another container, and sourcing would execute whatever is in them.
 handoff_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
 
+# ── Working root ────────────────────────────────────────────────────────────────────────
+# Where the agent actually works: the directory its file and terminal tools resolve relative
+# paths against, and where a file you send it lands.
+#
+# Hermes defaults this to ~/workspace. Inside a container that is /root/workspace — on the
+# OVERLAY LAYER, not on the volume. So every `docker compose up --force-recreate` silently
+# deletes everything the agent has written or been sent, with no warning and nothing in a
+# backup. (Found the hard way: a photo sent to the agent was sitting in /root/workspace
+# after several rebuilds had already thrown away whatever came before it.)
+#
+# Per agent rather than one shared directory: agents are separate identities with separate
+# model providers, and "put the report in the root" from one shouldn't overwrite the other's.
+WORKSPACE_ROOT="${HERMES_WORKSPACE:-/data/workspace}"
+
+# Point profile $2's config at a persistent working root for agent $1, and migrate anything
+# Hermes already put in the ephemeral default so the first upgrade doesn't lose it.
+ensure_workspace() {
+  local lp="$1" cfg="$2"
+  local ws="$WORKSPACE_ROOT/$lp"
+  mkdir -p "$ws"
+
+  # One-time rescue of the pre-fix location. Only when the target is empty, so this can never
+  # overwrite real work on a later boot.
+  if [ -d /root/workspace ] && [ -z "$(ls -A "$ws" 2>/dev/null)" ] \
+     && [ -n "$(ls -A /root/workspace 2>/dev/null)" ]; then
+    echo "[agent] moving '$lp' workspace onto the data volume (was on the container layer)"
+    cp -a /root/workspace/. "$ws"/ 2>/dev/null || true
+  fi
+
+  # terminal.cwd is bridged to TERMINAL_CWD, which the gateway reads for the terminal tool,
+  # the code-exec tool, and relative-path resolution.
+  if ! pp-config-set "$cfg" terminal.cwd "$ws"; then
+    echo "[agent] could not set the working root for '$lp'" >&2
+  fi
+}
+
 # Give agent $1 (localpart) a profile carrying the credentials in $2 (its handoff file).
 provision_profile() {
   local lp="$1" env_file="$2"
@@ -176,56 +212,15 @@ provision_profile() {
     # model.api_key, NOT OPENAI_API_KEY in .env: Hermes host-gates OPENAI_API_KEY to
     # openai.com, so a key put there is silently dropped for any other endpoint and the
     # runtime falls through to "no-key-required" → 401. See docs/HANDOFF.
-    if ! /opt/hermes/venv/bin/python - "$home/config.yaml" "$prov" "$mdl" "$base" "$key" <<'PY'
-import os, sys
-
-path, prov, mdl, base, key = sys.argv[1:6]
-
-# Round-trip through ruamel so the cloned config's comments and key order survive. A
-# profile's config.yaml is the file Hermes ships its own documentation in — the fallback
-# parser keeps this working if ruamel ever goes away, at the cost of those comments.
-try:
-    from ruamel.yaml import YAML
-
-    _yaml = YAML()
-    _yaml.preserve_quotes = True
-    load, dump = _yaml.load, (lambda data, fh: _yaml.dump(data, fh))
-except ImportError:
-    import yaml
-
-    load = yaml.safe_load
-    dump = lambda data, fh: yaml.safe_dump(data, fh, sort_keys=False)
-
-try:
-    with open(path) as fh:
-        cfg = load(fh) or {}
-except FileNotFoundError:
-    cfg = {}
-if not isinstance(cfg, dict):
-    cfg = {}
-
-# Replace the model block wholesale, keep everything else. Picking a provider in the wizard
-# is a complete statement about the model, and --clone copied the PREVIOUS agent's block:
-# merging key-by-key would leave that agent's base_url or api_key behind, silently pointing
-# the new agent at the wrong endpoint. Everything outside `model:` is the owner's and stays.
-model = {"provider": prov}
-for field, value in (("default", mdl), ("base_url", base), ("api_key", key)):
-    if value:
-        model[field] = value
-cfg["model"] = model
-
-tmp = path + ".pp-new"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w") as fh:
-    dump(cfg, fh)
-os.replace(tmp, path)
-PY
-    then
+    if ! pp-config-set --replace "$home/config.yaml" model \
+         "provider=$prov" "default=$mdl" "base_url=$base" "api_key=$key"; then
       echo "[agent] could not write config.yaml for '$lp'" >&2
       return 1
     fi
     chmod 600 "$home/config.yaml"
   fi
+
+  ensure_workspace "$lp" "$home/config.yaml"
 
   # Cross-signing, per agent — same two-step as the default profile, because each agent is a
   # separate Matrix identity and cannot borrow another's recovery key.
@@ -270,6 +265,34 @@ PY
   mv "$tmp" "$home/.env"
   chmod 600 "$home/.env"
   return 0
+}
+
+# Retire profiles the owner has removed.
+#
+# The box deletes an agent by deleting its handoff file, so "a profile with no handoff file"
+# means "this agent is gone". Without this the profile stays on disk and the multiplexer keeps
+# serving it: the agent would go on answering in a room the owner just left.
+#
+# ARCHIVED, not deleted. A profile carries that agent's memories, skills and sessions — the
+# work the owner did with it — and this runs unattended on every boot, so a bug here would be
+# unrecoverable. Moving it aside is the same outcome for the gateway and reversible for the
+# owner. The archive lives OUTSIDE profiles/ on purpose: anything under profiles/ is itself
+# enumerated as a profile.
+retire_removed_profiles() {
+  local d lp attic="$HERMES_HOME/retired-profiles"
+  for d in "$HERMES_PROFILES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    lp="$(basename "$d")"
+    # The first agent has no file in /handoff/agents — it lives at the legacy matrix.env path.
+    if [ "$lp" = "hermes-ai" ]; then continue; fi
+    if [ -f "/handoff/agents/$lp.env" ]; then continue; fi
+    mkdir -p "$attic"
+    if mv "$d" "$attic/$lp-$(date +%Y%m%d-%H%M%S)" 2>/dev/null; then
+      echo "[agent] '$lp' was removed by the owner — profile archived under $attic"
+    else
+      echo "[agent] could not archive the removed profile '$lp'" >&2
+    fi
+  done
 }
 
 # One gateway serves every profile (gateway.multiplex_profiles). Starting a second gateway
@@ -323,6 +346,46 @@ gateway_watch() {
         # they should never have to: the box created the one room this agent has. Same
         # reasoning as the secondary-profile path in provision_profile.
         if [ -n "${PP_AGENT_ROOM:-}" ]; then export MATRIX_HOME_ROOM="$PP_AGENT_ROOM"; fi
+        # The first agent's working root, on the volume — see ensure_workspace.
+        ensure_workspace "${PP_AGENT_LOCALPART:-hermes-ai}" "$HERMES_HOME/config.yaml"
+        export TERMINAL_CWD="$WORKSPACE_ROOT/${PP_AGENT_LOCALPART:-hermes-ai}"
+
+        # ── What the agent may send back as a file ──────────────────────────────────────
+        # The agent CAN send files: it writes `MEDIA:<path>` and the gateway uploads it
+        # (encrypted, correctly, via encrypt_attachment). The question is which paths.
+        #
+        # Hermes's default is a DENYLIST — anything that isn't a known credential file. On
+        # this box we measured what that lets through, and it is not acceptable:
+        #
+        #   /data/hermes/matrix-recovery.key        DELIVERABLE   <- cross-signing key
+        #   /data/hermes/profiles/<agent>/.env      DELIVERABLE   <- that agent's Matrix token
+        #   /data/hermes/webui-password             DELIVERABLE   <- WebUI runs shell commands
+        #   /handoff/matrix.env                     DELIVERABLE   <- access token
+        #   .../matrix/store/crypto.db              DELIVERABLE   <- olm store
+        #
+        # Upstream's denylist knows `<hermes home>/.env` and `auth.json`; it does not know
+        # about profiles/, /handoff, or our key files, and it never will. So switch to
+        # strict mode, which is an ALLOWLIST and therefore fails closed as Hermes grows new
+        # secret files. Verified: with these three set, everything above is blocked and the
+        # workspace still sends.
+        export HERMES_MEDIA_DELIVERY_STRICT=1
+        # NOTE: HERMES_MEDIA_ALLOW_DIRS is deliberately NOT set.
+        #
+        # It is a single process-wide variable, and one process serves every agent under
+        # multiplexing — so using it to allow each agent's working root would mean naming
+        # the shared parent (/data/workspace), which lets any agent attach a file out of any
+        # other agent's directory. Instead, patches/media-allow-dirs-per-profile.py teaches
+        # _media_delivery_allowed_roots() to add the ACTIVE profile's working root, resolved
+        # through get_hermes_home() the same way the cache roots already are. Each agent can
+        # then deliver from its own directory and no other, with no env var involved.
+        #
+        # Setting the variable here would still work and would still be additive — it is
+        # left unset so the only allowance is the per-profile one.
+        # Load-bearing. Strict mode ALSO trusts any file modified in the last 10 minutes,
+        # and provision_profile rewrites every profile's .env on every boot — which made
+        # each agent's Matrix access token "freshly produced" and therefore sendable. This
+        # is the difference between the list above being blocked and not.
+        export HERMES_MEDIA_TRUST_RECENT_FILES=0
         # ── Cross-signing identity ──────────────────────────────────────────────────────
         # Without this the agent's device is never signed by its own identity, so every
         # client shows it as unverified ("not verified by its owner" in Element) and has no
@@ -357,6 +420,9 @@ gateway_watch() {
         unset MATRIX_PROXY
         # Every agent after the first, before the gateway starts — the multiplexer reads the
         # profile set once at startup, so a profile written afterwards would not be served.
+        # Removals before additions: a name can be removed and re-added, and archiving the
+        # old profile first is what lets the new one start clean instead of inheriting it.
+        retire_removed_profiles
         local extra=0 lp
         for f in /handoff/agents/*.env; do
           [ -e "$f" ] || continue

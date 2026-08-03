@@ -62,6 +62,9 @@ pub struct Provisioned {
     pub user_id: String,
     pub display_name: String,
     pub room_id: Option<String>,
+    /// An agent the box no longer tracks — its account and room outlived a hand-deletion.
+    /// Listed so the owner can clear it up; never treated as a live agent.
+    pub leftover: bool,
 }
 
 /// Register an agent account using the box's registration token.
@@ -349,8 +352,12 @@ pub async fn publish_registry(
             json!({
                 "user_id": a.user_id,
                 "display_name": a.display_name,
-                "group": "",
-                "description": "Runs on your box",
+                "group": if a.leftover { "Leftovers" } else { "" },
+                "description": if a.leftover {
+                    "Left over from a deleted agent — remove it to clear the chat"
+                } else {
+                    "Runs on your box"
+                },
                 "room_id": a.room_id,
             })
         })
@@ -470,6 +477,10 @@ pub async fn read_registry(
                             .get("room_id")
                             .and_then(|r| r.as_str())
                             .map(String::from),
+                        leftover: o
+                            .get("group")
+                            .and_then(|g| g.as_str())
+                            .is_some_and(|g| g == "Leftovers"),
                     })
                 })
                 .collect()
@@ -487,8 +498,11 @@ pub async fn read_registry(
 /// landing at the right time.
 pub async fn republish_from_handoff(
     client: &reqwest::Client,
+    base: &str,
     registry_url: &str,
     owner_token: &str,
+    onion: &str,
+    owner_user: &str,
 ) {
     // EVERY provisioned agent, not just the first. Republishing from one handoff file would
     // rewrite the roster down to a single entry on the next supervisor pass — silently
@@ -531,6 +545,8 @@ pub async fn republish_from_handoff(
                 user_id: known.user_id.clone(),
                 display_name: known.display_name.clone(),
                 room_id: known.room_id.clone(),
+                // Anything with a handoff file is live, whatever a stale roster said.
+                leftover: false,
             },
             // Only reachable for an agent whose roster entry was lost; the localpart is the
             // best name we have left, and it beats showing nothing.
@@ -549,11 +565,359 @@ pub async fn republish_from_handoff(
                     },
                     user_id,
                     room_id: None,
+                    leftover: false,
                 }
             }
         })
         .collect();
+    let mut roster = roster;
+    roster.extend(discover_orphans(client, base, owner_token, onion, owner_user, &roster).await);
     let _ = publish_registry(client, registry_url, owner_token, &roster).await;
+}
+
+/// Leave and forget a room, and prune it out of `m.direct`.
+///
+/// The prune is not optional: a left-and-forgotten DM lingers in that map and resurfaces as a
+/// ghost chat, which is the exact symptom this cleanup exists to remove.
+async fn leave_and_forget(
+    client: &reqwest::Client,
+    base: &str,
+    registry_url: &str,
+    owner_token: &str,
+    room: &str,
+) -> bool {
+    let enc = enc_path(room);
+    let left = client
+        .post(format!("{base}/_matrix/client/v3/rooms/{enc}/leave"))
+        .bearer_auth(owner_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    let forgot = client
+        .post(format!("{base}/_matrix/client/v3/rooms/{enc}/forget"))
+        .bearer_auth(owner_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if let Some((ad_base, _)) = registry_url.rsplit_once("/account_data/") {
+        let direct_url = format!("{ad_base}/account_data/m.direct");
+        if let Ok(resp) = client.get(&direct_url).bearer_auth(owner_token).send().await {
+            if let Ok(map) = resp.json::<Value>().await {
+                if let Some(obj) = map.as_object() {
+                    let mut kept = serde_json::Map::new();
+                    let mut changed = false;
+                    for (uid, rooms) in obj {
+                        let pruned: Vec<Value> = rooms
+                            .as_array()
+                            .map(|a| a.iter().filter(|r| r.as_str() != Some(room)).cloned().collect())
+                            .unwrap_or_default();
+                        if rooms.as_array().is_some_and(|a| a.len() != pruned.len()) {
+                            changed = true;
+                        }
+                        if !pruned.is_empty() {
+                            kept.insert(uid.clone(), Value::Array(pruned));
+                        } else if rooms.as_array().is_none() {
+                            kept.insert(uid.clone(), rooms.clone());
+                        }
+                    }
+                    if changed {
+                        let _ = client
+                            .put(&direct_url)
+                            .bearer_auth(owner_token)
+                            .json(&Value::Object(kept))
+                            .send()
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+    left && forgot
+}
+
+/// Clear rooms that cannot be a live conversation with anyone.
+///
+/// Deliberately narrow, because this runs unattended against the owner's real chat list and
+/// leaving a room federates a visible "left" event to whoever is in it. Exactly two shapes
+/// qualify, and neither can be a contact:
+///
+///   1. **Nobody else is in it.** The owner is the only member — every other party has left.
+///      There is no one to talk to and no one to notify.
+///   2. **A one-to-one with a LOCAL account that is not a known agent.** Local accounts only
+///      exist because this box registered them (registration is token-gated and the box is
+///      the only thing that registers), so a local id that is not the owner and not in the
+///      roster is a deleted agent. A federated peer — a real contact — is never local.
+///
+/// Everything else, including every room on another onion, is left strictly alone.
+pub async fn cleanup_dead_rooms(
+    client: &reqwest::Client,
+    base: &str,
+    registry_url: &str,
+    owner_token: &str,
+    onion: &str,
+    owner_user: &str,
+) -> usize {
+    let live: Vec<String> = read_registry(client, registry_url, owner_token)
+        .await
+        .into_iter()
+        .filter(|a| !a.leftover)
+        .map(|a| a.user_id)
+        .collect();
+    let suffix = format!(":{onion}");
+    let Ok(resp) = client
+        .get(format!("{base}/_matrix/client/v3/joined_rooms"))
+        .bearer_auth(owner_token)
+        .send()
+        .await
+    else {
+        return 0;
+    };
+    let Ok(v) = resp.json::<Value>().await else {
+        return 0;
+    };
+    let Some(rooms) = v.get("joined_rooms").and_then(|r| r.as_array()) else {
+        return 0;
+    };
+    let mut cleared = 0usize;
+    for room in rooms {
+        let Some(room) = room.as_str() else { continue };
+        let enc = enc_path(room);
+        let Ok(resp) = client
+            .get(format!("{base}/_matrix/client/v3/rooms/{enc}/members"))
+            .bearer_auth(owner_token)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(members) = resp.json::<Value>().await else {
+            continue;
+        };
+        let Some(chunk) = members.get("chunk").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let mut ids: Vec<String> = Vec::new();
+        for ev in chunk {
+            if let Some(uid) = ev.get("state_key").and_then(|k| k.as_str()) {
+                if !ids.iter().any(|u| u == uid) {
+                    ids.push(uid.to_string());
+                }
+            }
+        }
+        let others: Vec<&String> = ids.iter().filter(|u| *u != owner_user).collect();
+        let reason = if others.is_empty() {
+            Some("nobody else is in it")
+        } else if others.len() == 1
+            && others[0].ends_with(&suffix)
+            && !is_reserved_local(others[0])
+            && !live.iter().any(|l| l == others[0])
+        {
+            Some("a deleted agent's room")
+        } else {
+            None
+        };
+        if let Some(why) = reason {
+            if leave_and_forget(client, base, registry_url, owner_token, room).await {
+                cleared += 1;
+                eprintln!("[pureprivacy] agents: cleared {room} — {why}");
+            } else {
+                eprintln!("[pureprivacy] agents: could NOT clear {room} ({why})");
+            }
+        }
+    }
+    cleared
+}
+
+/// Local accounts that are NOT agents and must never be offered for removal.
+///
+/// tuwunel/conduwuit runs a server admin bot (`@conduit:`) and the owner shares an admin room
+/// with it. It is local, it is not the owner, and it is in no roster — so every heuristic for
+/// "a leftover agent" matches it exactly. Removing it would throw away the box's own admin
+/// channel. Caught in testing: the Agents app listed `conduit` under Leftovers.
+fn is_reserved_local(user_id: &str) -> bool {
+    let lp = user_id.trim_start_matches('@').split(':').next().unwrap_or("");
+    matches!(lp, "conduit" | "conduwuit" | "tuwunel" | "server" | "admin" | "notices")
+}
+
+/// Find agent accounts the box no longer tracks, so the owner can clear them up.
+///
+/// Agents deleted before `remove()` existed left their Matrix account and their room behind,
+/// in no roster and no handoff file. Because the phone's human/AI split is roster-driven, the
+/// moment the box republished without them they were reclassified as PEOPLE and surfaced in
+/// Messaging next to real contacts — with no way to get rid of them, since the Agents screen
+/// only lists what the roster names.
+///
+/// So: list them, and let the owner delete them with the control that already exists. This
+/// only ever ADDS rows to the roster — nothing is removed automatically. That matters,
+/// because the identification below is a heuristic and a wrong guess that merely shows an
+/// extra row is recoverable, while a wrong guess that deletes a chat is not.
+///
+/// The heuristic is exact on a PurePrivacy box today: registration is token-gated and the box
+/// is the only thing that ever registers, so a LOCAL account that is neither the owner nor a
+/// known agent can only be an agent the box created earlier. If a box ever gains a second
+/// human account, this needs a real marker instead.
+async fn discover_orphans(
+    client: &reqwest::Client,
+    base: &str,
+    owner_token: &str,
+    onion: &str,
+    owner_user: &str,
+    known: &[Provisioned],
+) -> Vec<Provisioned> {
+    // Scanning every room's membership is several round trips, and this runs on the
+    // supervisor's regular pass. Orphans appear only when an agent is deleted, so a slow
+    // cadence costs the owner nothing and keeps the pass cheap.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    static LAST_SCAN: AtomicU64 = AtomicU64::new(0);
+    // The throttle must return the PREVIOUS result, not nothing. Returning an empty vec
+    // between scans republished a roster without the leftovers, so every pass in the 5-minute
+    // gap silently un-listed what the scan had just found — the roster oscillated and the
+    // last write (the empty one) is what the phone saw.
+    static CACHED: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+    let replay = || -> Vec<Provisioned> {
+        CACHED
+            .lock()
+            .map(|c| {
+                c.iter()
+                    .filter(|(uid, _, _)| !known.iter().any(|a| &a.user_id == uid))
+                    .map(|(uid, name, room)| Provisioned {
+                        user_id: uid.clone(),
+                        display_name: name.clone(),
+                        room_id: Some(room.clone()),
+                        leftover: true,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_SCAN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 300 {
+        return replay();
+    }
+    LAST_SCAN.store(now, Ordering::Relaxed);
+
+    let suffix = format!(":{onion}");
+    let Ok(resp) = client
+        .get(format!("{base}/_matrix/client/v3/joined_rooms"))
+        .bearer_auth(owner_token)
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(v) = resp.json::<Value>().await else {
+        return Vec::new();
+    };
+    let Some(rooms) = v.get("joined_rooms").and_then(|r| r.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<Provisioned> = Vec::new();
+    for room in rooms {
+        let Some(room) = room.as_str() else { continue };
+        let enc = enc_path(room);
+        // FULL member state, not joined_members. A dead agent may have been invited and never
+        // accepted, or have left — both still leave the owner staring at a dead chat, and
+        // both are invisible to joined_members. Measured: scanning only joined members found
+        // one of the three leftovers on this box.
+        let Ok(resp) = client
+            .get(format!("{base}/_matrix/client/v3/rooms/{enc}/members"))
+            .bearer_auth(owner_token)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(members) = resp.json::<Value>().await else {
+            continue;
+        };
+        let Some(chunk) = members.get("chunk").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let mut people: Vec<(String, String)> = Vec::new();
+        for ev in chunk {
+            let Some(uid) = ev.get("state_key").and_then(|k| k.as_str()) else {
+                continue;
+            };
+            let content = ev.get("content");
+            // `leave` for the OWNER would mean they already left; that room is not in
+            // joined_rooms anyway. Any other membership means this id belongs to the room.
+            let name = content
+                .and_then(|c| c.get("displayname"))
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !people.iter().any(|(u, _)| u == uid) {
+                people.push((uid.to_string(), name));
+            }
+        }
+        let locals: Vec<&str> = people
+            .iter()
+            .map(|(u, _)| u.as_str())
+            .filter(|u| *u != owner_user && u.ends_with(&suffix))
+            .collect();
+        if !locals.is_empty() || people.len() <= 2 {
+            eprintln!(
+                "[pureprivacy] agents: room {} — {} member(s), {} local non-owner",
+                room,
+                people.len(),
+                locals.len()
+            );
+        }
+        // A one-to-one room. A bigger room is not an agent DM, and leaving it would be
+        // someone else's conversation.
+        if people.len() > 2 {
+            continue;
+        }
+        for (uid, dn) in &people {
+            let uid = uid.as_str();
+            if uid == owner_user || !uid.ends_with(&suffix) || is_reserved_local(uid) {
+                continue; // the owner, a federated peer, or the server's own admin bot
+            }
+            if known.iter().any(|a| a.user_id == uid) || out.iter().any(|a| a.user_id == uid) {
+                continue;
+            }
+            let name = if dn.is_empty() {
+                uid.trim_start_matches('@').split(':').next().unwrap_or("agent").to_string()
+            } else {
+                dn.clone()
+            };
+            out.push(Provisioned {
+                user_id: uid.to_string(),
+                display_name: name,
+                room_id: Some(room.to_string()),
+                leftover: true,
+            });
+        }
+    }
+    if let Ok(mut c) = CACHED.lock() {
+        *c = out
+            .iter()
+            .map(|a| {
+                (
+                    a.user_id.clone(),
+                    a.display_name.clone(),
+                    a.room_id.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+    }
+    eprintln!(
+        "[pureprivacy] agents: scanned {} room(s), {} leftover agent room(s) found",
+        rooms.len(),
+        out.len()
+    );
+    out
 }
 
 /// The whole one-tap flow. Returns the message the phone shows.
@@ -646,8 +1010,259 @@ pub async fn setup(
         user_id: user_id.clone(),
         display_name: display.clone(),
         room_id,
+        leftover: false,
     });
     publish_registry(client, registry_url, owner_token, &existing).await?;
 
     Ok(format!("{display} is ready — say hello in the Agents app"))
+}
+
+/// Remove an agent: clear the chat, retire the account, forget the profile.
+///
+/// This is the inverse of [`setup`], and it exists because not having it was a real defect —
+/// deleting an agent by hand (`rm` the handoff file and the profile) removed the *agent* and
+/// left the *Matrix identity* behind. The account and its room outlived it, and because the
+/// phone's human/AI split is roster-driven and deliberately fail-closed, the moment the box
+/// republished a roster without that id the phone reclassified it as a PERSON — so a deleted
+/// agent reappeared as a fake human in Messaging, next to real contacts. It also burned the
+/// name forever (`M_USER_IN_USE`).
+///
+/// `target` is the agent's full Matrix user id. Deliberately not a display name: this is
+/// destructive, near-irreversible, and the phone always knows the exact id of the row the
+/// owner tapped. Resolving a human-typed name here would be one fuzzy match away from
+/// deleting the wrong agent.
+///
+/// Ordering is chosen so a partial failure leaves the box in the safest state:
+///
+///   1. leave + forget the room       — what the owner actually asked for (the chat goes away)
+///   2. drop the handoff entry        — stops the container serving it, frees `/handoff`
+///   3. republish the roster          — the phone stops listing it
+///   4. deactivate the account        — LAST, and best-effort: it is the only irreversible
+///                                      step, and failing it costs a reusable name, nothing
+///                                      more. Never let it fail the whole removal.
+pub async fn remove(
+    client: &reqwest::Client,
+    base: &str,
+    registry_url: &str,
+    owner_token: &str,
+    owner_user: &str,
+    target: &str,
+) -> Result<String, String> {
+    let target = target.trim();
+    if target.is_empty() || !target.starts_with('@') || !target.contains(':') {
+        return Err("that doesn't look like an agent id".to_string());
+    }
+    let localpart = target
+        .trim_start_matches('@')
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if localpart.is_empty() {
+        return Err("that doesn't look like an agent id".to_string());
+    }
+    // The first agent IS Hermes's default profile, and the box's own legacy handoff path
+    // points at it. Removing it would leave a running profile with no credentials rather
+    // than a clean box, so refuse rather than half-do it.
+    if localpart == DEFAULT_LOCALPART {
+        return Err("the first agent can't be removed — remove the agents add-on instead".into());
+    }
+
+    let known = read_registry(client, registry_url, owner_token).await;
+    let entry = known.iter().find(|a| a.user_id == target);
+    let display = entry
+        .map(|a| a.display_name.clone())
+        .unwrap_or_else(|| localpart.clone());
+
+    // 1. The chat. Room id from the roster when we have it; otherwise ask the homeserver for
+    //    the owner's rooms and pick the one this agent is in — which is what makes ORPHANS
+    //    (agents deleted by hand before this existed) cleanable at all, since they are in no
+    //    roster and no handoff file.
+    let mut room_id = entry.and_then(|a| a.room_id.clone());
+    if room_id.is_none() {
+        room_id = find_room_with(client, base, owner_token, target).await;
+    }
+    let mut chat_cleared = false;
+    if let Some(room) = room_id.as_deref() {
+        let enc = enc_path(room);
+        // Leave first: forgetting a room you are still in is rejected.
+        let left = client
+            .post(format!("{base}/_matrix/client/v3/rooms/{enc}/leave"))
+            .bearer_auth(owner_token)
+            .json(&json!({}))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        // Forget is what removes it from the owner's room list rather than just marking them
+        // as departed — without it the dead chat keeps showing.
+        let forgot = client
+            .post(format!("{base}/_matrix/client/v3/rooms/{enc}/forget"))
+            .bearer_auth(owner_token)
+            .json(&json!({}))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        chat_cleared = left && forgot;
+        if !chat_cleared {
+            eprintln!("[pureprivacy] agent remove: leave={left} forget={forgot} for {room}");
+        }
+    }
+
+    // 1b. Prune `m.direct`. A left-and-forgotten DM can linger in that account-data map and
+    //     resurface later as a ghost chat — the box's own peer-removal path already learned
+    //     this and prunes there for the same reason. Skipping it here would leave exactly the
+    //     symptom this whole feature exists to fix.
+    if let Some((ad_base, _)) = registry_url.rsplit_once("/account_data/") {
+        let direct_url = format!("{ad_base}/account_data/m.direct");
+        if let Ok(resp) = client.get(&direct_url).bearer_auth(owner_token).send().await {
+            if let Ok(map) = resp.json::<Value>().await {
+                if let Some(obj) = map.as_object() {
+                    let mut kept = serde_json::Map::new();
+                    let mut changed = false;
+                    for (uid, rooms) in obj {
+                        if uid == target {
+                            changed = true;
+                            continue;
+                        }
+                        // Also drop the room itself from any other user's list — an agent DM
+                        // should only be under its own id, but a stale entry elsewhere would
+                        // resurrect the same room.
+                        if let (Some(arr), Some(room)) = (rooms.as_array(), room_id.as_deref()) {
+                            let pruned: Vec<Value> = arr
+                                .iter()
+                                .filter(|r| r.as_str() != Some(room))
+                                .cloned()
+                                .collect();
+                            if pruned.len() != arr.len() {
+                                changed = true;
+                            }
+                            if !pruned.is_empty() {
+                                kept.insert(uid.clone(), Value::Array(pruned));
+                            }
+                            continue;
+                        }
+                        kept.insert(uid.clone(), rooms.clone());
+                    }
+                    if changed {
+                        let _ = client
+                            .put(&direct_url)
+                            .bearer_auth(owner_token)
+                            .json(&Value::Object(kept))
+                            .send()
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. The handoff entry. Its absence is what tells the container to stop serving the
+    //    profile, so this must happen before we report success.
+    let handoff = std::path::Path::new(HANDOFF_AGENTS_DIR).join(format!("{localpart}.env"));
+    let agent_token = std::fs::read_to_string(&handoff)
+        .ok()
+        .and_then(|body| {
+            body.lines()
+                .find_map(|l| l.strip_prefix("MATRIX_ACCESS_TOKEN=").map(str::to_string))
+        });
+    let _ = std::fs::remove_file(&handoff);
+
+    // 3. The roster, rebuilt from what's left on disk.
+    // The onion is whatever the agent's own id says — no need to plumb it in separately.
+    let onion = target.split(':').nth(1).unwrap_or("");
+    republish_from_handoff(client, base, registry_url, owner_token, onion, owner_user).await;
+
+    // 4. Retire the account, so the name can be used again. Uses the AGENT's own token from
+    //    the handoff file — the box never kept the password, and tuwunel has no HTTP admin
+    //    API, so this is the only route that doesn't need the owner to drive an admin room by
+    //    hand. Orphans have no handoff file and therefore no token: their chat still goes
+    //    away, their name stays taken, and we say so rather than pretending.
+    let mut name_freed = false;
+    if let Some(tok) = agent_token {
+        let ok = client
+            .post(format!("{base}/_matrix/client/v3/account/deactivate"))
+            .bearer_auth(&tok)
+            .json(&json!({ "erase": true }))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        name_freed = ok;
+        if !ok {
+            eprintln!("[pureprivacy] agent remove: couldn't deactivate {target} (name stays taken)");
+        }
+    }
+
+    Ok(match (chat_cleared, name_freed) {
+        (true, true) => format!("{display} is gone. The name is free to use again."),
+        (true, false) => format!("{display} is gone. The name stays taken on this box."),
+        (false, true) => format!(
+            "{display} is removed, but its chat may linger until your phone re-syncs."
+        ),
+        (false, false) => format!("{display} is removed from your agents."),
+    })
+}
+
+/// Find the owner's room shared with `user_id`, for agents that predate the roster carrying
+/// room ids (and for orphans that are in no roster at all).
+async fn find_room_with(
+    client: &reqwest::Client,
+    base: &str,
+    owner_token: &str,
+    user_id: &str,
+) -> Option<String> {
+    let rooms: Value = client
+        .get(format!("{base}/_matrix/client/v3/joined_rooms"))
+        .bearer_auth(owner_token)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    for room in rooms.get("joined_rooms")?.as_array()? {
+        let room = room.as_str()?;
+        let enc = enc_path(room);
+        let members: Value = match client
+            .get(format!("{base}/_matrix/client/v3/rooms/{enc}/joined_members"))
+            .bearer_auth(owner_token)
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        if let Some(joined) = members.get("joined").and_then(|j| j.as_object()) {
+            // A DM with exactly the owner and this agent. The membership check keeps a
+            // group room the agent merely sits in from being mistaken for its own chat.
+            if joined.contains_key(user_id) && joined.len() <= 2 {
+                return Some(room.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Percent-encode a Matrix id for use as a URL path segment.
+///
+/// Room ids start with `!` and always contain `:` — both of which change the meaning of a
+/// path if passed through raw. Written here rather than pulling in a crate: this is the only
+/// place in the box that needs it, and the rule (encode everything outside RFC 3986
+/// unreserved) is short enough to be obviously correct.
+fn enc_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }

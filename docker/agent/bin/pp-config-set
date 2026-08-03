@@ -1,0 +1,124 @@
+#!/opt/hermes/venv/bin/python
+"""Set dotted keys in a Hermes config.yaml WITHOUT destroying the rest of the file.
+
+    pp-config-set <config.yaml> <dotted.key> <value> [<dotted.key> <value> ...]
+    pp-config-set --replace <config.yaml> <block> k=v [k=v ...]
+
+Why this exists rather than `hermes config set`: Hermes's own writer reformats the file and
+drops every comment. A profile's config.yaml is where Hermes ships its inline documentation
+(fallback-model examples, the security block, provider notes), and it is also where the
+OWNER's settings live — `/sethome` persists the home channel there, and Agent settings writes
+tool and gateway config there. The entrypoint touches this file on every boot, so a lossy
+writer means the owner's config quietly erodes one restart at a time. Measured: `hermes config
+set terminal.cwd ...` took a 61-line profile config to 25 lines.
+
+`--replace <block>` replaces a whole top-level mapping instead of merging into it. Used for
+`model`, because picking a provider in the wizard is a complete statement about the model and
+`hermes profile create --clone` copied the PREVIOUS agent's block — a key-by-key merge would
+leave that agent's base_url or api_key behind and silently point the new agent at the wrong
+endpoint.
+
+Values are parsed as YAML scalars, so `true`, `131072` and `~` land as bool/int/null rather
+than strings. Anything unparseable stays a string.
+"""
+
+import os
+import sys
+
+# Round-trip so comments and key order survive. The fallback keeps this working if ruamel
+# ever goes away, at the cost of exactly the comments we are here to protect — so it warns.
+try:
+    from ruamel.yaml import YAML
+
+    _y = YAML()
+    _y.preserve_quotes = True
+    _load = _y.load
+
+    def _dump(data, fh):
+        _y.dump(data, fh)
+
+    _scalar = None
+except ImportError:  # pragma: no cover - defensive
+    import yaml
+
+    print("pp-config-set: ruamel missing — comments will be lost", file=sys.stderr)
+    _load = yaml.safe_load
+
+    def _dump(data, fh):
+        yaml.safe_dump(data, fh, sort_keys=False)
+
+    _scalar = yaml.safe_load
+
+
+def parse_scalar(text):
+    try:
+        if _scalar is not None:
+            return _scalar(text)
+        from ruamel.yaml import YAML as _Y
+
+        return _Y(typ="safe").load(text)
+    except Exception:
+        return text
+
+
+def load_config(path):
+    try:
+        with open(path) as fh:
+            cfg = _load(fh) or {}
+    except FileNotFoundError:
+        cfg = {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def write_config(path, cfg):
+    # 0600 at creation, not after: this file can hold an API key, and a chmod-later window on
+    # a shared volume is a real (if brief) exposure.
+    tmp = path + ".pp-new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        _dump(cfg, fh)
+    os.replace(tmp, path)
+
+
+def set_dotted(cfg, dotted, value):
+    parts = dotted.split(".")
+    node = cfg
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[parts[-1]] = value
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "--replace":
+        path, block, pairs = argv[1], argv[2], argv[3:]
+        cfg = load_config(path)
+        replacement = {}
+        for pair in pairs:
+            if "=" not in pair:
+                print(f"pp-config-set: expected key=value, got {pair!r}", file=sys.stderr)
+                return 2
+            key, _, raw = pair.partition("=")
+            if raw != "":
+                replacement[key] = parse_scalar(raw)
+        cfg[block] = replacement
+        write_config(path, cfg)
+        return 0
+
+    if len(argv) < 3 or len(argv) % 2 == 0:
+        print(__doc__, file=sys.stderr)
+        return 2
+
+    path, rest = argv[0], argv[1:]
+    cfg = load_config(path)
+    for i in range(0, len(rest), 2):
+        set_dotted(cfg, rest[i], parse_scalar(rest[i + 1]))
+    write_config(path, cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

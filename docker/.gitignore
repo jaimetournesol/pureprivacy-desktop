@@ -1,5 +1,8 @@
-bin/
-pureprivacy
-.env
-backups/
-connect-qr.png
+# Anchored to THIS directory. Unanchored `bin/` also matched docker/agent/bin/, which
+# silently excluded a script the agent Dockerfile COPYs — a fresh clone would fail the
+# build. These entries are all build artefacts staged at docker/ root by build.sh.
+/bin/
+/pureprivacy
+/.env
+/backups/
+/connect-qr.png

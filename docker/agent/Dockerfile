@@ -78,8 +78,13 @@ COPY patches/ /opt/hermes/patches/
 RUN ADAPTER=/opt/hermes/agent/plugins/platforms/matrix/adapter.py \
     && python3 /opt/hermes/patches/matrix-per-profile-store.py "$ADAPTER" \
     && python3 /opt/hermes/patches/matrix-per-profile-recovery-output.py "$ADAPTER" \
+    && python3 /opt/hermes/patches/matrix-media-to-workspace.py "$ADAPTER" \
+    && BASE=/opt/hermes/agent/gateway/platforms/base.py \
+    && python3 /opt/hermes/patches/media-allow-dirs-per-profile.py "$BASE" \
     && grep -q 'class _PerProfilePath:' "$ADAPTER" \
-    && grep -q 'def _scoped_recovery_key_output_file' "$ADAPTER"
+    && grep -q 'def _scoped_recovery_key_output_file' "$ADAPTER" \
+    && grep -q 'def _pp_deliver_to_workspace' "$ADAPTER" \
+    && grep -q 'def _pp_profile_working_root' "$BASE"
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
@@ -209,7 +214,14 @@ RUN printf '%s\n' \
 
 COPY --from=build /opt/hermes /opt/hermes
 COPY entrypoint.sh /opt/hermes/entrypoint.sh
-RUN chmod +x /opt/hermes/entrypoint.sh
+# pp-config-set edits a profile's config.yaml WITHOUT reformatting it. `hermes config set`
+# reformats and drops every comment (measured: a 61-line profile config came back as 25), and
+# the entrypoint touches that file on every boot — so a lossy writer erodes the owner's
+# settings one restart at a time. See the script's docstring.
+COPY bin/pp-config-set /usr/local/bin/pp-config-set
+RUN chmod +x /opt/hermes/entrypoint.sh /usr/local/bin/pp-config-set \
+    && pp-config-set 2>&1 | grep -q "pp-config-set" \
+    && echo "pp-config-set installed"
 
 # Everything stateful lives under /data so ONE volume carries it: config, the agent's
 # profiles (= the agents themselves), sessions, memories, skills, and ~/.hermes/.env which
