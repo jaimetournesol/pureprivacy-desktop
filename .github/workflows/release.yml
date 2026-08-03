@@ -57,6 +57,12 @@ jobs:
             libgtk-3-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev
+          # linuxdeploy walks every ELF in the AppDir — including the bundled tor — and
+          # resolves its dependencies against the RUNNER's libraries. tor needs libevent,
+          # which the runner image doesn't ship, and that one unresolvable dep fails the
+          # whole AppImage. (At runtime tor uses its own libs from sidecars/tor-libs; this
+          # is purely so linuxdeploy's scan can complete.)
+          sudo apt-get install -y libevent-2.1-7t64 || sudo apt-get install -y libevent-2.1-7
 
       - name: Install pnpm via corepack
         run: |
