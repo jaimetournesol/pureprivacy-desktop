@@ -55,7 +55,13 @@ m = {
     "version": version,
     "released": datetime.date.today().isoformat(),
     "notes": json.loads(notes),
-    "docker": {"image": f"jaimemelon/pureprivacy-box:{version}"},
+    # Both images: the agents add-on releases in lockstep with the box, and the manifest is
+    # the only SIGNED statement of which agent image belongs to a release — without it a
+    # Docker install has no trusted answer to "which agent image matches my box".
+    "docker": {
+        "image": f"jaimemelon/pureprivacy-box:{version}",
+        "agent_image": f"jaimemelon/pureprivacy-agent:{version}",
+    },
     "native": {target: {"url": url, "sha256": sha, "size": int(size)}},
 }
 # Compact + stable: the signature covers these EXACT bytes.
