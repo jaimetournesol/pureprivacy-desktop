@@ -6,7 +6,7 @@ mod agent;
 mod backup;
 mod commands;
 mod config;
-mod crypto;
+pub mod crypto; // pub: pp-crypt (backup-bundle encryption CLI) runs this exact code
 mod fedauth;
 mod pairing;
 mod setup_server;

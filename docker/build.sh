@@ -23,6 +23,11 @@ done
 # The Expert-Bundle tor has no rpath and needs ITS libs, not whichever libevent the image's
 # base happens to ship. The supervisor sets LD_LIBRARY_PATH to <bin>/tor-libs when present.
 if [ -d "$BIN_SRC/tor-libs" ]; then cp -r "$BIN_SRC/tor-libs" "$HERE/bin/tor-libs"; fi
+# pp-crypt: `pp-box backup --encrypt` runs it FROM this image, so an installed pp-box can
+# seal/open bundles without a Rust toolchain on the host. Built alongside the app binary.
+PP_CRYPT_BIN="$(dirname "$APP_BIN")/pp-crypt"
+if [ -x "$PP_CRYPT_BIN" ]; then cp "$PP_CRYPT_BIN" "$HERE/bin/pp-crypt"
+else echo "warn: pp-crypt missing at $PP_CRYPT_BIN (encrypted backups need it; cargo build --release --bin pp-crypt)"; fi
 cp "$APP_BIN" "$HERE/pureprivacy"
 
 echo "staged $(du -sh "$HERE/bin" | cut -f1) sidecars + $(du -h "$HERE/pureprivacy" | cut -f1) binary"
