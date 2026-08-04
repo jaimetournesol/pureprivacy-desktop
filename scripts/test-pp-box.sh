@@ -228,6 +228,53 @@ else
   good "no member tarballs in restored volume (bundle/legacy sniff is sound)"
 fi
 
+# -------------------------------------------------------------- encrypted backups ----
+# pp-box resolves pp-crypt relative to ITS OWN location (the scratch install), so point it
+# at the repo's build explicitly; build it if missing (CI runs this before tauri build).
+if [ -z "${PP_CRYPT:-}" ]; then
+  for c in "$HERE/src-tauri/target/release/pp-crypt" "$HERE/src-tauri/target/debug/pp-crypt"; do
+    [ -x "$c" ] && { export PP_CRYPT="$c"; break; }
+  done
+fi
+if [ -z "${PP_CRYPT:-}" ]; then
+  say "building pp-crypt (not found in target/)"
+  (cd "$HERE/src-tauri" && cargo build --locked --bin pp-crypt >/dev/null 2>&1) \
+    && export PP_CRYPT="$HERE/src-tauri/target/debug/pp-crypt"
+fi
+
+if [ -n "${PP_CRYPT:-}" ]; then
+  say "encrypted backup seals, restores, and fails closed"
+  # Re-seed (the restore tests consumed nothing, but destroy below wants the originals).
+  ( cd "$INSTALL" && PP_BACKUP_PASSPHRASE=correct-horse ./pp-box backup "$WORK/enc" --encrypt ) >/dev/null 2>&1
+  ENC="$(ls "$WORK/enc"/pp-box-*.tgz.enc 2>/dev/null | head -1)"
+  if [ -n "$ENC" ]; then good "encrypted backup wrote $(basename "$ENC")"; else bad "no .enc written"; fi
+  [ -z "$(ls "$WORK/enc"/pp-box-*.tgz 2>/dev/null)" ] \
+    && good "plaintext bundle removed after sealing" || bad "plaintext bundle left next to the .enc"
+  head -c 512 "$ENC" | head -1 | grep -q '"ppcrypt":1' \
+    && good ".enc carries the pp-crypt header" || bad ".enc header missing/wrong"
+
+  INSTALL5="$WORK/install5"; mkdir -p "$INSTALL5"
+  cp "$PPBOX" "$INSTALL5/pp-box"; chmod +x "$INSTALL5/pp-box"
+  sed -e "s/$BOXV/$PREFIX-box5/" -e "s/$AGENTV/$PREFIX-agent5/" -e "s/$HANDV/$PREFIX-handoff5/" \
+      "$INSTALL/.env" > "$INSTALL5/.env"
+  ( cd "$INSTALL5" && PP_BACKUP_PASSPHRASE=correct-horse printf 'y\n' | \
+      PP_BACKUP_PASSPHRASE=correct-horse ./pp-box restore "$ENC" ) >/dev/null 2>&1
+  [ "$(vol_file "$PREFIX-box5" data/tor/hs/hs_ed25519_secret_key)" = "FAKE-ONION-KEY" ] \
+    && good "encrypted bundle restored (onion key byte-identical)" \
+    || bad "encrypted restore content wrong"
+
+  INSTALL6="$WORK/install6"; mkdir -p "$INSTALL6"
+  cp "$PPBOX" "$INSTALL6/pp-box"; chmod +x "$INSTALL6/pp-box"
+  sed "s/$BOXV/$PREFIX-box6/" "$INSTALL/.env" > "$INSTALL6/.env"
+  ( cd "$INSTALL6" && PP_BACKUP_PASSPHRASE=wrong-horse1 printf 'y\n' | \
+      PP_BACKUP_PASSPHRASE=wrong-horse1 ./pp-box restore "$ENC" ) >/dev/null 2>&1
+  docker volume inspect "$PREFIX-box6" >/dev/null 2>&1 \
+    && bad "wrong passphrase still created/filled a volume" \
+    || good "wrong passphrase fails closed — nothing restored"
+else
+  bad "pp-crypt not available and could not be built — encrypted-backup path untested"
+fi
+
 # ------------------------------------------------------------------------- destroy ----
 say "destroy removes ALL three volumes, not just the box"
 ( cd "$INSTALL" && printf 'testbox\n' | ./pp-box destroy ) >/dev/null 2>&1

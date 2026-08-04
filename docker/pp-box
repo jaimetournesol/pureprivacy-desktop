@@ -17,8 +17,11 @@
 #   ./pp-box update [<ver>]  update the box, keeping its identity. Docker-Hub install:
 #                            pull <ver> (or refresh the current tag), pin it in .env,
 #                            recreate. Source install: rebuild the image + recreate
-#   ./pp-box backup [dir]    bundle the box + agents (onion key, secrets, pairings) — DO THIS
-#   ./pp-box restore <file>  restore a backup (box must be down; old backups still work)
+#   ./pp-box backup [dir] [--encrypt]
+#                            bundle the box + agents (onion key, secrets, pairings) — DO THIS
+#                            --encrypt seals it with a passphrase (AES-256-GCM); without the
+#                            passphrase the file is noise — including to you, so don't lose it
+#   ./pp-box restore <file>  restore a backup (box must be down; old + encrypted both work)
 #   ./pp-box agents on|off   install / remove the optional agents add-on (separate image)
 #   ./pp-box agents ui       open the Hermes Web UI in a browser on THIS machine (tunnel)
 #   ./pp-box shell           open a shell inside the container
@@ -53,6 +56,22 @@ IMAGE="${IMAGE:-pureprivacy-box:dev}"
 agents_on() { [ "$(sed -n 's/^PP_AGENTS=//p' "$HERE/.env" 2>/dev/null | head -1 || true)" = "1" ]; }
 DC() {
   if agents_on; then docker compose --profile agents "$@"; else docker compose "$@"; fi
+}
+# pp-crypt seals/opens encrypted backup bundles with the box's own crypto code. Resolve it
+# from: an explicit override, a repo checkout next to this script (dev/CI), or the box
+# image (the normal case for an installed pp-box — the binary ships in the image).
+pp_crypt() { # $1=seal|open ; stdin->stdout ; passphrase in $PP_PASSPHRASE
+  if [ -n "${PP_CRYPT:-}" ] && [ -x "${PP_CRYPT:-}" ]; then
+    "$PP_CRYPT" "$1"; return
+  fi
+  local c
+  for c in "$HERE/../src-tauri/target/release/pp-crypt" "$HERE/../src-tauri/target/debug/pp-crypt"; do
+    if [ -x "$c" ]; then "$c" "$1"; return; fi
+  done
+  # -i (not -it): stdin/stdout are the data path. Passphrase via env, NOT argv — argv is
+  # world-readable in /proc while the process lives.
+  docker run --rm -i -e PP_PASSPHRASE -e PP_META_ONION -e PP_META_CREATED "$IMAGE" \
+    /opt/pureprivacy/bin/pp-crypt "$1"
 }
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -238,7 +257,23 @@ EOF
 
   backup)
     docker volume inspect "$VOLUME" >/dev/null 2>&1 || die "no $VOLUME volume yet (has the box ever run?)"
-    dir="${1:-$HERE/backups}"; mkdir -p "$dir"
+    # `backup [dir] [--encrypt]` in either order. --encrypt seals the bundle with a
+    # passphrase (pp-crypt: PBKDF2 -> AES-256-GCM, the box's own crypto code) — what lands
+    # on disk is then useless without it. Passphrase from $PP_BACKUP_PASSPHRASE, or
+    # prompted twice. NOT the default (yet): a passphrase the owner forgets turns every
+    # backup into noise, which for an irreplaceable onion key is the worse failure.
+    dir=""; encrypt=0
+    for a in "$@"; do case "$a" in --encrypt) encrypt=1 ;; *) dir="$a" ;; esac; done
+    dir="${dir:-$HERE/backups}"; mkdir -p "$dir"
+    if [ "$encrypt" = 1 ]; then
+      pass="${PP_BACKUP_PASSPHRASE:-}"
+      if [ -z "$pass" ]; then
+        read -rsp "Backup passphrase (min 8 chars): " pass; echo
+        read -rsp "Again: " pass2; echo
+        [ "$pass" = "$pass2" ] || die "passphrases don't match"
+      fi
+      [ "${#pass}" -ge 8 ] || die "passphrase must be at least 8 characters"
+    fi
     # A fixed-name-free stamp: caller can pass a dir; we name by the (short) onion + a counter.
     # `onion` needs the container up; a backup is BEST taken with the box down (so the sqlite
     # DBs aren't mid-write), so fall back to reading box.json straight out of the volume.
@@ -286,16 +321,48 @@ secrets_key=$key"
     # the keys to this box.
     docker run --rm -v "$dir":/backup -e B="$base" -e U="$(id -u):$(id -g)" alpine \
       sh -c 'chown "$U" "/backup/$B" && chmod 600 "/backup/$B"' >/dev/null
+    if [ "$encrypt" = 1 ]; then
+      # Seal, verify the seal opens, and only THEN drop the plaintext. A backup that fails
+      # this check is deleted, not kept — a half-written .enc is indistinguishable from a
+      # good one until the day it's needed.
+      if ! PP_PASSPHRASE="$pass" PP_META_ONION="$o" PP_META_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          pp_crypt seal < "$out" > "$out.enc"; then
+        rm -f "$out.enc"; die "encryption failed — the unencrypted bundle is kept at $out"
+      fi
+      if ! PP_PASSPHRASE="$pass" pp_crypt open < "$out.enc" | cmp -s - "$out"; then
+        rm -f "$out.enc"; die "encrypted bundle failed its read-back check — unencrypted bundle kept at $out"
+      fi
+      chmod 600 "$out.enc"
+      rm -f "$out"
+      out="$out.enc"
+    fi
     echo "✓ backed up the box → $out"
     [ "$have_agent" = yes ] && echo "  including the agents add-on (profiles, model API keys, transcripts)"
-    echo "  this holds the onion KEY + secrets + pairings + the key that unlocks them —"
-    echo "  it IS the box. Store it somewhere safe and private."
+    if [ "$encrypt" = 1 ]; then
+      echo "  encrypted: useless without the passphrase — and unrecoverable without it too."
+    else
+      echo "  this holds the onion KEY + secrets + pairings + the key that unlocks them —"
+      echo "  it IS the box. Store it somewhere safe and private."
+    fi
     ;;
 
   restore)
     file="${1:-}"; [ -f "$file" ] || die "usage: ./pp-box restore <backup.tgz>"
     if docker ps --format '{{.Names}}' | grep -qx pureprivacy-box; then
       die "stop the box first so the restore is clean:  ./pp-box down"
+    fi
+    # Encrypted bundle? The pp-crypt header is line 1 (grep the LINE, not a byte prefix —
+    # serde alphabetises the JSON keys, so the file doesn't start with "ppcrypt").
+    # Decrypt to a private temp file and fall through to the normal restore below.
+    if head -c 512 "$file" | head -1 | grep -q '"ppcrypt":1'; then
+      pass="${PP_BACKUP_PASSPHRASE:-}"
+      if [ -z "$pass" ]; then read -rsp "Backup passphrase: " pass; echo; fi
+      tmpdir="$(mktemp -d)"; chmod 700 "$tmpdir"
+      trap 'rm -rf "$tmpdir"' EXIT
+      if ! PP_PASSPHRASE="$pass" pp_crypt open < "$file" > "$tmpdir/bundle.tgz"; then
+        die "couldn't decrypt (wrong passphrase, or the file is damaged)"
+      fi
+      file="$tmpdir/bundle.tgz"
     fi
     dir="$(cd "$(dirname "$file")" && pwd)"; base="$(basename "$file")"
     # Two formats in the wild. Backups taken before this change are a bare tar OF the box

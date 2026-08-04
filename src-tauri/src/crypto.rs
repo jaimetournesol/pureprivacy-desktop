@@ -143,17 +143,38 @@ pub fn key_for_decrypt(source: KeySource) -> Result<[u8; 32], String> {
     }
 }
 
-/// AES-256-GCM encrypt `plaintext`; returns base64(nonce ‖ ciphertext‖tag).
-pub fn encrypt(plaintext: &str, key: &[u8; 32]) -> Result<String, String> {
+/// AES-256-GCM seal raw bytes; returns nonce ‖ ciphertext‖tag. The byte-level primitive
+/// under [`encrypt`]/[`decrypt`] — public so `pp-crypt` (the CLI that encrypts `pp-box`
+/// backup bundles) is running THIS code, not a re-implementation that could drift.
+pub fn seal_bytes(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(nonce, plaintext)
         .map_err(|e| format!("encrypt failed: {e}"))?;
     let mut out = nonce_bytes.to_vec();
     out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open a nonce ‖ ciphertext‖tag blob produced by [`seal_bytes`]. Fails closed (GCM
+/// authentication) on a wrong key or tampered data — never returns garbage bytes.
+pub fn open_bytes(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
+    if data.len() < NONCE_LEN + TAG_LEN {
+        return Err("ciphertext too short".into());
+    }
+    let (nonce_bytes, ct) = data.split_at(NONCE_LEN);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+        .map_err(|_| "decryption failed — wrong key or tampered data".to_string())
+}
+
+/// AES-256-GCM encrypt `plaintext`; returns base64(nonce ‖ ciphertext‖tag).
+pub fn encrypt(plaintext: &str, key: &[u8; 32]) -> Result<String, String> {
+    let mut out = seal_bytes(plaintext.as_bytes(), key)?;
     let b64 = B64.encode(&out);
     out.zeroize();
     Ok(b64)
@@ -162,13 +183,7 @@ pub fn encrypt(plaintext: &str, key: &[u8; 32]) -> Result<String, String> {
 /// Decrypt a base64(nonce ‖ ciphertext‖tag) blob produced by [`encrypt`].
 pub fn decrypt(blob_b64: &str, key: &[u8; 32]) -> Result<String, String> {
     let data = B64.decode(blob_b64.trim()).map_err(|e| format!("bad base64: {e}"))?;
-    if data.len() < NONCE_LEN + TAG_LEN {
-        return Err("ciphertext too short".into());
-    }
-    let (nonce_bytes, ct) = data.split_at(NONCE_LEN);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let pt = cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+    let pt = open_bytes(&data, key)
         .map_err(|_| "decryption failed — wrong key or tampered secrets.json".to_string())?;
     String::from_utf8(pt).map_err(|e| format!("decrypted bytes not UTF-8: {e}"))
 }
