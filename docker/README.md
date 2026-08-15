@@ -79,8 +79,8 @@ down the moment your phone connects** — setup is one-time.
 | `./pp-box restart` | Restart the box. |
 | `./pp-box down` | Stop the box — identity is kept in the volume. |
 | `./pp-box update [<version>]` | Update, keeping identity. Docker-Hub install: pull `<version>` (or refresh the current tag), pin it in `.env`, recreate — the box's own update check hands you this command with the version filled in. Source install: rebuild the image + recreate. |
-| `./pp-box backup [dir]` | Tar the volume (onion key + secrets + pairings) → `backups/`. **Do this.** |
-| `./pp-box restore <file>` | Restore a backup into the volume (stop the box first). |
+| `./pp-box backup [dir] [--encrypt]` | Bundle the box **and** the agents add-on (onion key, secrets, pairings, agent profiles + keys) → `backups/`. **Do this.** `--encrypt` seals it with a passphrase (AES-256-GCM) — without the passphrase the file is noise, to you too. |
+| `./pp-box restore <file>` | Restore a backup into the volume (stop the box first). Old bare-tar backups and `.enc` bundles both work. |
 | `./pp-box shell` | Open a shell inside the container. |
 | `./pp-box destroy` | Remove the box **and** its volume (asks you to type the box name). |
 
@@ -145,9 +145,10 @@ workspace volume (so it survives container recreates) with its own `pip`.
 
 Two things worth knowing before you rely on it:
 
-- **`pp-box backup` does not cover the agents' volume.** It tars the box's own identity.
-  Agent profiles, memories, skills and **model API keys** live in
-  `pureprivacy-agent-data` and need their own backup.
+- **`pp-box backup` covers the agents too** (since bundle format 2): the agents' data
+  volume — profiles, memories, skills, **model API keys** — and the credential handoff
+  volume ride in the same bundle and come back with `restore`. Older single-volume backups
+  never held them; take a fresh backup once agents are set up.
 - **Agents can't be deleted yet.** They can be added from the app; removing one is manual
   and leaves its Matrix account behind, so that name can't be reused.
 

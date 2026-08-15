@@ -12,7 +12,8 @@
 //!   pp-crypt seal < bundle.tgz > bundle.tgz.enc     # passphrase in $PP_PASSPHRASE
 //!   pp-crypt open < bundle.tgz.enc > bundle.tgz     # same
 //!
-//! File format (sniffable by `head -c 11` == `{"ppcrypt":`):
+//! File format (sniff it by grepping LINE 1 for `"ppcrypt":1` — serde_json writes the keys
+//! alphabetised, so the file starts with `{"created":`, not `{"ppcrypt":`):
 //!   line 1: JSON header — version, KDF params, salt, payload type, and (in the clear,
 //!           deliberately — it's public information and lets an owner tell several backup
 //!           files apart) the box's onion + creation stamp via $PP_META_*.
