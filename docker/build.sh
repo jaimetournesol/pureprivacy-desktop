@@ -25,9 +25,12 @@ done
 if [ -d "$BIN_SRC/tor-libs" ]; then cp -r "$BIN_SRC/tor-libs" "$HERE/bin/tor-libs"; fi
 # pp-crypt: `pp-box backup --encrypt` runs it FROM this image, so an installed pp-box can
 # seal/open bundles without a Rust toolchain on the host. Built alongside the app binary.
+# Hard failure, not a warning: the published image is built and pushed BY HAND from this
+# script, and an image without pp-crypt makes `backup --encrypt` and `restore <x.enc>` fail
+# on every Hub install with "executable file not found" — discovered only when it's needed.
 PP_CRYPT_BIN="$(dirname "$APP_BIN")/pp-crypt"
-if [ -x "$PP_CRYPT_BIN" ]; then cp "$PP_CRYPT_BIN" "$HERE/bin/pp-crypt"
-else echo "warn: pp-crypt missing at $PP_CRYPT_BIN (encrypted backups need it; cargo build --release --bin pp-crypt)"; fi
+[ -x "$PP_CRYPT_BIN" ] || { echo "no pp-crypt at $PP_CRYPT_BIN — build it first: (cd src-tauri && cargo build --release --bin pp-crypt)"; exit 1; }
+cp "$PP_CRYPT_BIN" "$HERE/bin/pp-crypt"
 cp "$APP_BIN" "$HERE/pureprivacy"
 
 echo "staged $(du -sh "$HERE/bin" | cut -f1) sidecars + $(du -h "$HERE/pureprivacy" | cut -f1) binary"
