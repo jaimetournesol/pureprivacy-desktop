@@ -79,7 +79,7 @@ pp_crypt() { # $1=seal|open ; stdin->stdout ; passphrase in $PP_PASSPHRASE
   # (Xvfb, tor, tuwunel) — without the override this hung forever with the bundle on the
   # box's stdin, left an orphan container running, and wrote the web-setup banner to .enc.
   docker run --rm -i --entrypoint /opt/pureprivacy/bin/pp-crypt \
-    -e PP_PASSPHRASE -e PP_META_ONION -e PP_META_CREATED "$IMAGE" "$1"
+    -e PP_PASSPHRASE -e PP_META_CREATED "$IMAGE" "$1"
 }
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -337,7 +337,10 @@ secrets_key=$key"
       # Seal, verify the seal opens, and only THEN drop the plaintext. A backup that fails
       # this check is deleted, not kept — a half-written .enc is indistinguishable from a
       # good one until the day it's needed.
-      if ! PP_PASSPHRASE="$pass" PP_META_ONION="$o" PP_META_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      # The header carries a timestamp, not the onion: the filename's 12-char tag is enough
+      # to tell backups apart, and the full address in the clear on a cloud drive would link
+      # that account to the box.
+      if ! PP_PASSPHRASE="$pass" PP_META_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           pp_crypt seal < "$out" > "$out.enc"; then
         rm -f "$out.enc"; die "encryption failed — the unencrypted bundle is kept at $out"
       fi

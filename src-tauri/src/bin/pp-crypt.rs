@@ -14,9 +14,11 @@
 //!
 //! File format (sniff it by grepping LINE 1 for `"ppcrypt":1` — serde_json writes the keys
 //! alphabetised, so the file starts with `{"created":`, not `{"ppcrypt":`):
-//!   line 1: JSON header — version, KDF params, salt, payload type, and (in the clear,
-//!           deliberately — it's public information and lets an owner tell several backup
-//!           files apart) the box's onion + creation stamp via $PP_META_*.
+//!   line 1: JSON header — version, KDF params, salt, payload type, creation stamp
+//!           ($PP_META_CREATED). Deliberately NOT the onion: the filename already carries
+//!           12 chars of it, which is all an owner needs to tell files apart, and the full
+//!           address in the clear would let anyone who finds the .enc on a cloud drive tie
+//!           that account to the box — the one link this product exists to prevent.
 //!   rest:   raw nonce ‖ ciphertext‖tag bytes.
 //! The passphrase rides an environment variable, not argv: argv is world-readable in
 //! /proc/*/cmdline for the process's lifetime; the env of a short-lived process is not.
@@ -72,7 +74,6 @@ fn seal() -> Result<(), String> {
         "iters": KDF_ITERS,
         "salt": b64(&salt),
         "payload": "tar+gzip",
-        "onion": std::env::var("PP_META_ONION").unwrap_or_default(),
         "created": std::env::var("PP_META_CREATED").unwrap_or_default(),
     });
     let out = std::io::stdout();
