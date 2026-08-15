@@ -78,7 +78,7 @@ down the moment your phone connects** — setup is one-time.
 | `./pp-box logs` | Follow the logs (watch it mint the onion + boot the sidecars). |
 | `./pp-box restart` | Restart the box. |
 | `./pp-box down` | Stop the box — identity is kept in the volume. |
-| `./pp-box update` | Rebuild the image + recreate the box on the same volume (same onion). |
+| `./pp-box update [<version>]` | Update, keeping identity. Docker-Hub install: pull `<version>` (or refresh the current tag), pin it in `.env`, recreate — the box's own update check hands you this command with the version filled in. Source install: rebuild the image + recreate. |
 | `./pp-box backup [dir]` | Tar the volume (onion key + secrets + pairings) → `backups/`. **Do this.** |
 | `./pp-box restore <file>` | Restore a backup into the volume (stop the box first). |
 | `./pp-box shell` | Open a shell inside the container. |

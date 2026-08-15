@@ -11,6 +11,12 @@
 #    print the phone-connect QR to the logs — the original behaviour, unchanged.
 set -euo pipefail
 
+# `docker run <box-image> <command…>` runs THAT command — a shell to look around, pp-crypt to
+# seal a backup — instead of booting a box around it. The standard container contract; without
+# it every argument was silently swallowed and a whole box (Xvfb, tor, tuwunel) came up
+# instead. No arguments (compose passes none) = boot the box, exactly as before.
+if [ "$#" -gt 0 ]; then exec "$@"; fi
+
 # No baked-in default account name — in the interactive flow the username comes from the
 # web setup form; in the scripted flow the operator must state it explicitly.
 PP_USER="${PP_USER:-}"
