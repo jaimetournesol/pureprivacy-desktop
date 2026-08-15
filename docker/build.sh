@@ -5,7 +5,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN_SRC="${PUREPRIVACY_BIN_DIR:-$HOME/.local/share/ai.tournesol.pureprivacy/bin}"
-APP_BIN="${APP_BIN:-$HOME/Tournesol/pureprivacy-desktop/src-tauri/target/release/pureprivacy}"
+# Relative to THIS checkout, not a hardcoded developer path (the previous default pointed at a
+# clone that no longer exists). Override with APP_BIN=… for a binary built elsewhere.
+APP_BIN="${APP_BIN:-$HERE/../src-tauri/target/release/pureprivacy}"
 IMG="${IMAGE:-pureprivacy-box:dev}"
 
 [ -x "$APP_BIN" ] || { echo "no box binary at $APP_BIN — build it first (pnpm tauri build)"; exit 1; }

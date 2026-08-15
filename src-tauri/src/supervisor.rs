@@ -1060,6 +1060,13 @@ async fn run_update_check(
                 // True when this box runs on an OS we don't publish a box for at all — the
                 // phone says "run your box under Docker instead", not "download an update".
                 "unsupported_os": !is_docker && !self_install,
+                // The release's images, straight from the SIGNED manifest, so a Docker owner
+                // (or PP Config) can see what `pp-box update <ver>` will land on. Optional on
+                // both ends: manifests before 0.1.11 have no agent_image, and the phone shows
+                // these only when present.
+                "docker_image": m.docker.as_ref().map(|d| d.image.clone()).unwrap_or_default(),
+                "docker_agent_image": m.docker.as_ref()
+                    .and_then(|d| d.agent_image.clone()).unwrap_or_default(),
                 "target": crate::updater::native_target(),
                 "checked_ts": now_ms(),
                 "manual": manual,

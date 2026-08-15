@@ -384,22 +384,18 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// The exact command a Docker box's owner runs on the HOST to update. The container can't do
 /// this itself by design (no Docker socket), so we hand over a copyable command instead.
+///
+/// It names the VERSION and nothing else. The install — not the box — knows which registry
+/// image and which tag it runs (`PP_IMAGE` in `.env`), whether the agents add-on is on, and
+/// therefore what to pull: `pp-box update <ver>` pulls exactly those tags, pins them in
+/// `.env`, and recreates on the same volume. The earlier shape, `docker pull <image> && … &&
+/// ./pp-box update`, never updated a Docker-Hub box at all: compose kept running the tag
+/// `.env` named (a versioned pull doesn't retag `:latest`; `up` doesn't re-pull an image it
+/// has), and `pp-box update` then died in `build.sh` looking for a Tauri build. The manifest's
+/// `docker.image` / `docker.agent_image` remain the signed statement of which images belong
+/// to this release; the tags they carry equal `version` by construction (sign-release.sh).
 pub fn docker_command(m: &Manifest) -> String {
-    let image = m
-        .docker
-        .as_ref()
-        .map(|d| d.image.as_str())
-        .unwrap_or("jaimemelon/pureprivacy-box:latest");
-    // When the manifest names an agent image, pull it in the same breath: `pp-box update`
-    // recreates both containers, and updating the box while the agent stays on the old
-    // image is a version skew the owner never chose. Harmless without the add-on — the
-    // extra pull costs disk, not correctness.
-    match m.docker.as_ref().and_then(|d| d.agent_image.as_deref()) {
-        Some(agent) => {
-            format!("docker pull {image} && docker pull {agent} && cd docker && ./pp-box update")
-        }
-        None => format!("docker pull {image} && cd docker && ./pp-box update"),
-    }
+    format!("cd docker && ./pp-box update {}", m.version)
 }
 
 #[cfg(test)]
@@ -502,32 +498,39 @@ mod tests {
         )
         .unwrap();
         let cmd = docker_command(&m);
-        assert!(cmd.contains("docker pull jaimemelon/pureprivacy-box:0.1.3"));
-        assert!(cmd.contains("pp-box update"));
+        // The version is the whole payload: pp-box resolves image + tag from its own .env.
+        assert!(cmd.contains("pp-box update 0.1.3"), "{cmd}");
+        // No bare `docker pull`: it never reached a compose-run box and dies in build.sh.
+        assert!(!cmd.contains("docker pull"), "{cmd}");
     }
 
     #[test]
-    fn manifests_with_an_agent_image_pull_both() {
-        // Updating the box while the agent stays on the old image is version skew the
-        // owner never chose — the command must name both images.
+    fn manifests_name_the_agent_image_and_the_command_names_only_the_version() {
+        // docker.agent_image is the signed statement of which agent image belongs to the
+        // release. The command does NOT spell out images: pp-box pulls the agent only when
+        // the add-on is on, so a plain box never downloads it, and updating the box while the
+        // agent stays behind (skew the owner never chose) can't happen — same version, both.
         let m: Manifest = serde_json::from_str(
             r#"{"version":"0.1.11","docker":{"image":"jaimemelon/pureprivacy-box:0.1.11","agent_image":"jaimemelon/pureprivacy-agent:0.1.11"}}"#,
         )
         .unwrap();
-        let cmd = docker_command(&m);
-        assert!(cmd.contains("docker pull jaimemelon/pureprivacy-box:0.1.11"));
-        assert!(cmd.contains("docker pull jaimemelon/pureprivacy-agent:0.1.11"));
+        assert_eq!(
+            m.docker.as_ref().unwrap().agent_image.as_deref(),
+            Some("jaimemelon/pureprivacy-agent:0.1.11")
+        );
+        assert_eq!(docker_command(&m), "cd docker && ./pp-box update 0.1.11");
     }
 
     #[test]
-    fn manifests_without_an_agent_image_still_parse_and_pull_one() {
-        // Every manifest before 0.1.11 lacks agent_image — they must keep working.
+    fn manifests_without_an_agent_image_still_parse() {
+        // Every manifest before 0.1.11 lacks agent_image — they must keep working, and the
+        // command is the same shape (the version alone).
         let m: Manifest = serde_json::from_str(
             r#"{"version":"0.1.10","docker":{"image":"jaimemelon/pureprivacy-box:0.1.10"}}"#,
         )
         .unwrap();
         assert!(m.docker.as_ref().unwrap().agent_image.is_none());
-        assert!(!docker_command(&m).contains("pureprivacy-agent"));
+        assert_eq!(docker_command(&m), "cd docker && ./pp-box update 0.1.10");
     }
 
     /// A NATIVE box whose platform has no build in the release must not be treated as Docker.

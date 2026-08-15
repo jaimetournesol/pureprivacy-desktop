@@ -24,6 +24,10 @@ good() { printf '\033[32m ok \033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad()  { printf '\033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
 
 cleanup() {
+  # update-test leftovers: the stand-in compose project, the throwaway registry, its images
+  docker rm -f "$PREFIX-upd-box" "$PREFIX-upd-agent" "$PREFIX-registry" >/dev/null 2>&1
+  docker network rm "$PREFIX-upd_default" >/dev/null 2>&1
+  docker images --format '{{.Repository}}:{{.Tag}}' | grep "^127.0.0.1:${RPORT:-none}/" | xargs -r docker rmi -f >/dev/null 2>&1
   docker volume ls --format '{{.Name}}' | grep "^$PREFIX" | xargs -r docker volume rm -f >/dev/null 2>&1
   rm -rf "$WORK"
 }
@@ -63,6 +67,96 @@ seed "$AGENTV" "hermes/auth.json" '{"providers":[{"provider":"fake"}]}'
 seed "$HANDV" "webui-password" "hunter2"
 
 vol_file() { docker run --rm -v "$1":/v:ro alpine cat "/v/$2" 2>/dev/null; }
+
+# ------------------------------------------------------ update: a Docker-Hub install ----
+# `pp-box update <ver>` on an install that runs a REGISTRY image must pull that tag, pin it
+# in .env (box — and agent only while the add-on is on), and recreate; it must never call
+# build.sh, and a failed pull must leave .env and the containers exactly as they were.
+# Before this it always ran build.sh (which needs a Tauri build no user machine has), and
+# the `docker pull` the box told owners to run first never reached compose anyway — it kept
+# the tag .env named. A throwaway local registry stands in for Docker Hub, alpine for the
+# images, and a stand-in compose file carries the same env contract as the real one.
+say "update on a Docker-Hub install pulls + pins the version, never builds, fails closed"
+RPORT=""
+docker run -d --name "$PREFIX-registry" -p 127.0.0.1:0:5000 registry:2 >/dev/null 2>&1
+RPORT="$(docker port "$PREFIX-registry" 5000/tcp 2>/dev/null | head -1 | sed 's/.*://')"
+if [ -n "$RPORT" ]; then
+  for i in $(seq 1 30); do
+    if command -v curl >/dev/null 2>&1; then curl -sf "http://127.0.0.1:$RPORT/v2/" >/dev/null 2>&1 && break
+    else sleep 3; break; fi
+    sleep 1
+  done
+  BOXREPO="127.0.0.1:$RPORT/pp-box"; AGREPO="127.0.0.1:$RPORT/pp-agent"
+  for t in 0.1.10 0.1.11; do
+    docker tag alpine "$BOXREPO:$t" && docker push -q "$BOXREPO:$t" >/dev/null 2>&1
+    docker tag alpine "$AGREPO:$t"  && docker push -q "$AGREPO:$t"  >/dev/null 2>&1
+  done
+  # Drop the local copies of the NEW tag: an update has to genuinely pull it.
+  docker rmi "$BOXREPO:0.1.11" "$AGREPO:0.1.11" >/dev/null 2>&1
+  INSTALLU="$WORK/installu"; mkdir -p "$INSTALLU"
+  cp "$PPBOX" "$INSTALLU/pp-box"; chmod +x "$INSTALLU/pp-box"
+  # A build.sh that only leaves a fingerprint — the Hub path must never reach it.
+  printf '#!/bin/sh\ntouch "$(dirname "$0")/BUILD-SH-WAS-CALLED"\n' > "$INSTALLU/build.sh"
+  chmod +x "$INSTALLU/build.sh"
+  cat > "$INSTALLU/docker-compose.yml" <<EOF
+name: $PREFIX-upd
+services:
+  box:
+    image: \${PP_IMAGE:-pureprivacy-box:dev}
+    container_name: $PREFIX-upd-box
+    command: ["sleep", "300"]
+  agent:
+    image: \${PP_AGENT_IMAGE:-jaimemelon/pureprivacy-agent:latest}
+    container_name: $PREFIX-upd-agent
+    profiles: ["agents"]
+    command: ["sleep", "300"]
+EOF
+  cat > "$INSTALLU/.env" <<EOF
+PP_USER=tester
+PP_BOX=testbox
+PP_PASS=irrelevant
+PP_SECRETS_KEY=k
+PP_VOLUME=$PREFIX-upd-vol
+PP_AGENTS=1
+PP_IMAGE=$BOXREPO:0.1.10
+PP_AGENT_IMAGE=$AGREPO:0.1.10
+EOF
+  ( cd "$INSTALLU" && ./pp-box update 0.1.11 ) >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] && good "update 0.1.11 exits 0 on a Hub install" || bad "update 0.1.11 failed (rc=$rc)"
+  [ ! -e "$INSTALLU/BUILD-SH-WAS-CALLED" ] \
+    && good "build.sh never invoked on a Hub install" || bad "build.sh was invoked on a Hub install"
+  grep -q "^PP_IMAGE=$BOXREPO:0.1.11\$" "$INSTALLU/.env" \
+    && good ".env pins PP_IMAGE to 0.1.11" || bad ".env has $(grep ^PP_IMAGE= "$INSTALLU/.env")"
+  grep -q "^PP_AGENT_IMAGE=$AGREPO:0.1.11\$" "$INSTALLU/.env" \
+    && good ".env pins PP_AGENT_IMAGE to 0.1.11 (add-on on)" || bad ".env has $(grep ^PP_AGENT_IMAGE= "$INSTALLU/.env")"
+  bimg="$(docker inspect "$PREFIX-upd-box" --format '{{.Config.Image}}' 2>/dev/null)"
+  aimg="$(docker inspect "$PREFIX-upd-agent" --format '{{.Config.Image}}' 2>/dev/null)"
+  [ "$bimg" = "$BOXREPO:0.1.11" ] && good "box container recreated on 0.1.11" || bad "box container runs '$bimg'"
+  [ "$aimg" = "$AGREPO:0.1.11" ] && good "agent container recreated on 0.1.11" || bad "agent container runs '$aimg'"
+
+  # A tag that doesn't exist: fail, and change nothing.
+  ( cd "$INSTALLU" && ./pp-box update 9.9.9 ) >/dev/null 2>&1; rc=$?
+  [ "$rc" != 0 ] && good "update to a missing tag fails" || bad "update 9.9.9 exited 0"
+  grep -q "^PP_IMAGE=$BOXREPO:0.1.11\$" "$INSTALLU/.env" \
+    && good ".env untouched after the failed pull" || bad ".env changed after a failed pull"
+  [ "$(docker inspect "$PREFIX-upd-box" --format '{{.Config.Image}}' 2>/dev/null)" = "$BOXREPO:0.1.11" ] \
+    && good "container untouched after the failed pull" || bad "container changed after a failed pull"
+
+  # A plain box (add-on off) must not touch the agent image at all.
+  sed -i 's/^PP_AGENTS=.*/PP_AGENTS=0/' "$INSTALLU/.env"
+  ( cd "$INSTALLU" && ./pp-box update 0.1.10 ) >/dev/null 2>&1
+  grep -q "^PP_IMAGE=$BOXREPO:0.1.10\$" "$INSTALLU/.env" && grep -q "^PP_AGENT_IMAGE=$AGREPO:0.1.11\$" "$INSTALLU/.env" \
+    && good "add-on off: box repinned, agent image left alone" || bad "add-on off: $(grep -E '^PP_(AGENT_)?IMAGE=' "$INSTALLU/.env" | tr '\n' ' ')"
+
+  # A source install (local image name, no registry namespace) still goes through build.sh.
+  sed -i 's|^PP_IMAGE=.*|PP_IMAGE=pp-box:dev|' "$INSTALLU/.env"
+  ( cd "$INSTALLU" && ./pp-box update ) >/dev/null 2>&1
+  [ -e "$INSTALLU/BUILD-SH-WAS-CALLED" ] \
+    && good "source install still rebuilds via build.sh" || bad "source install skipped build.sh"
+  ( cd "$INSTALLU" && docker compose --profile agents down --remove-orphans ) >/dev/null 2>&1
+else
+  bad "could not start a throwaway registry (registry:2) — update path untested"
+fi
 
 # --------------------------------------------------------------------- backup: bundle ----
 say "backup produces a format-2 bundle covering all three volumes"

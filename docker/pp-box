@@ -14,7 +14,9 @@
 #   ./pp-box logs            follow the logs (Ctrl-C to stop watching)
 #   ./pp-box restart         restart the box
 #   ./pp-box down            stop the box (identity is kept in the volume)
-#   ./pp-box update          rebuild the image + recreate the box (keeps identity)
+#   ./pp-box update [<ver>]  update the box, keeping its identity. Docker-Hub install:
+#                            pull <ver> (or refresh the current tag), pin it in .env,
+#                            recreate. Source install: rebuild the image + recreate
 #   ./pp-box backup [dir]    bundle the box + agents (onion key, secrets, pairings) — DO THIS
 #   ./pp-box restore <file>  restore a backup (box must be down; old backups still work)
 #   ./pp-box agents on|off   install / remove the optional agents add-on (separate image)
@@ -58,6 +60,17 @@ have_env() { [ -f "$HERE/.env" ] || die "no .env yet — run: ./pp-box init"; }
 # Both helpers are failure-tolerant (return "" not an error) so a not-yet-minted onion or a
 # missing key never trips `set -e` in a status/qr call.
 envval() { local v; v="$(grep -E "^$1=" "$HERE/.env" 2>/dev/null | head -1 || true)"; printf '%s' "${v#*=}"; }
+# Set (or add) KEY=VALUE in .env in place. .env is chmod 600; GNU sed -i keeps the mode.
+setenv() {
+  if grep -qE "^$1=" "$HERE/.env" 2>/dev/null; then sed -i "s|^$1=.*|$1=$2|" "$HERE/.env"
+  else printf '%s=%s\n' "$1" "$2" >> "$HERE/.env"; fi
+}
+# "jaimemelon/pureprivacy-box:0.1.10" -> "jaimemelon/pureprivacy-box". Only the LAST path
+# element may carry a tag — "127.0.0.1:5000/pp-box" has a colon in the registry, not a tag.
+image_repo() { local last="${1##*/}"; case "$last" in *:*) printf '%s' "${1%:*}" ;; *) printf '%s' "$1" ;; esac; }
+# A registry image has a namespace ("jaimemelon/…", "127.0.0.1:5000/…"); a local build
+# ("pureprivacy-box:dev") has none. This is what tells a Docker-Hub install from a source one.
+is_registry_image() { case "$1" in */*) return 0 ;; *) return 1 ;; esac; }
 onion() {
   local j; j="$(docker exec pureprivacy-box sh -c 'cat /data/box.json 2>/dev/null' 2>/dev/null || true)"
   printf '%s' "$j" | sed -n 's/.*"onion"[^"]*"\([a-z2-7]*\.onion\)".*/\1/p' | head -1
@@ -180,6 +193,7 @@ EOF
     o="$(onion)"; u="$(boxuser)"
     echo "● box: running   ($up)"
     echo "  user:  @${u}:${o:-<minting onion…>}"
+    echo "  image: $(docker inspect pureprivacy-box --format '{{.Config.Image}}' 2>/dev/null || envval PP_IMAGE)"
     echo "  volume: $VOLUME   (identity lives here — back it up: ./pp-box backup)"
     ;;
 
@@ -189,9 +203,37 @@ EOF
 
   update)
     have_env
-    ./build.sh
-    DC up -d --force-recreate
-    echo "✓ rebuilt + recreated on the same volume (same onion, same account)"
+    ver="${1:-}"
+    img="$(envval PP_IMAGE)"
+    if is_registry_image "$img"; then
+      # A Docker-Hub install (install.sh writes PP_IMAGE=jaimemelon/pureprivacy-box:<tag>).
+      # PULL, don't build: build.sh needs a Tauri build that exists on no user's machine, and
+      # a bare `docker pull <image>:<ver>` before this command never reached the box either —
+      # compose keeps running whatever tag .env names (a versioned pull doesn't retag :latest,
+      # and `up` never re-pulls an image it already has). So: pull the wanted tags FIRST (a
+      # failed pull leaves .env and the running box exactly as they were), pin them in .env,
+      # then recreate. The agent image is only touched when the add-on is on — a plain box
+      # never downloads it.
+      new_box="$img"; [ -n "$ver" ] && new_box="$(image_repo "$img"):$ver"
+      new_agent=""
+      if agents_on; then
+        ai="$(envval PP_AGENT_IMAGE)"; [ -n "$ai" ] || ai="jaimemelon/pureprivacy-agent:latest"
+        if is_registry_image "$ai"; then new_agent="$ai"; [ -n "$ver" ] && new_agent="$(image_repo "$ai"):$ver"; fi
+      fi
+      echo "→ pulling $new_box"; docker pull "$new_box" >/dev/null || die "couldn't pull $new_box — nothing changed"
+      if [ -n "$new_agent" ]; then
+        echo "→ pulling $new_agent"; docker pull "$new_agent" >/dev/null || die "couldn't pull $new_agent — nothing changed"
+      fi
+      setenv PP_IMAGE "$new_box"
+      [ -n "$new_agent" ] && setenv PP_AGENT_IMAGE "$new_agent"
+      DC up -d --force-recreate
+      echo "✓ updated to $new_box${new_agent:+ + $new_agent} — same volume, same onion, same account"
+    else
+      # Source install: the image is built here from the staged binary.
+      ./build.sh
+      DC up -d --force-recreate
+      echo "✓ rebuilt + recreated on the same volume (same onion, same account)"
+    fi
     ;;
 
   backup)
