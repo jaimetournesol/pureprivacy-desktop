@@ -28,6 +28,8 @@ cleanup() {
   docker rm -f "$PREFIX-upd-box" "$PREFIX-upd-agent" "$PREFIX-registry" >/dev/null 2>&1
   docker network rm "$PREFIX-upd_default" >/dev/null 2>&1
   docker images --format '{{.Repository}}:{{.Tag}}' | grep "^127.0.0.1:${RPORT:-none}/" | xargs -r docker rmi -f >/dev/null 2>&1
+  docker ps -aq --filter "ancestor=$PREFIX-img" | xargs -r docker rm -f >/dev/null 2>&1
+  docker rmi -f "$PREFIX-img" >/dev/null 2>&1
   docker volume ls --format '{{.Name}}' | grep "^$PREFIX" | xargs -r docker volume rm -f >/dev/null 2>&1
   rm -rf "$WORK"
 }
@@ -228,6 +230,35 @@ else
   good "no member tarballs in restored volume (bundle/legacy sniff is sound)"
 fi
 
+# ------------------------------------------------------------- backup: a PLAIN box ----
+# No agents add-on and no handoff volume — the README's bare `docker run` install, or any
+# box that never ran under compose. This used to exit 1 with NO bundle and NO message: the
+# manifest string's last $(...) was `[ no = yes ] && echo`, its status became the
+# assignment's status, and `set -e` killed the script. The one command that "IS the box",
+# silently doing nothing.
+say "a plain box (box volume only, no agent/handoff volumes) still backs up"
+seed "$PREFIX-plain" "box.json" '{"box_name":"plain","username":"tester","onion":"aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmmnnnn.onion"}'
+seed "$PREFIX-plain" "data/tor/hs/hs_ed25519_secret_key" "PLAIN-ONION-KEY"
+INSTALLP="$WORK/installp"; mkdir -p "$INSTALLP"
+cp "$PPBOX" "$INSTALLP/pp-box"; chmod +x "$INSTALLP/pp-box"
+sed -e "s/$BOXV/$PREFIX-plain/" -e "s/$AGENTV/$PREFIX-no-such-agent/" -e "s/$HANDV/$PREFIX-no-such-handoff/" \
+    "$INSTALL/.env" > "$INSTALLP/.env"
+( cd "$INSTALLP" && ./pp-box backup "$WORK/plain" ) >/dev/null 2>&1; rc=$?
+PLAINB="$(ls "$WORK/plain"/pp-box-*.tgz 2>/dev/null | head -1)"
+if [ "$rc" = 0 ] && [ -n "$PLAINB" ]; then
+  good "plain-box backup exits 0 and writes a bundle"
+else
+  bad "plain-box backup failed (rc=$rc, bundle: ${PLAINB:-none}) — silent set -e death in the manifest?"
+fi
+if [ -n "$PLAINB" ]; then
+  tar tzf "$PLAINB" 2>/dev/null | grep -qx ./agent-data.tgz \
+    && bad "plain bundle carries an agent-data member it can't have" \
+    || good "plain bundle holds MANIFEST + box only"
+  tar xzf "$PLAINB" -O ./MANIFEST 2>/dev/null | grep -q '^handoff_volume=$' \
+    && good "MANIFEST records no handoff volume (restore won't look for one)" \
+    || bad "MANIFEST handoff_volume should be empty for a plain box"
+fi
+
 # -------------------------------------------------------------- encrypted backups ----
 # pp-box resolves pp-crypt relative to ITS OWN location (the scratch install), so point it
 # at the repo's build explicitly; build it if missing (CI runs this before tauri build).
@@ -271,6 +302,54 @@ if [ -n "${PP_CRYPT:-}" ]; then
   docker volume inspect "$PREFIX-box6" >/dev/null 2>&1 \
     && bad "wrong passphrase still created/filled a volume" \
     || good "wrong passphrase fails closed — nothing restored"
+
+  # ------------------------------------------ encrypted backups: the DOCKER path ----
+  # An INSTALLED pp-box has no repo next to it: pp_crypt() falls through to running
+  # pp-crypt out of the box image named by PP_IMAGE in .env. Everything above pins
+  # PP_CRYPT to a host binary, so this path was untested — and it shipped broken twice
+  # over: the image's ENTRYPOINT swallowed the arguments and booted a whole box (hang,
+  # orphan container, the web-setup banner written to .enc), and IMAGE ignored PP_IMAGE.
+  # A stand-in image reproduces both hazards faithfully: the real pp-crypt at the real
+  # path, behind a decoy ENTRYPOINT that hangs (as the box does) unless it is bypassed.
+  say "encrypted backup + restore via the box image (installed layout, PP_IMAGE from .env)"
+  TIMG="$PREFIX-img"; IMGCTX="$WORK/imgctx"; mkdir -p "$IMGCTX"
+  cp "$PP_CRYPT" "$IMGCTX/pp-crypt"
+  printf 'FROM ubuntu:26.04\nCOPY pp-crypt /opt/pureprivacy/bin/pp-crypt\nENTRYPOINT ["/bin/sh","-c","echo BOOTING-A-WHOLE-BOX; sleep 120"]\n' > "$IMGCTX/Dockerfile"
+  if docker build -q -t "$TIMG" "$IMGCTX" >/dev/null 2>&1; then
+    # Bound the run: without --entrypoint pp-box would sit inside the decoy forever.
+    T=""; command -v timeout >/dev/null 2>&1 && T="timeout 90"
+    INSTALL7="$WORK/install7"; mkdir -p "$INSTALL7"
+    cp "$PPBOX" "$INSTALL7/pp-box"; chmod +x "$INSTALL7/pp-box"
+    { cat "$INSTALL/.env"; printf 'PP_IMAGE=%s\n' "$TIMG"; } > "$INSTALL7/.env"
+    # env -u: pp-box must find pp-crypt on its own — no override, no repo at ../src-tauri.
+    ( cd "$INSTALL7" && env -u PP_CRYPT -u IMAGE PP_BACKUP_PASSPHRASE=correct-horse \
+        $T ./pp-box backup "$WORK/enc7" --encrypt ) >/dev/null 2>&1; rc=$?
+    ENC7="$(ls "$WORK/enc7"/pp-box-*.tgz.enc 2>/dev/null | head -1)"
+    if [ "$rc" = 0 ] && [ -n "$ENC7" ]; then
+      good "sealed by the image's pp-crypt (ENTRYPOINT bypassed, PP_IMAGE honoured)"
+    else
+      bad "docker-path backup failed (rc=$rc; 124 = hung in the image's ENTRYPOINT)"
+    fi
+    [ -z "$(docker ps -aq --filter "ancestor=$TIMG" 2>/dev/null)" ] \
+      && good "no orphan container left behind" \
+      || bad "orphan container(s) from $TIMG left behind"
+    [ -z "$(ls "$WORK/enc7"/pp-box-*.tgz 2>/dev/null)" ] \
+      && good "plaintext removed after sealing (docker path)" \
+      || bad "plaintext bundle left next to the .enc (docker path)"
+    if [ -n "$ENC7" ]; then
+      INSTALL8="$WORK/install8"; mkdir -p "$INSTALL8"
+      cp "$PPBOX" "$INSTALL8/pp-box"; chmod +x "$INSTALL8/pp-box"
+      { sed -e "s/$BOXV/$PREFIX-box8/" -e "s/$AGENTV/$PREFIX-agent8/" -e "s/$HANDV/$PREFIX-handoff8/" \
+            "$INSTALL/.env"; printf 'PP_IMAGE=%s\n' "$TIMG"; } > "$INSTALL8/.env"
+      ( cd "$INSTALL8" && printf 'y\ny\n' | env -u PP_CRYPT -u IMAGE PP_BACKUP_PASSPHRASE=correct-horse \
+          $T ./pp-box restore "$ENC7" ) >/dev/null 2>&1
+      [ "$(vol_file "$PREFIX-box8" data/tor/hs/hs_ed25519_secret_key)" = "FAKE-ONION-KEY" ] \
+        && good "opened by the image's pp-crypt and restored (onion key byte-identical)" \
+        || bad "docker-path restore content wrong"
+    fi
+  else
+    bad "could not build the stand-in image (docker build FROM ubuntu:26.04) — docker path untested"
+  fi
 else
   bad "pp-crypt not available and could not be built — encrypted-backup path untested"
 fi

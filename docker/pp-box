@@ -49,7 +49,12 @@ AGENT_VOLUME="$(sed -n 's/^PP_AGENT_VOLUME=//p' "$HERE/.env" 2>/dev/null | head 
 [ -n "$AGENT_VOLUME" ] || AGENT_VOLUME="pureprivacy-agent-data"
 HANDOFF_VOLUME="$(sed -n 's/^PP_AGENT_HANDOFF_VOLUME=//p' "$HERE/.env" 2>/dev/null | head -1 || true)"
 [ -n "$HANDOFF_VOLUME" ] || HANDOFF_VOLUME="pureprivacy-agent-handoff"
-IMAGE="${IMAGE:-pureprivacy-box:dev}"
+# The image THIS install runs. compose reads PP_IMAGE from .env (install.sh writes it for a
+# Docker-Hub install); anything here that runs a one-off container from the box image —
+# pp-crypt for encrypted backups — must resolve the same name, or a Hub install would
+# `docker run pureprivacy-box:dev`: an image it never built.
+IMAGE="${IMAGE:-$(sed -n 's/^PP_IMAGE=//p' "$HERE/.env" 2>/dev/null | head -1 || true)}"
+[ -n "$IMAGE" ] || IMAGE="pureprivacy-box:dev"
 # Agents are an OPTIONAL add-on in a separate image, gated behind a compose profile, so a
 # plain box never pulls or runs them. PP_AGENTS=1 in .env turns the profile on for every
 # compose call — that single switch is what "installed" means.
@@ -69,9 +74,12 @@ pp_crypt() { # $1=seal|open ; stdin->stdout ; passphrase in $PP_PASSPHRASE
     if [ -x "$c" ]; then "$c" "$1"; return; fi
   done
   # -i (not -it): stdin/stdout are the data path. Passphrase via env, NOT argv — argv is
-  # world-readable in /proc while the process lives.
-  docker run --rm -i -e PP_PASSPHRASE -e PP_META_ONION -e PP_META_CREATED "$IMAGE" \
-    /opt/pureprivacy/bin/pp-crypt "$1"
+  # world-readable in /proc while the process lives. --entrypoint is load-bearing: the
+  # image's ENTRYPOINT is entrypoint.sh, which ignores its arguments and boots a whole box
+  # (Xvfb, tor, tuwunel) — without the override this hung forever with the bundle on the
+  # box's stdin, left an orphan container running, and wrote the web-setup banner to .enc.
+  docker run --rm -i --entrypoint /opt/pureprivacy/bin/pp-crypt \
+    -e PP_PASSPHRASE -e PP_META_ONION -e PP_META_CREATED "$IMAGE" "$1"
 }
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -298,13 +306,17 @@ EOF
     # the key travels with the bundle. This does not widen the blast radius: the onion
     # private key is already in here, and that alone is enough to impersonate the box.
     key="$(envval PP_SECRETS_KEY)"; user="$(envval PP_USER)"
+    # `|| true` on the two optional lines is NOT decorative: an assignment's exit status is
+    # that of its LAST command substitution, so on a plain box (no handoff volume — e.g. the
+    # README's bare `docker run` install) `[ no = yes ] && echo` returned 1 and `set -e`
+    # killed the script right here — silently, with no bundle written.
     manifest="pp_backup_format=2
 created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 onion=$o
 box_user=$user
 box_volume=$VOLUME
-agent_volume=$([ "$have_agent" = yes ] && echo "$AGENT_VOLUME")
-handoff_volume=$([ "$have_handoff" = yes ] && echo "$HANDOFF_VOLUME")
+agent_volume=$([ "$have_agent" = yes ] && echo "$AGENT_VOLUME" || true)
+handoff_volume=$([ "$have_handoff" = yes ] && echo "$HANDOFF_VOLUME" || true)
 secrets_key=$key"
     # One container, all volumes: build the member tars inside and emit a single bundle, so
     # there is never a half-written staging dir on the host to clean up (or leak).
